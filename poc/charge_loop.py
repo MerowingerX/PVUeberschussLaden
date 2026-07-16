@@ -573,8 +573,20 @@ INDEX_HTML = """<!doctype html>
   input[type=range] { width:100%; accent-color:#2e7d32; }
   h2 { font-size:1rem; margin:1.2rem 0 .2rem; color:#aaa; }
   .slider-row { padding:.2rem .5rem .6rem; }
+  .pages { display:flex; overflow-x:auto; scroll-snap-type:x mandatory;
+           scrollbar-width:none; }
+  .pages::-webkit-scrollbar { display:none; }
+  .page { flex:0 0 100%; scroll-snap-align:start; scroll-snap-stop:always;
+          box-sizing:border-box; padding:0 .1rem; }
+  .dots { text-align:center; margin:.3rem 0; }
+  .dot { display:inline-block; width:.5rem; height:.5rem; border-radius:50%;
+         background:#555; margin:0 .3rem; }
+  .dot.on { background:#eee; }
 </style></head><body>
 <h1>PVueb – Überschussladen</h1>
+<div class="dots"><span class="dot on"></span><span class="dot"></span></div>
+<div class="pages" id="pages">
+<section class="page">
 <button id="frei" onclick="toggleRelease()">…</button>
 <div id="stat"></div>
 <h2>Lademodus</h2>
@@ -589,13 +601,18 @@ INDEX_HTML = """<!doctype html>
 <button id="m_fast" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 <h2>Automatik</h2>
 <button id="night" onclick="toggleNight()">…</button>
-<h2>Batterie</h2>
-<button id="batt" onclick="toggleBatt()">…</button>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
   <input type="range" id="heartbeat" min="5" max="120" step="5"
          oninput="document.getElementById('hblabel').textContent=this.value"
          onchange="setConfig({heartbeat_s: +this.value})">
+</div>
+</section>
+<section class="page">
+<h2>Huawei-Batterie</h2>
+<div id="batstat"></div>
+<button id="batt" onclick="toggleBatt()">…</button>
+</section>
 </div>
 <script>
 let s = {};
@@ -612,6 +629,7 @@ async function refresh() {
   const f = document.getElementById("frei");
   f.textContent = s.released ? "Freigegeben – tippen zum Sperren" : "GESPERRT – tippen zum Freigeben";
   f.className = s.released ? "on" : "warn";
+  const row = r => `<div class="row"><span>${r[0]}</span><span class="val">${r[1]}</span></div>`;
   const rows = [
     ["Nachtfenster", s.night ? "🌙 AKTIV – lädt mit voller Leistung" : "inaktiv"],
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
@@ -619,20 +637,25 @@ async function refresh() {
     ["Ladeleistung", Math.round(s.charge_w) + " W"],
     ["Limit", s.current_limit + " A"],
     ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],
-    ["Batterie", s.battery_w === null ? "–"
-      : (s.battery_w >= 0 ? "lädt " : "entlädt ") + Math.abs(Math.round(s.battery_w)) + " W"],
-    ["Batterie-Netzladung", s.battery_grid_charge
-      ? "⚡ AKTIV" + (s.battery_charge_auto ? " (Automatik)" : "") + " bis " + s.batt_target_soc + " %"
-      : (s.forcible_cmd === 1 ? "aktiv (extern gestartet)" : "aus")],
-    ["Prognose " + s.forecast_label, s.forecast_kwh === null ? "–"
-      : (s.forecast_kwh < s.forecast_min_kwh ? "🌥 " : "☀️ ") + s.forecast_kwh.toFixed(1) + " kWh"],
     ["Wallbox", s.box_connected ? (s.charging ? "lädt" : "verbunden") : "getrennt"],
     ["Box-Status (OCPP)", s.box_status],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
   ];
-  document.getElementById("stat").innerHTML =
-    rows.map(r => `<div class="row"><span>${r[0]}</span><span class="val">${r[1]}</span></div>`).join("");
+  document.getElementById("stat").innerHTML = rows.map(row).join("");
+  const brows = [
+    ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],
+    ["Batterie", s.battery_w === null ? "–"
+      : (s.battery_w >= 0 ? "lädt " : "entlädt ") + Math.abs(Math.round(s.battery_w)) + " W"],
+    ["Netzladung", s.battery_grid_charge
+      ? "⚡ AKTIV" + (s.battery_charge_auto ? " (Automatik)" : "") + " bis " + s.batt_target_soc + " %"
+      : (s.forcible_cmd === 1 ? "aktiv (extern gestartet)" : "aus")],
+    ["Prognose " + s.forecast_label, s.forecast_kwh === null ? "–"
+      : (s.forecast_kwh < s.forecast_min_kwh ? "🌥 " : "☀️ ") + s.forecast_kwh.toFixed(1) + " kWh"],
+    ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
+    ["Heartbeat Huawei", ago(s.huawei_seen_s)],
+  ];
+  document.getElementById("batstat").innerHTML = brows.map(row).join("");
   for (const m of ["pv","minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
   const mi = document.getElementById("minamps");
@@ -670,6 +693,11 @@ async function setConfig(cfg) {
                               body: JSON.stringify(cfg)});
   refresh();
 }
+const pg = document.getElementById("pages");
+pg.addEventListener("scroll", () => {
+  const i = Math.round(pg.scrollLeft / pg.clientWidth);
+  document.querySelectorAll(".dot").forEach((d, n) => d.classList.toggle("on", n === i));
+});
 refresh(); setInterval(refresh, 2000);
 </script></body></html>"""
 
