@@ -1,0 +1,11 @@
+# Umgebungsspezifisches / Geheimnisse — bleibt lokal
+.env
+LOCAL.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
