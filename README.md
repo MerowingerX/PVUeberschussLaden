@@ -49,12 +49,26 @@ beide sind gitignored. Feste Parameter (bewusst nur im Code änderbar, `poc/char
 | `ADJUST_MIN_INTERVAL_S` | 25 s | Mindestabstand zwischen Limit-Änderungen |
 | `BATTERY_LOW_SOC` / `BATTERY_TARGET_SOC` | 20 / 80 % | Nachtladung Hausbatterie |
 
-### Einrichtung
+### Einrichtung: Docker auf dem Raspberry Pi (empfohlen)
+
+```bash
+git clone git@github.com:MerowingerX/PVUeberschussLaden.git pvueb
+cd pvueb
+cp .env.example .env          # PVUEB_INVERTER_IP eintragen
+docker compose up -d --build
+docker compose logs -f        # Box-Boot und Modbus-Werte beobachten
+```
+
+Startet automatisch neu (`restart: unless-stopped`), auch nach Pi-Reboot.
+Zeitzone im Container: `Europe/Berlin` (Dockerfile) — wichtig fürs Nachttarif-Fenster.
+Nach Umzug auf den Pi: OCPP-URL in der Wallbox-App auf die Pi-IP ändern.
+
+### Einrichtung: direkt (Entwicklung)
 
 ```bash
 cd poc
 python -m venv .venv
-.venv/bin/pip install pymodbus ocpp websockets aiohttp
+.venv/bin/pip install -r ../requirements.txt
 .venv/bin/python -u charge_loop.py          # Ports: OCPP 9000, Web 8080
 ```
 

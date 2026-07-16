@@ -1,0 +1,9 @@
+services:
+  pvueb:
+    build: .
+    container_name: pvueb
+    env_file: .env            # PVUEB_INVERTER_IP=<ip-des-sdongle>
+    ports:
+      - "9000:9000"           # OCPP (Wallbox -> Server)
+      - "8080:8080"           # Web-UI
+    restart: unless-stopped
