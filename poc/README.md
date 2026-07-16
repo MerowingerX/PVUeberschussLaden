@@ -81,13 +81,22 @@ Verbindet alles: Modbus-Messung → Regel-Logik → OCPP-Steuerung. Dazu Web-Int
   Zeigt Netz/Überschuss/SOC/Limit/Status, Freigabe-Button, Modus-Buttons.
 - **Freigabe:** Laden nur nach Knopfdruck (Web-UI oder stdin `frei`/`sperr`). Start: gesperrt.
 - **Modi:** `pv` (nur Überschuss), `minpv` (immer ≥ 6 A), `fast` (16 A).
-- **Nachttarif 00–08 Uhr:** freigegebenes Fahrzeug lädt mit 16 A, unabhängig vom Modus.
-  Batterie-Netzladung (SOC < 20 % → 80 %) vorerst nur Log-Meldung — Schreibregister unverifiziert.
+- **Nachttarif 00–08 Uhr** (`.env`): freigegebenes Fahrzeug lädt mit 16 A, unabhängig vom Modus.
+- **Batterie-Netzladung:** Web-Toggle oder Automatik (Nachtfenster + SOC <
+  `PVUEB_BATT_LOW_SOC` + Prognose < `PVUEB_FORECAST_MIN_KWH`, max. 1 Start/Nacht)
+  startet die LUNA2000-Zwangsladung (`PVUEB_BATT_CHARGE_W` bis
+  `PVUEB_BATT_TARGET_SOC`, Wechselrichter stoppt am Ziel selbst). Register
+  verifiziert und live getestet 2026-07-16; Details:
+  [features/feature_NachtStromInHuaweiBatterie.md](../features/feature_NachtStromInHuaweiBatterie.md).
 - **Hysterese:** Start nach 2 min stabilem Überschuss (> ~4,2 kW), Stopp nach 3 min Defizit,
-  Limit-Anpassung höchstens alle 25 s.
+  Limit-Anpassung höchstens alle 25 s — alle Zeiten über `.env` (`PVUEB_*_S`) änderbar.
 
 ## Erfolgskriterien
 
 - [ ] Box verbindet sich mit charge_loop, Web-UI zeigt live Werte
 - [ ] Freigabe + Modus `fast`: Auto lädt; Freigabe weg: Ladung stoppt
 - [ ] Sonniger Tag, Modus `pv`: Ladung folgt dem Überschuss
+- [x] Batterie-Netzladung (2026-07-16): Toggle startet Zwangsladung (Batterie
+      +356 W, Netzbezug 672 W), Stopp per Toggle funktioniert; Grid-charge-Cutoff
+      (47088) deckelt die Zwangsladung nicht. Noch offen: Selbst-Stopp am Ziel-SOC
+      (läuft beim ersten Automatik-Einsatz mit)

@@ -15,8 +15,14 @@ Stdin-Kommandos:
 
 Nachttarif: 00:00–08:00 lädt ein freigegebenes, eingestecktes Fahrzeug
 unabhängig vom Modus mit voller Leistung (16 A). Ab 08:00 gilt wieder
-der eingestellte Modus. Batterie-Zwangsladung (SOC < 20 % → 80 %) ist
-vorbereitet, aber bis zur Register-Verifikation nur als Log-Meldung aktiv.
+der eingestellte Modus.
+
+Batterie-Netzladung (LUNA2000-Zwangsladung, Register verifiziert 2026-07-16):
+lädt mit PVUEB_BATT_CHARGE_W bis PVUEB_BATT_TARGET_SOC, der Wechselrichter
+stoppt am Ziel selbst. Manuell jederzeit über den Web-Toggle; Automatik
+startet höchstens einmal pro Nacht, wenn Nachtfenster aktiv, SOC unter
+PVUEB_BATT_LOW_SOC und die Sonnenprognose (forecast.solar) unter
+PVUEB_FORECAST_MIN_KWH liegt.
 """
 
 import argparse
@@ -26,6 +32,7 @@ import logging
 import os
 import sys
 
+import aiohttp
 import websockets
 from aiohttp import web
 from ocpp.routing import on
@@ -51,18 +58,27 @@ MIN_AMPS = 6
 MAX_AMPS = 16
 MIN_CHARGE_W = MIN_AMPS * PHASES * VOLTAGE  # ~4140 W
 
-POLL_INTERVAL_S = 5          # Modbus-Polling und Regel-Takt
-ADJUST_MIN_INTERVAL_S = 25   # Limit höchstens so oft ändern
-START_DELAY_S = 120          # Überschuss muss so lange reichen, bevor Start
-STOP_DELAY_S = 180           # Überschuss muss so lange fehlen, bevor Stopp
+# Regelzeit-Parameter (Poll-Takt, Anpass-Intervall, Start-/Stopp-Verzögerung)
+# über .env (PVUEB_POLL_INTERVAL_S usw.), Defaults in State
 
 # Nachttarif-Fenster: Tarif-Parameter, konfigurierbar über .env
 # (PVUEB_NIGHT_START / PVUEB_NIGHT_END im Format HH:MM), Default 00:00-08:00
-BATTERY_LOW_SOC = 20.0       # unter diesem SOC um Mitternacht: Netzladung ...
-BATTERY_TARGET_SOC = 80.0    # ... bis zu diesem Ziel
+# Batterie-Netzladung: Schwellen/Leistung über .env (PVUEB_BATT_*), Defaults in State
 
 REG_GRID_POWER = 37113       # int32, W, positiv = Einspeisung (verifiziert 2026-07-15)
 REG_BATTERY_SOC = 37760      # uint16, ×0,1 % (verifiziert 2026-07-15)
+REG_BATTERY_POWER = 37001    # int32, W, positiv = Laden
+
+# LUNA2000-Zwangsladung (verifiziert 2026-07-16 gegen huawei_solar 3.0.6)
+REG_FORCIBLE_CMD = 47100         # uint16: 0 = Stop, 1 = Laden, 2 = Entladen
+REG_FORCIBLE_TARGET_SOC = 47101  # uint16, ×0,1 %
+REG_FORCIBLE_MODE = 47246        # uint16: 0 = Dauer, 1 = Ziel-SOC
+REG_FORCIBLE_CHARGE_W = 47247    # uint32, W
+
+# Sonnenprognose (forecast.solar, kostenlos ohne Key; Anlagendaten aus .env)
+FORECAST_URL = "https://api.forecast.solar/estimate/{lat}/{lon}/{tilt}/{azimut}/{kwp}"
+FORECAST_REFRESH_S = 6 * 3600    # Abruf-Rhythmus (Limit wäre 12/h — wir sind weit drunter)
+FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 
 
 class State:
@@ -73,15 +89,34 @@ class State:
     heartbeat_s = 10             # OCPP-Heartbeat der Box (justierbar im UI, Default aus .env)
     night_start_min = 0          # Nachttarif-Beginn in Minuten seit 00:00 (aus .env)
     night_end_min = 8 * 60       # Nachttarif-Ende (aus .env)
+    poll_interval_s = 5          # Modbus-Polling und Regel-Takt (aus .env)
+    adjust_min_interval_s = 25   # Limit höchstens so oft ändern (aus .env)
+    start_delay_s = 120          # Überschuss muss so lange reichen, bevor Start (aus .env)
+    stop_delay_s = 180           # Überschuss muss so lange fehlen, bevor Stopp (aus .env)
+    batt_low_soc = 30.0          # Automatik-Startschwelle in % (aus .env)
+    batt_target_soc = 80.0       # Netzladung bis zu diesem SOC (aus .env)
+    batt_charge_w = 500          # Leistung der Zwangsladung in W (aus .env)
+    lat = 52.25                  # Standort/Anlage für forecast.solar (aus .env)
+    lon = 10.66
+    pv_tilt = 42
+    pv_azimut = 0                # forecast.solar-Konvention: 0 = Süd
+    pv_kwp = 7.0
+    forecast_min_kwh = 5.0       # „keine Sonne“ = Prognose unter diesem Wert (aus .env)
+    forecast: dict[str, float] = {}      # Datum (ISO) -> prognostizierte kWh
+    forecast_at: float | None = None     # Unix-Zeit des letzten erfolgreichen Abrufs
     grid_w: float | None = None  # positiv = Einspeisung
     soc: float | None = None     # Batterie-SOC in %
+    battery_w: float | None = None  # Batterie-Leistung, positiv = Laden
     charge_w = 0.0               # letzte bekannte Ladeleistung
     charging = False
     current_limit = 0            # zuletzt gesetztes Limit in A
     surplus_since: float | None = None   # Zeitstempel: Überschuss reicht seit ...
     deficit_since: float | None = None   # Zeitstempel: Überschuss fehlt seit ...
     last_adjust = 0.0
-    battery_grid_charge = False  # Batterie-Nachtladung aktiv
+    battery_grid_charge = False  # von uns gestartete Zwangsladung aktiv
+    forcible_cmd: int | None = None      # gelesenes Register 47100 (0/1/2)
+    battery_charge_auto = False  # aktive Zwangsladung kam von der Nachtautomatik
+    battery_auto_started = False # Automatik hat diese Nacht schon gestartet (einmal pro Nacht)
     last_box_seen: float | None = None     # Unix-Zeit: letzter OCPP-Heartbeat
     last_huawei_seen: float | None = None  # Unix-Zeit: letzter erfolgreicher Modbus-Poll
     box_status = "unbekannt"               # letzter StatusNotification-Status der Box
@@ -100,6 +135,8 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
 
 state = State()
 charge_point: "ChargePoint | None" = None
+modbus_client: AsyncModbusTcpClient | None = None
+modbus_lock = asyncio.Lock()  # serialisiert Polling und Schreibzugriffe (SDongle: 1 Verbindung)
 
 
 class ChargePoint(OcppChargePoint):
@@ -232,34 +269,62 @@ async def on_connect(websocket):
         charge_point = None
 
 
+def decode_i32(words: list[int]) -> float:
+    raw = (words[0] << 16) | words[1]
+    if raw >= 1 << 31:
+        raw -= 1 << 32
+    return float(raw)
+
+
 async def modbus_task(host: str):
+    global modbus_client
     while True:
-        client = AsyncModbusTcpClient(host, port=502)
+        # SDongle ist träge: langer Timeout, sonst Transaction-ID-Salat bei später Antwort
+        client = AsyncModbusTcpClient(host, port=502, timeout=10)
         await client.connect()
         if client.connected:
             await asyncio.sleep(3)  # SDongle-Eigenheit nach Connect
+            modbus_client = client
             while client.connected:
                 try:
-                    result = await client.read_holding_registers(
-                        REG_GRID_POWER, count=2, device_id=1
-                    )
-                    if not result.isError():
-                        raw = (result.registers[0] << 16) | result.registers[1]
-                        if raw >= 1 << 31:
-                            raw -= 1 << 32
-                        state.grid_w = float(raw)
-                        state.last_huawei_seen = datetime.datetime.now().timestamp()
-                    soc_result = await client.read_holding_registers(
-                        REG_BATTERY_SOC, count=1, device_id=1
-                    )
-                    if not soc_result.isError():
-                        state.soc = soc_result.registers[0] * 0.1
+                    async with modbus_lock:
+                        result = await client.read_holding_registers(
+                            REG_GRID_POWER, count=2, device_id=1
+                        )
+                        if not result.isError():
+                            state.grid_w = decode_i32(result.registers)
+                            state.last_huawei_seen = datetime.datetime.now().timestamp()
+                        await asyncio.sleep(0.3)  # SDongle nicht hetzen
+                        soc_result = await client.read_holding_registers(
+                            REG_BATTERY_SOC, count=1, device_id=1
+                        )
+                        if not soc_result.isError():
+                            state.soc = soc_result.registers[0] * 0.1
+                        await asyncio.sleep(0.3)
+                        batt_result = await client.read_holding_registers(
+                            REG_BATTERY_POWER, count=2, device_id=1
+                        )
+                        if not batt_result.isError():
+                            state.battery_w = decode_i32(batt_result.registers)
+                        await asyncio.sleep(0.3)
+                        cmd_result = await client.read_holding_registers(
+                            REG_FORCIBLE_CMD, count=1, device_id=1
+                        )
+                        if not cmd_result.isError():
+                            state.forcible_cmd = cmd_result.registers[0]
+                            if state.forcible_cmd == 0 and state.battery_grid_charge:
+                                state.battery_grid_charge = False
+                                state.battery_charge_auto = False
+                                log.info("Batterie-Netzladung vom Wechselrichter beendet "
+                                         "(Ziel-SOC erreicht oder extern gestoppt)")
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Modbus-Fehler: %s", exc)
                     break
-                await asyncio.sleep(POLL_INTERVAL_S)
+                await asyncio.sleep(state.poll_interval_s)
+        modbus_client = None
         client.close()
         state.grid_w = None
+        state.battery_w = None
         log.warning("Modbus getrennt, Reconnect in 10 s")
         await asyncio.sleep(10)
 
@@ -269,27 +334,135 @@ def target_amps(surplus_w: float) -> int:
     return max(0, min(MAX_AMPS, amps))
 
 
-async def battery_night_check():
-    """Nachttarif: Batterie bei SOC < 20 % aus dem Netz auf 80 % laden.
+async def start_battery_grid_charge() -> str | None:
+    """Startet die LUNA2000-Zwangsladung bis zum Ziel-SOC.
 
-    TODO: Schreibregister (Block um 47075–47086, 'forcible charge') erst am
-    Gerät verifizieren — bis dahin nur Log-Meldung, kein Modbus-Write.
+    Schreibreihenfolge wie huawei_solar-Service forcible_charge_soc:
+    Leistung → Ziel-SOC → Modus(SOC) → Befehl(Laden). Ziel-SOC-Modus als
+    Sicherheitsnetz: der Wechselrichter stoppt am Ziel selbst, auch wenn
+    dieses Skript abstürzt. Gibt None bei Erfolg zurück, sonst Fehlertext.
     """
-    if state.soc is None:
+    client = modbus_client  # Snapshot gegen Reconnect-Race
+    if client is None or not client.connected:
+        return "Keine Modbus-Verbindung zum Wechselrichter"
+    charge_w = int(state.batt_charge_w)
+    sequence = [
+        (REG_FORCIBLE_CHARGE_W, [charge_w >> 16, charge_w & 0xFFFF]),
+        (REG_FORCIBLE_TARGET_SOC, [int(state.batt_target_soc * 10)]),
+        (REG_FORCIBLE_MODE, [1]),
+        (REG_FORCIBLE_CMD, [1]),
+    ]
+    try:
+        async with modbus_lock:
+            for register, words in sequence:
+                result = await client.write_registers(register, words, device_id=1)
+                if result.isError():
+                    log.warning("Batterie-Netzladung: Schreibfehler Register %s: %s", register, result)
+                    return f"Schreibfehler Register {register}: {result}"
+                await asyncio.sleep(0.3)  # SDongle nicht hetzen
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Batterie-Netzladung: %s", exc)
+        return str(exc)
+    state.battery_grid_charge = True
+    log.info("Batterie-Netzladung gestartet: %d W bis %.0f %% (SOC jetzt %s %%)",
+             charge_w, state.batt_target_soc, state.soc)
+    return None
+
+
+async def stop_battery_grid_charge() -> str | None:
+    """Stoppt die Zwangsladung (Befehl = Stop). None bei Erfolg, sonst Fehlertext."""
+    client = modbus_client  # Snapshot gegen Reconnect-Race
+    if client is None or not client.connected:
+        return "Keine Modbus-Verbindung zum Wechselrichter"
+    try:
+        async with modbus_lock:
+            result = await client.write_registers(REG_FORCIBLE_CMD, [0], device_id=1)
+            if result.isError():
+                log.warning("Batterie-Netzladung: Stop fehlgeschlagen: %s", result)
+                return f"Stop fehlgeschlagen: {result}"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Batterie-Netzladung: %s", exc)
+        return str(exc)
+    state.battery_grid_charge = False
+    state.battery_charge_auto = False
+    log.info("Batterie-Netzladung gestoppt (SOC %s %%)", state.soc)
+    return None
+
+
+def relevant_forecast() -> tuple[str, float | None]:
+    """(Label, kWh) der nächsten Tageslichtperiode.
+
+    Nachts nach Mitternacht zählt die Sonne von heute, abends die von morgen —
+    Grenze pragmatisch 12:00. Fürs Nachtfenster (egal ob 00–08 oder 22–06 Uhr)
+    ergibt das immer den kommenden Tag mit Sonne.
+    """
+    now = datetime.datetime.now()
+    if now.hour < 12:
+        return "heute", state.forecast.get(now.date().isoformat())
+    tomorrow = now.date() + datetime.timedelta(days=1)
+    return "morgen", state.forecast.get(tomorrow.isoformat())
+
+
+async def forecast_task():
+    """Holt die PV-Prognose regelmäßig von forecast.solar (alle 6 h, Retry 15 min)."""
+    url = FORECAST_URL.format(lat=state.lat, lon=state.lon, tilt=state.pv_tilt,
+                              azimut=state.pv_azimut, kwp=state.pv_kwp)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            state.forecast = {day: wh / 1000
+                              for day, wh in data["result"]["watt_hours_day"].items()}
+            state.forecast_at = datetime.datetime.now().timestamp()
+            log.info("Prognose: %s", "  ".join(f"{d}: {kwh:.1f} kWh"
+                                               for d, kwh in sorted(state.forecast.items())))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Prognose-Abruf fehlgeschlagen (%s) — neuer Versuch in %d min",
+                        exc, FORECAST_RETRY_S // 60)
+            await asyncio.sleep(FORECAST_RETRY_S)
+            continue
+        await asyncio.sleep(FORECAST_REFRESH_S)
+
+
+async def battery_night_check():
+    """Nachtautomatik: Batterie aus dem Netz laden, wenn alles zusammenkommt.
+
+    Start (höchstens einmal pro Nacht): Nachtfenster aktiv + SOC unter
+    PVUEB_BATT_LOW_SOC + Prognose der nächsten Tageslichtperiode unter
+    PVUEB_FORECAST_MIN_KWH. Ohne Prognose (API-Fehler) wird nicht geladen.
+    Am Ziel-SOC stoppt der Wechselrichter selbst; am Fensterende stoppen wir
+    eine automatisch gestartete Ladung. Der Web-Toggle bleibt unabhängig
+    nutzbar und wird von der Automatik nicht angefasst.
+    """
+    if not in_night_window():
+        state.battery_auto_started = False  # nächste Nacht darf wieder starten
+        if state.battery_grid_charge and state.battery_charge_auto:
+            log.info("NACHT: Fensterende — stoppe automatische Netzladung (SOC %s %%)", state.soc)
+            await stop_battery_grid_charge()
         return
-    if in_night_window() and not state.battery_grid_charge and state.soc < BATTERY_LOW_SOC:
-        state.battery_grid_charge = True
-        log.info("NACHT: Batterie-SOC %.0f %% < %.0f %% — würde Netzladung auf %.0f %% starten "
-                 "(noch inaktiv, Register unverifiziert)", state.soc, BATTERY_LOW_SOC, BATTERY_TARGET_SOC)
-    elif state.battery_grid_charge and (not in_night_window() or state.soc >= BATTERY_TARGET_SOC):
-        state.battery_grid_charge = False
-        log.info("NACHT: Batterie-Netzladung beendet (SOC %.0f %%)", state.soc)
+    if (state.soc is None or state.battery_grid_charge or state.battery_auto_started
+            or state.soc >= state.batt_low_soc):
+        return
+    label, kwh = relevant_forecast()
+    if kwh is None or kwh >= state.forecast_min_kwh:
+        return
+    log.info("NACHT: SOC %.0f %% < %.0f %% und Prognose %s nur %.1f kWh < %.1f kWh — "
+             "starte Netzladung auf %.0f %%", state.soc, state.batt_low_soc, label, kwh,
+             state.forecast_min_kwh, state.batt_target_soc)
+    error = await start_battery_grid_charge()
+    if error is None:
+        state.battery_auto_started = True
+        state.battery_charge_auto = True
+    else:
+        log.warning("NACHT: Start fehlgeschlagen (%s) — neuer Versuch im nächsten Takt", error)
 
 
 async def control_task():
     loop = asyncio.get_event_loop()
     while True:
-        await asyncio.sleep(POLL_INTERVAL_S)
+        await asyncio.sleep(state.poll_interval_s)
         await battery_night_check()
         if charge_point is None or state.grid_w is None:
             continue
@@ -319,9 +492,9 @@ async def control_task():
             if amps >= MIN_AMPS:
                 state.deficit_since = None
                 state.surplus_since = state.surplus_since or now
-                if now - state.surplus_since >= START_DELAY_S:
+                if now - state.surplus_since >= state.start_delay_s:
                     log.info("Überschuss %.0f W seit %ds — starte Ladung mit %d A",
-                             surplus, START_DELAY_S, amps)
+                             surplus, state.start_delay_s, amps)
                     await charge_point.set_limit(amps)
                     await charge_point.remote_start()
                     state.last_adjust = now
@@ -331,13 +504,13 @@ async def control_task():
             if amps < MIN_AMPS:
                 state.surplus_since = None
                 state.deficit_since = state.deficit_since or now
-                if now - state.deficit_since >= STOP_DELAY_S:
+                if now - state.deficit_since >= state.stop_delay_s:
                     log.info("Überschuss weg (%.0f W) seit %ds — stoppe Ladung",
-                             surplus, STOP_DELAY_S)
+                             surplus, state.stop_delay_s)
                     await charge_point.remote_stop()
             else:
                 state.deficit_since = None
-                if amps != state.current_limit and now - state.last_adjust >= ADJUST_MIN_INTERVAL_S:
+                if amps != state.current_limit and now - state.last_adjust >= state.adjust_min_interval_s:
                     log.info("Überschuss %.0f W — passe Limit an: %d → %d A",
                              surplus, state.current_limit, amps)
                     await charge_point.set_limit(amps)
@@ -379,6 +552,7 @@ def status_line() -> str:
             f"| Netz {state.grid_w} W | SOC {state.soc} % | Ladung {state.charge_w} W "
             f"| Überschuss {surplus:.0f} W | Limit {state.current_limit} A "
             f"| lädt: {state.charging} | Nachtfenster: {'ja' if in_night_window() else 'nein'} "
+            f"| Batterie-Netzladung: {'ja' if state.battery_grid_charge else 'nein'} "
             f"| Box: {'ja' if charge_point else 'nein'}")
 
 
@@ -415,6 +589,8 @@ INDEX_HTML = """<!doctype html>
 <button id="m_fast" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 <h2>Automatik</h2>
 <button id="night" onclick="toggleNight()">…</button>
+<h2>Batterie</h2>
+<button id="batt" onclick="toggleBatt()">…</button>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
   <input type="range" id="heartbeat" min="5" max="120" step="5"
@@ -443,6 +619,13 @@ async function refresh() {
     ["Ladeleistung", Math.round(s.charge_w) + " W"],
     ["Limit", s.current_limit + " A"],
     ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],
+    ["Batterie", s.battery_w === null ? "–"
+      : (s.battery_w >= 0 ? "lädt " : "entlädt ") + Math.abs(Math.round(s.battery_w)) + " W"],
+    ["Batterie-Netzladung", s.battery_grid_charge
+      ? "⚡ AKTIV" + (s.battery_charge_auto ? " (Automatik)" : "") + " bis " + s.batt_target_soc + " %"
+      : (s.forcible_cmd === 1 ? "aktiv (extern gestartet)" : "aus")],
+    ["Prognose " + s.forecast_label, s.forecast_kwh === null ? "–"
+      : (s.forecast_kwh < s.forecast_min_kwh ? "🌥 " : "☀️ ") + s.forecast_kwh.toFixed(1) + " kWh"],
     ["Wallbox", s.box_connected ? (s.charging ? "lädt" : "verbunden") : "getrennt"],
     ["Box-Status (OCPP)", s.box_status],
     ["Heartbeat Box", ago(s.box_seen_s)],
@@ -466,6 +649,16 @@ async function refresh() {
   nb.classList.toggle("on", s.night_enabled);
   nb.textContent = "Nachtladen " + (s.night_enabled ? "aktiv" : "aus") + " – nachts ab "
     + hhmm(s.night_start_min) + " bis " + hhmm(s.night_end_min) + " mit voller Leistung";
+  const bb = document.getElementById("batt");
+  bb.classList.toggle("on", s.battery_grid_charge);
+  bb.textContent = s.battery_grid_charge
+    ? "Batterie-Netzladung stoppen (lädt mit " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)"
+    : "Batterie-Netzladung starten (Test: " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)";
+}
+async function toggleBatt() {
+  const r = await fetch("/api/battery/"+(s.battery_grid_charge?"off":"on"), {method:"POST"});
+  if (!r.ok) alert(await r.text());
+  refresh();
 }
 async function setMode(m) { await fetch("/api/mode/"+m, {method:"POST"}); refresh(); }
 async function toggleRelease() {
@@ -496,6 +689,14 @@ async def http_status(_request):
         "night_end_min": state.night_end_min,
         "grid_w": state.grid_w,
         "soc": state.soc,
+        "battery_w": state.battery_w,
+        "batt_target_soc": state.batt_target_soc,
+        "batt_charge_w": state.batt_charge_w,
+        "forcible_cmd": state.forcible_cmd,
+        "battery_charge_auto": state.battery_charge_auto,
+        "forecast_label": relevant_forecast()[0],
+        "forecast_kwh": relevant_forecast()[1],
+        "forecast_min_kwh": state.forecast_min_kwh,
         "charge_w": state.charge_w,
         "surplus_w": (state.grid_w or 0) + state.charge_w,
         "current_limit": state.current_limit,
@@ -527,6 +728,16 @@ async def http_release(request):
     return web.json_response({"ok": True})
 
 
+async def http_battery(request):
+    if request.match_info["onoff"] == "on":
+        error = await start_battery_grid_charge()
+    else:
+        error = await stop_battery_grid_charge()
+    if error:
+        raise web.HTTPServiceUnavailable(text=error)
+    return web.json_response({"ok": True})
+
+
 async def http_config(request):
     cfg = await request.json()
     if "min_amps" in cfg:
@@ -555,6 +766,7 @@ async def web_task(port: int):
     app.router.add_get("/api/status", http_status)
     app.router.add_post("/api/mode/{mode}", http_mode)
     app.router.add_post("/api/release/{onoff}", http_release)
+    app.router.add_post("/api/battery/{onoff}", http_battery)
     app.router.add_post("/api/config", http_config)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -600,6 +812,24 @@ async def main():
     state.heartbeat_s = int(os.environ.get("PVUEB_HEARTBEAT_S", "10"))
     state.night_start_min = parse_hhmm(os.environ.get("PVUEB_NIGHT_START", "00:00"))
     state.night_end_min = parse_hhmm(os.environ.get("PVUEB_NIGHT_END", "08:00"))
+    state.batt_low_soc = float(os.environ.get("PVUEB_BATT_LOW_SOC", "30"))
+    state.batt_target_soc = float(os.environ.get("PVUEB_BATT_TARGET_SOC", "80"))
+    state.batt_charge_w = int(os.environ.get("PVUEB_BATT_CHARGE_W", "500"))
+    if not 0 < state.batt_low_soc < state.batt_target_soc <= 100:
+        sys.exit("PVUEB_BATT_LOW_SOC/TARGET_SOC unplausibel (0 < low < target <= 100 nötig)")
+    state.poll_interval_s = int(os.environ.get("PVUEB_POLL_INTERVAL_S", "5"))
+    state.adjust_min_interval_s = int(os.environ.get("PVUEB_ADJUST_MIN_INTERVAL_S", "25"))
+    state.start_delay_s = int(os.environ.get("PVUEB_START_DELAY_S", "120"))
+    state.stop_delay_s = int(os.environ.get("PVUEB_STOP_DELAY_S", "180"))
+    if min(state.poll_interval_s, state.adjust_min_interval_s,
+           state.start_delay_s, state.stop_delay_s) < 1:
+        sys.exit("Regelzeit-Parameter (PVUEB_*_S) müssen >= 1 Sekunde sein")
+    state.lat = float(os.environ.get("PVUEB_LAT", "52.25"))
+    state.lon = float(os.environ.get("PVUEB_LON", "10.66"))
+    state.pv_tilt = int(os.environ.get("PVUEB_PV_TILT", "42"))
+    state.pv_azimut = int(os.environ.get("PVUEB_PV_AZIMUT", "0"))
+    state.pv_kwp = float(os.environ.get("PVUEB_PV_KWP", "7"))
+    state.forecast_min_kwh = float(os.environ.get("PVUEB_FORECAST_MIN_KWH", "5"))
     if state.night_start_min == state.night_end_min:
         sys.exit("PVUEB_NIGHT_START und PVUEB_NIGHT_END dürfen nicht gleich sein")
 
@@ -607,7 +837,7 @@ async def main():
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
     await asyncio.gather(
         server.wait_closed(), modbus_task(args.inverter), control_task(),
-        command_loop(), web_task(args.web_port),
+        command_loop(), web_task(args.web_port), forecast_task(),
     )
 
 

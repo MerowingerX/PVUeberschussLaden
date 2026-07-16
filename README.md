@@ -14,11 +14,16 @@ Keine Geräteabstraktionen, keine Konfigurierbarkeit auf Vorrat (siehe [PLAN.md]
   - *Reines PV-Überschussladen* — lädt nur, wenn der Überschuss reicht (≥ ~4,2 kW bei 3-phasig/16 A)
   - *PV + Minimum* — lädt immer mit einstellbarem Mindeststrom (Slider 6–16 A), Überschuss oben drauf
   - *Sofort laden* — volle Leistung, PV egal
-- **Nachttarif-Automatik** (abschaltbar): im Tariffenster (fest im Code, Standard 00:00–08:00)
-  lädt ein freigegebenes Fahrzeug mit voller Leistung; Hausbatterie-Nachladung bei
-  SOC < 20 % ist vorbereitet (inaktiv, bis Schreibregister am Gerät verifiziert sind)
-- **Web-UI** fürs Handy: Live-Status (Netz, Überschuss, Ladeleistung, Batterie-SOC,
-  Box-Status, Heartbeats), Freigabe-, Modus- und Automatik-Buttons
+- **Nachttarif-Automatik** (abschaltbar): im Tariffenster (`.env`, Standard 00:00–08:00)
+  lädt ein freigegebenes Fahrzeug mit voller Leistung
+- **Hausbatterie aus dem Netz laden** (LUNA2000-Zwangsladung, Register verifiziert,
+  live getestet): per Web-Toggle oder Automatik — nachts bei SOC < Schwelle, aber nur,
+  wenn die Sonnenprognose (forecast.solar) für den nächsten Tag unter der Schwelle
+  liegt. Lädt bis Ziel-SOC, der Wechselrichter stoppt am Ziel selbst. Details:
+  [features/feature_NachtStromInHuaweiBatterie.md](features/feature_NachtStromInHuaweiBatterie.md)
+- **Web-UI** fürs Handy: Live-Status (Netz, Überschuss, Ladeleistung, Batterie-SOC und
+  -Leistung, Netzladung, Box-Status, Heartbeats), Freigabe-, Modus-, Automatik- und
+  Batterie-Buttons
 - Batterie-Priorität ohne Extra-Logik: als Überschuss zählt nur die Einspeisung —
   der Wechselrichter füllt den Hausspeicher von selbst zuerst
 
@@ -38,16 +43,22 @@ cp .env.example .env        # PVUEB_INVERTER_IP eintragen (IP des SDongle)
 ```
 
 Alle anlagenspezifischen Werte (IPs, OCPP-URL) bleiben in `.env` bzw. `LOCAL.md` —
-beide sind gitignored. Feste Parameter (bewusst nur im Code änderbar, `poc/charge_loop.py`):
+beide sind gitignored. Auch alle Tuning-Parameter kommen aus der `.env`
+(Übersicht mit Defaults: [.env.example](.env.example)):
+
+| .env-Bereich | Variablen |
+|---|---|
+| Nachttarif-Fenster | `PVUEB_NIGHT_START/_END` (HH:MM, auch über Mitternacht) |
+| Regelzeiten (Hysterese) | `PVUEB_START_DELAY_S`, `PVUEB_STOP_DELAY_S`, `PVUEB_ADJUST_MIN_INTERVAL_S`, `PVUEB_POLL_INTERVAL_S` |
+| Batterie-Netzladung | `PVUEB_BATT_LOW_SOC`, `PVUEB_BATT_TARGET_SOC`, `PVUEB_BATT_CHARGE_W` |
+| Standort & PV (Prognose) | `PVUEB_LAT/LON`, `PVUEB_PV_KWP/TILT/AZIMUT`, `PVUEB_FORECAST_MIN_KWH` |
+
+Bewusst fest im Code (`poc/charge_loop.py`, siehe Designprinzip):
 
 | Parameter | Standard | Bedeutung |
 |---|---|---|
 | `PHASES`, `VOLTAGE` | 3, 230 V | Anschluss der Wallbox |
 | `MIN_AMPS`, `MAX_AMPS` | 6, 16 A | Regelbereich (IEC 61851 / 11-kW-Box) |
-| `PVUEB_NIGHT_START/_END` (.env) | 00:00–08:00 | Nachttarif-Fenster (Tarif-Parameter), auch über Mitternacht (22:00→06:00) |
-| `START_DELAY_S` / `STOP_DELAY_S` | 120 / 180 s | Hysterese gegen Wolken-Flattern |
-| `ADJUST_MIN_INTERVAL_S` | 25 s | Mindestabstand zwischen Limit-Änderungen |
-| `BATTERY_LOW_SOC` / `BATTERY_TARGET_SOC` | 20 / 80 % | Nachtladung Hausbatterie |
 
 ### Einrichtung: Docker auf dem Raspberry Pi (empfohlen)
 
@@ -85,6 +96,7 @@ python -m venv .venv
 | [poc/read_sun2000.py](poc/read_sun2000.py) | M1 ✅ Modbus-Lesen (Register verifiziert, 10-min-Stabilität) |
 | [poc/ocpp_server.py](poc/ocpp_server.py) | M2 ✅ OCPP-Server, Box verbunden, Kommandos akzeptiert |
 | [poc/charge_loop.py](poc/charge_loop.py) | M3 ⏳ Regel-Loop + Web-UI (Ladetest mit Fahrzeug ausstehend) |
+| [poc/read_battery_registers.py](poc/read_battery_registers.py) | ✅ LUNA2000-Steuerregister verifiziert (nur lesend) |
 | [poc/README.md](poc/README.md) | Testprotokolle und Erfolgskriterien je Meilenstein |
 
 Danach: M4 Vue-Dashboard, M5 Historie (SQLite), M6 Pi-Deployment (systemd).
