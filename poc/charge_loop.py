@@ -56,8 +56,8 @@ ADJUST_MIN_INTERVAL_S = 25   # Limit höchstens so oft ändern
 START_DELAY_S = 120          # Überschuss muss so lange reichen, bevor Start
 STOP_DELAY_S = 180           # Überschuss muss so lange fehlen, bevor Stopp
 
-NIGHT_START_MIN = 0          # Nachttarif-Beginn 00:00 (fest, Tarif-Parameter)
-NIGHT_END_MIN = 8 * 60       # Nachttarif-Ende 08:00 (fest, Tarif-Parameter)
+# Nachttarif-Fenster: Tarif-Parameter, konfigurierbar über .env
+# (PVUEB_NIGHT_START / PVUEB_NIGHT_END im Format HH:MM), Default 00:00-08:00
 BATTERY_LOW_SOC = 20.0       # unter diesem SOC um Mitternacht: Netzladung ...
 BATTERY_TARGET_SOC = 80.0    # ... bis zu diesem Ziel
 
@@ -71,6 +71,8 @@ class State:
     min_amps = MIN_AMPS          # Untergrenze im Modus minpv (justierbar im UI)
     night_enabled = True         # Nachtladen-Automatik an/aus
     heartbeat_s = 10             # OCPP-Heartbeat der Box (justierbar im UI, Default aus .env)
+    night_start_min = 0          # Nachttarif-Beginn in Minuten seit 00:00 (aus .env)
+    night_end_min = 8 * 60       # Nachttarif-Ende (aus .env)
     grid_w: float | None = None  # positiv = Einspeisung
     soc: float | None = None     # Batterie-SOC in %
     charge_w = 0.0               # letzte bekannte Ladeleistung
@@ -90,7 +92,7 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
         return False
     t = now or datetime.datetime.now()
     minutes = t.hour * 60 + t.minute
-    start, end = NIGHT_START_MIN, NIGHT_END_MIN
+    start, end = state.night_start_min, state.night_end_min
     if start < end:
         return start <= minutes < end
     return minutes >= start or minutes < end  # Fenster über Mitternacht (z. B. 23:00–08:00)
@@ -490,8 +492,8 @@ async def http_status(_request):
         "min_amps": state.min_amps,
         "night_enabled": state.night_enabled,
         "heartbeat_s": state.heartbeat_s,
-        "night_start_min": NIGHT_START_MIN,
-        "night_end_min": NIGHT_END_MIN,
+        "night_start_min": state.night_start_min,
+        "night_end_min": state.night_end_min,
         "grid_w": state.grid_w,
         "soc": state.soc,
         "charge_w": state.charge_w,
@@ -562,6 +564,17 @@ async def web_task(port: int):
     await asyncio.Event().wait()
 
 
+def parse_hhmm(text: str) -> int:
+    try:
+        hours, _, minutes = text.strip().partition(":")
+        result = int(hours) * 60 + int(minutes or 0)
+        if not 0 <= result < 24 * 60:
+            raise ValueError
+        return result
+    except ValueError:
+        sys.exit(f"Ungültige Uhrzeit {text!r} — erwartet HH:MM (z. B. 22:30)")
+
+
 def load_dotenv():
     """Minimaler .env-Lader (Projektverzeichnis), ohne Zusatz-Dependency."""
     env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -585,6 +598,10 @@ async def main():
     if not args.inverter:
         sys.exit("Wechselrichter-IP fehlt: --inverter, PVUEB_INVERTER_IP oder .env setzen")
     state.heartbeat_s = int(os.environ.get("PVUEB_HEARTBEAT_S", "10"))
+    state.night_start_min = parse_hhmm(os.environ.get("PVUEB_NIGHT_START", "00:00"))
+    state.night_end_min = parse_hhmm(os.environ.get("PVUEB_NIGHT_END", "08:00"))
+    if state.night_start_min == state.night_end_min:
+        sys.exit("PVUEB_NIGHT_START und PVUEB_NIGHT_END dürfen nicht gleich sein")
 
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)

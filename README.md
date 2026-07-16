@@ -44,7 +44,7 @@ beide sind gitignored. Feste Parameter (bewusst nur im Code änderbar, `poc/char
 |---|---|---|
 | `PHASES`, `VOLTAGE` | 3, 230 V | Anschluss der Wallbox |
 | `MIN_AMPS`, `MAX_AMPS` | 6, 16 A | Regelbereich (IEC 61851 / 11-kW-Box) |
-| `NIGHT_START_MIN`, `NIGHT_END_MIN` | 00:00–08:00 | Nachttarif-Fenster (Tarif-Parameter) |
+| `PVUEB_NIGHT_START/_END` (.env) | 00:00–08:00 | Nachttarif-Fenster (Tarif-Parameter), auch über Mitternacht (22:00→06:00) |
 | `START_DELAY_S` / `STOP_DELAY_S` | 120 / 180 s | Hysterese gegen Wolken-Flattern |
 | `ADJUST_MIN_INTERVAL_S` | 25 s | Mindestabstand zwischen Limit-Änderungen |
 | `BATTERY_LOW_SOC` / `BATTERY_TARGET_SOC` | 20 / 80 % | Nachtladung Hausbatterie |
