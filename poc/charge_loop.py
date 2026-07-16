@@ -70,6 +70,7 @@ class State:
     released = False             # manuelle Freigabe (Knopfdruck)
     min_amps = MIN_AMPS          # Untergrenze im Modus minpv (justierbar im UI)
     night_enabled = True         # Nachtladen-Automatik an/aus
+    heartbeat_s = 10             # OCPP-Heartbeat der Box (justierbar im UI, Default aus .env)
     grid_w: float | None = None  # positiv = Einspeisung
     soc: float | None = None     # Batterie-SOC in %
     charge_w = 0.0               # letzte bekannte Ladeleistung
@@ -108,23 +109,25 @@ class ChargePoint(OcppChargePoint):
         asyncio.get_event_loop().create_task(self.configure_metering())
         return call_result.BootNotification(
             current_time=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            interval=10,
+            interval=state.heartbeat_s,
             status=RegistrationStatus.accepted,
         )
 
+    async def change_configuration(self, key: str, value: str):
+        try:
+            response = await self.call(call.ChangeConfiguration(key=key, value=value))
+            log.info("ChangeConfiguration %s=%s: %s", key, value,
+                     response.status if response else "keine Antwort")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ChangeConfiguration %s fehlgeschlagen: %s", key, exc)
+
     async def configure_metering(self):
         await asyncio.sleep(2)  # Boot-Antwort erst rausgehen lassen
-        for key, value in (
-            ("HeartbeatInterval", "10"),
-            ("MeterValueSampleInterval", "10"),
-            ("MeterValuesSampledData", "Power.Active.Import,Energy.Active.Import.Register"),
-        ):
-            try:
-                response = await self.call(call.ChangeConfiguration(key=key, value=value))
-                log.info("ChangeConfiguration %s=%s: %s", key, value,
-                         response.status if response else "keine Antwort")
-            except Exception as exc:  # noqa: BLE001
-                log.warning("ChangeConfiguration %s fehlgeschlagen: %s", key, exc)
+        await self.change_configuration("HeartbeatInterval", str(state.heartbeat_s))
+        await self.change_configuration("MeterValueSampleInterval", "10")
+        await self.change_configuration(
+            "MeterValuesSampledData", "Power.Active.Import,Energy.Active.Import.Register"
+        )
 
     @on("Heartbeat")
     def on_heartbeat(self):
@@ -410,6 +413,12 @@ INDEX_HTML = """<!doctype html>
 <button id="m_fast" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 <h2>Automatik</h2>
 <button id="night" onclick="toggleNight()">…</button>
+<h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
+<div class="slider-row">
+  <input type="range" id="heartbeat" min="5" max="120" step="5"
+         oninput="document.getElementById('hblabel').textContent=this.value"
+         onchange="setConfig({heartbeat_s: +this.value})">
+</div>
 <script>
 let s = {};
 function ago(sec) {
@@ -446,6 +455,11 @@ async function refresh() {
     mi.value = s.min_amps;
     document.getElementById("minlabel").textContent = s.min_amps;
   }
+  const hb = document.getElementById("heartbeat");
+  if (document.activeElement !== hb) {
+    hb.value = s.heartbeat_s;
+    document.getElementById("hblabel").textContent = s.heartbeat_s;
+  }
   const nb = document.getElementById("night");
   nb.classList.toggle("on", s.night_enabled);
   nb.textContent = "Nachtladen " + (s.night_enabled ? "aktiv" : "aus") + " – nachts ab "
@@ -475,6 +489,7 @@ async def http_status(_request):
         "released": state.released,
         "min_amps": state.min_amps,
         "night_enabled": state.night_enabled,
+        "heartbeat_s": state.heartbeat_s,
         "night_start_min": NIGHT_START_MIN,
         "night_end_min": NIGHT_END_MIN,
         "grid_w": state.grid_w,
@@ -521,6 +536,14 @@ async def http_config(request):
     if "night_enabled" in cfg:
         state.night_enabled = bool(cfg["night_enabled"])
         log.info("Nachtladen (Web): %s", "aktiv" if state.night_enabled else "aus")
+    if "heartbeat_s" in cfg:
+        hb = int(cfg["heartbeat_s"])
+        if not 5 <= hb <= 300:
+            raise web.HTTPBadRequest(text="heartbeat_s muss 5–300 sein")
+        state.heartbeat_s = hb
+        log.info("Heartbeat (Web): %s s", hb)
+        if charge_point is not None:
+            await charge_point.change_configuration("HeartbeatInterval", str(hb))
     return web.json_response({"ok": True})
 
 
@@ -561,6 +584,7 @@ async def main():
     args = parser.parse_args()
     if not args.inverter:
         sys.exit("Wechselrichter-IP fehlt: --inverter, PVUEB_INVERTER_IP oder .env setzen")
+    state.heartbeat_s = int(os.environ.get("PVUEB_HEARTBEAT_S", "10"))
 
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
