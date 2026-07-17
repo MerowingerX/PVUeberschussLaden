@@ -682,6 +682,17 @@ function ago(sec) {
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
 }
+function minpvInfo() {
+  if (s.mode !== "minpv") return "–";
+  const minW = s.min_amps * WPA;
+  if (s.minpv_low_s !== null) {
+    const rest = Math.max(0, s.minpv_timeout_s - s.minpv_low_s);
+    return "⛅ Wolkenloch – Stopp in " + rest + " s, Erholung ab "
+      + Math.round(s.minpv_resume_factor * minW) + " W";
+  }
+  if (s.charging) return "lädt – Timeout ab < " + Math.round(s.minpv_pause_factor * minW) + " W";
+  return "wartet – Start ab " + Math.round(s.minpv_start_factor * minW) + " W";
+}
 function heart(seen_s, limit) {
   const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
   return ok ? '<span class="heart">❤️</span>' : '<span class="heart dead">💔</span>';
@@ -705,6 +716,9 @@ async function refresh() {
   const drows = [
     ["Box-Status (OCPP)", s.box_status],
     ["Limit", s.current_limit + " A"],
+    ["PV-Überschuss echt", s.pv_surplus_w === null ? "–"
+      : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
+    ["minpv-Hysterese", minpvInfo()],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
   ];
@@ -794,6 +808,14 @@ async def http_status(_request):
         "forecast_min_kwh": state.forecast_min_kwh,
         "charge_w": state.charge_w,
         "surplus_w": (state.grid_w or 0) + state.charge_w,
+        "pv_surplus_w": None if state.grid_w is None
+                        else state.grid_w + state.charge_w + (state.battery_w or 0),
+        "minpv_low_s": None if state.minpv_low_since is None
+                       else round(asyncio.get_event_loop().time() - state.minpv_low_since),
+        "minpv_timeout_s": state.minpv_timeout_s,
+        "minpv_start_factor": state.minpv_start_factor,
+        "minpv_pause_factor": state.minpv_pause_factor,
+        "minpv_resume_factor": state.minpv_resume_factor,
         "current_limit": state.current_limit,
         "charging": state.charging,
         "night": in_night_window(),
