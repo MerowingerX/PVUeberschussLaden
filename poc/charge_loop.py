@@ -636,7 +636,6 @@ async function refresh() {
     ["Überschuss", Math.round(s.surplus_w) + " W"],
     ["Ladeleistung", Math.round(s.charge_w) + " W"],
     ["Limit", s.current_limit + " A"],
-    ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],
     ["Wallbox", s.box_connected ? (s.charging ? "lädt" : "verbunden") : "getrennt"],
     ["Box-Status (OCPP)", s.box_status],
     ["Heartbeat Box", ago(s.box_seen_s)],
