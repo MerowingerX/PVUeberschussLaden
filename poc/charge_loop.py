@@ -582,36 +582,51 @@ INDEX_HTML = """<!doctype html>
   .dot { display:inline-block; width:.5rem; height:.5rem; border-radius:50%;
          background:#555; margin:0 .3rem; }
   .dot.on { background:#eee; }
+  .heart { display:inline-block; animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { transform:scale(1); } 50% { transform:scale(1.3); } }
+  .heart.dead { animation:none; filter:grayscale(1) brightness(.6); }
+  .modes { border:1px solid #444; border-radius:.6rem; padding:.2rem .5rem .5rem; }
+  button.mode { padding-left:2.4rem; position:relative; }
+  button.mode::before { content:"○"; position:absolute; left:.9rem; }
+  button.mode.on::before { content:"●"; }
 </style></head><body>
 <h1>PVueb – Überschussladen</h1>
-<div class="dots"><span class="dot on"></span><span class="dot"></span></div>
+<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span></div>
 <div class="pages" id="pages">
 <section class="page">
-<button id="frei" onclick="toggleRelease()">…</button>
 <div id="stat"></div>
-<h2>Lademodus</h2>
-<button id="m_pv" onclick="setMode('pv')">Reines PV-Überschussladen</button>
-<button id="m_minpv" onclick="setMode('minpv')">PV-Überschussladen, aber mindestens
+<h2>Lademodus – genau eine Option</h2>
+<div class="modes">
+<button id="m_pv" class="mode" onclick="setMode('pv')">Reines PV-Überschussladen</button>
+<button id="m_minpv" class="mode" onclick="setMode('minpv')">PV-Überschussladen, aber mindestens
   <span id="minlabel">6</span> A</button>
-<div class="slider-row">
-  <input type="range" id="minamps" min="6" max="16" step="1"
-         oninput="document.getElementById('minlabel').textContent=this.value"
-         onchange="setConfig({min_amps: +this.value})">
+<button id="m_fast" class="mode" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 </div>
-<button id="m_fast" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 <h2>Automatik</h2>
 <button id="night" onclick="toggleNight()">…</button>
+</section>
+<section class="page">
+<h2>Huawei-Batterie <span id="hheart"></span></h2>
+<div id="batstat"></div>
+<button id="batt" onclick="toggleBatt()">…</button>
+</section>
+<section class="page">
+<h2>Debug</h2>
+<button id="frei" onclick="toggleRelease()">…</button>
+<div id="dbgstat"></div>
+<h2>Mindest-Ladestrom: <span id="minlabel2">6</span> A</h2>
+<div class="slider-row">
+  <input type="range" id="minamps" min="6" max="16" step="1"
+         oninput="document.getElementById('minlabel').textContent=this.value;
+                  document.getElementById('minlabel2').textContent=this.value"
+         onchange="setConfig({min_amps: +this.value})">
+</div>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
   <input type="range" id="heartbeat" min="5" max="120" step="5"
          oninput="document.getElementById('hblabel').textContent=this.value"
          onchange="setConfig({heartbeat_s: +this.value})">
 </div>
-</section>
-<section class="page">
-<h2>Huawei-Batterie</h2>
-<div id="batstat"></div>
-<button id="batt" onclick="toggleBatt()">…</button>
 </section>
 </div>
 <script>
@@ -624,24 +639,34 @@ function ago(sec) {
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
 }
+function heart(seen_s, limit) {
+  const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
+  return ok ? '<span class="heart">❤️</span>' : '<span class="heart dead">💔</span>';
+}
 async function refresh() {
   s = await (await fetch("/api/status")).json();
   const f = document.getElementById("frei");
   f.textContent = s.released ? "Freigegeben – tippen zum Sperren" : "GESPERRT – tippen zum Freigeben";
   f.className = s.released ? "on" : "warn";
   const row = r => `<div class="row"><span>${r[0]}</span><span class="val">${r[1]}</span></div>`;
+  const boxLimit = Math.max(90, 3 * s.heartbeat_s);
   const rows = [
     ["Nachtfenster", s.night ? "🌙 AKTIV – lädt mit voller Leistung" : "inaktiv"],
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
     ["Überschuss", Math.round(s.surplus_w) + " W"],
     ["Ladeleistung", Math.round(s.charge_w) + " W"],
-    ["Limit", s.current_limit + " A"],
-    ["Wallbox", s.box_connected ? (s.charging ? "lädt" : "verbunden") : "getrennt"],
+    ["Wallbox", heart(s.box_seen_s, boxLimit) + " "
+      + (s.box_connected ? (s.charging ? "⚡ lädt" : "🔌 verbunden") : "⛔ getrennt")],
+  ];
+  document.getElementById("stat").innerHTML = rows.map(row).join("");
+  const drows = [
     ["Box-Status (OCPP)", s.box_status],
+    ["Limit", s.current_limit + " A"],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
   ];
-  document.getElementById("stat").innerHTML = rows.map(row).join("");
+  document.getElementById("dbgstat").innerHTML = drows.map(row).join("");
+  document.getElementById("hheart").innerHTML = heart(s.huawei_seen_s, 90);
   const brows = [
     ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],
     ["Batterie", s.battery_w === null ? "–"
@@ -652,7 +677,6 @@ async function refresh() {
     ["Prognose " + s.forecast_label, s.forecast_kwh === null ? "–"
       : (s.forecast_kwh < s.forecast_min_kwh ? "🌥 " : "☀️ ") + s.forecast_kwh.toFixed(1) + " kWh"],
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
-    ["Heartbeat Huawei", ago(s.huawei_seen_s)],
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
   for (const m of ["pv","minpv","fast"])
@@ -661,6 +685,7 @@ async function refresh() {
   if (document.activeElement !== mi) {
     mi.value = s.min_amps;
     document.getElementById("minlabel").textContent = s.min_amps;
+    document.getElementById("minlabel2").textContent = s.min_amps;
   }
   const hb = document.getElementById("heartbeat");
   if (document.activeElement !== hb) {
