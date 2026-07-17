@@ -50,6 +50,7 @@ beide sind gitignored. Auch alle Tuning-Parameter kommen aus der `.env`
 |---|---|
 | Nachttarif-Fenster | `PVUEB_NIGHT_START/_END` (HH:MM, auch über Mitternacht) |
 | Regelzeiten (Hysterese) | `PVUEB_START_DELAY_S`, `PVUEB_STOP_DELAY_S`, `PVUEB_ADJUST_MIN_INTERVAL_S`, `PVUEB_POLL_INTERVAL_S` |
+| minpv-Trigger (Wolkenloch) | `PVUEB_MINPV_START_FACTOR`, `PVUEB_MINPV_PAUSE_FACTOR`, `PVUEB_MINPV_RESUME_FACTOR`, `PVUEB_MINPV_TIMEOUT_MIN` |
 | Batterie-Netzladung | `PVUEB_BATT_LOW_SOC`, `PVUEB_BATT_TARGET_SOC`, `PVUEB_BATT_CHARGE_W` |
 | Standort & PV (Prognose) | `PVUEB_LAT/LON`, `PVUEB_PV_KWP/TILT/AZIMUT`, `PVUEB_FORECAST_MIN_KWH` |
 

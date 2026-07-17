@@ -17,6 +17,13 @@ Nachttarif: 00:00–08:00 lädt ein freigegebenes, eingestecktes Fahrzeug
 unabhängig vom Modus mit voller Leistung (16 A). Ab 08:00 gilt wieder
 der eingestellte Modus.
 
+minpv-Trigger (PVUEB_MINPV_*): Start erst, wenn der echte PV-Überschuss
+(inkl. Batterie-Korrektur: Hausbatterie-Ladung zählt als verfügbar,
+Entladung nicht) über START_FACTOR × Min-Leistung liegt. Während der
+Ladung überbrückt ein Timeout (TIMEOUT_MIN) Wolkenlöcher: unter
+PAUSE_FACTOR × Min startet er, über RESUME_FACTOR × Min wird er
+verworfen, bei Ablauf stoppt die Ladung.
+
 Batterie-Netzladung (LUNA2000-Zwangsladung, Register verifiziert 2026-07-16):
 lädt mit PVUEB_BATT_CHARGE_W bis PVUEB_BATT_TARGET_SOC, der Wechselrichter
 stoppt am Ziel selbst. Manuell jederzeit über den Web-Toggle; Automatik
@@ -93,6 +100,10 @@ class State:
     adjust_min_interval_s = 25   # Limit höchstens so oft ändern (aus .env)
     start_delay_s = 120          # Überschuss muss so lange reichen, bevor Start (aus .env)
     stop_delay_s = 180           # Überschuss muss so lange fehlen, bevor Stopp (aus .env)
+    minpv_start_factor = 1.25    # minpv: Start erst ab Faktor × Min-Leistung PV-Überschuss (aus .env)
+    minpv_pause_factor = 0.75    # minpv: darunter beginnt der Wolkenloch-Timeout (aus .env)
+    minpv_resume_factor = 0.90   # minpv: darüber wird der Timeout wieder verworfen (aus .env)
+    minpv_timeout_s = 600        # minpv: so lange werden Wolken überbrückt (aus .env)
     batt_low_soc = 30.0          # Automatik-Startschwelle in % (aus .env)
     batt_target_soc = 80.0       # Netzladung bis zu diesem SOC (aus .env)
     batt_charge_w = 500          # Leistung der Zwangsladung in W (aus .env)
@@ -112,6 +123,7 @@ class State:
     current_limit = 0            # zuletzt gesetztes Limit in A
     surplus_since: float | None = None   # Zeitstempel: Überschuss reicht seit ...
     deficit_since: float | None = None   # Zeitstempel: Überschuss fehlt seit ...
+    minpv_low_since: float | None = None # Zeitstempel: PV-Überschuss unter Pause-Schwelle seit ...
     last_adjust = 0.0
     battery_grid_charge = False  # von uns gestartete Zwangsladung aktiv
     forcible_cmd: int | None = None      # gelesenes Register 47100 (0/1/2)
@@ -472,7 +484,7 @@ async def control_task():
             if state.charging:
                 log.info("Freigabe fehlt — stoppe Ladung")
                 await charge_point.remote_stop()
-            state.surplus_since = state.deficit_since = None
+            state.surplus_since = state.deficit_since = state.minpv_low_since = None
             continue
 
         # Nachttarif-Fenster oder Modus "fast": volle Leistung
@@ -484,12 +496,20 @@ async def control_task():
             continue
 
         surplus = state.grid_w + state.charge_w
+        # Echter PV-Überschuss: Batterie-Ladung wäre für das Auto verfügbar,
+        # Batterie-Entladung täuscht Überschuss nur vor (Netzpunkt bleibt ~0)
+        pv_surplus = surplus + (state.battery_w or 0)
         amps = target_amps(surplus)
+        min_w = state.min_amps * VOLTAGE * PHASES
         if state.mode == "minpv":
             amps = max(state.min_amps, amps)
 
         if not state.charging:
-            if amps >= MIN_AMPS:
+            if state.mode == "minpv":
+                ready = pv_surplus >= state.minpv_start_factor * min_w
+            else:
+                ready = amps >= MIN_AMPS
+            if ready:
                 state.deficit_since = None
                 state.surplus_since = state.surplus_since or now
                 if now - state.surplus_since >= state.start_delay_s:
@@ -501,6 +521,28 @@ async def control_task():
             else:
                 state.surplus_since = None
         else:
+            if state.mode == "minpv":
+                # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
+                # Erholung über Resume-Schwelle verwirft ihn, Ablauf stoppt die Ladung
+                if pv_surplus > state.minpv_resume_factor * min_w:
+                    if state.minpv_low_since is not None:
+                        log.info("minpv: PV-Überschuss erholt (%.0f W) — Wolkenloch überbrückt",
+                                 pv_surplus)
+                    state.minpv_low_since = None
+                elif pv_surplus < state.minpv_pause_factor * min_w:
+                    if state.minpv_low_since is None:
+                        state.minpv_low_since = now
+                        log.info("minpv: PV-Überschuss nur %.0f W (< %.0f W) — stoppe in %ds, "
+                                 "falls keine Erholung", pv_surplus,
+                                 state.minpv_pause_factor * min_w, state.minpv_timeout_s)
+                if (state.minpv_low_since is not None
+                        and now - state.minpv_low_since >= state.minpv_timeout_s):
+                    log.info("minpv: PV-Überschuss seit %ds unter %.0f %% Min — stoppe Ladung",
+                             state.minpv_timeout_s, state.minpv_resume_factor * 100)
+                    await charge_point.remote_stop()
+                    state.minpv_low_since = None
+                    state.surplus_since = state.deficit_since = None
+                    continue
             if amps < MIN_AMPS:
                 state.surplus_since = None
                 state.deficit_since = state.deficit_since or now
@@ -532,7 +574,7 @@ async def command_loop():
             os._exit(0)
         elif cmd == "mode" and len(parts) == 2 and parts[1] in ("pv", "minpv", "fast"):
             state.mode = parts[1]
-            state.surplus_since = state.deficit_since = None
+            state.surplus_since = state.deficit_since = state.minpv_low_since = None
             log.info("Modus: %s", state.mode)
         elif cmd in ("frei", "release"):
             state.released = True
@@ -598,7 +640,7 @@ INDEX_HTML = """<!doctype html>
 <h2>Lademodus – genau eine Option</h2>
 <div class="modes">
 <button id="m_pv" class="mode" onclick="setMode('pv')">Reines PV-Überschussladen</button>
-<button id="m_minpv" class="mode" onclick="setMode('minpv')">PV-Überschussladen, aber mindestens
+<button id="m_minpv" class="mode" onclick="setMode('minpv')">PV-Überschussladen, mindestens
   <span id="minlabel">6</span> A</button>
 <button id="m_fast" class="mode" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
 </div>
@@ -631,6 +673,7 @@ INDEX_HTML = """<!doctype html>
 </div>
 <script>
 let s = {};
+const WPA = 690;  // W pro Ampere: 3 Phasen × 230 V
 function ago(sec) {
   if (sec === null || sec === undefined) return "noch nie";
   if (sec < 90) return "vor " + sec + " s";
@@ -653,8 +696,8 @@ async function refresh() {
   const rows = [
     ["Nachtfenster", s.night ? "🌙 AKTIV – lädt mit voller Leistung" : "inaktiv"],
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
-    ["Überschuss", Math.round(s.surplus_w) + " W"],
-    ["Ladeleistung", Math.round(s.charge_w) + " W"],
+    ["Überschuss", Math.round(s.surplus_w) + " W ≈ " + (s.surplus_w / WPA).toFixed(1) + " A"],
+    ["Ladeleistung", Math.round(s.charge_w) + " W ≈ " + (s.charge_w / WPA).toFixed(1) + " A"],
     ["Wallbox", heart(s.box_seen_s, boxLimit) + " "
       + (s.box_connected ? (s.charging ? "⚡ lädt" : "🔌 verbunden") : "⛔ getrennt")],
   ];
@@ -769,7 +812,7 @@ async def http_mode(request):
     if mode not in ("pv", "minpv", "fast"):
         raise web.HTTPBadRequest(text="mode muss pv|minpv|fast sein")
     state.mode = mode
-    state.surplus_since = state.deficit_since = None
+    state.surplus_since = state.deficit_since = state.minpv_low_since = None
     log.info("Modus (Web): %s", mode)
     return web.json_response({"ok": True})
 
@@ -873,6 +916,12 @@ async def main():
     state.adjust_min_interval_s = int(os.environ.get("PVUEB_ADJUST_MIN_INTERVAL_S", "25"))
     state.start_delay_s = int(os.environ.get("PVUEB_START_DELAY_S", "120"))
     state.stop_delay_s = int(os.environ.get("PVUEB_STOP_DELAY_S", "180"))
+    state.minpv_start_factor = float(os.environ.get("PVUEB_MINPV_START_FACTOR", "1.25"))
+    state.minpv_pause_factor = float(os.environ.get("PVUEB_MINPV_PAUSE_FACTOR", "0.75"))
+    state.minpv_resume_factor = float(os.environ.get("PVUEB_MINPV_RESUME_FACTOR", "0.90"))
+    state.minpv_timeout_s = int(float(os.environ.get("PVUEB_MINPV_TIMEOUT_MIN", "10")) * 60)
+    if not 0 < state.minpv_pause_factor < state.minpv_resume_factor <= state.minpv_start_factor:
+        sys.exit("PVUEB_MINPV_*_FACTOR unplausibel (0 < pause < resume <= start nötig)")
     if min(state.poll_interval_s, state.adjust_min_interval_s,
            state.start_delay_s, state.stop_delay_s) < 1:
         sys.exit("Regelzeit-Parameter (PVUEB_*_S) müssen >= 1 Sekunde sein")
