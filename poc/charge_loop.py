@@ -24,6 +24,24 @@ Ladung überbrückt ein Timeout (TIMEOUT_MIN) Wolkenlöcher: unter
 PAUSE_FACTOR × Min startet er, über RESUME_FACTOR × Min wird er
 verworfen, bei Ablauf stoppt die Ladung.
 
+Der Überschuss wird als Netzleistung + Ladeleistung gerechnet, die eigene
+Ladung also wieder herausgerechnet. Die Ladeleistung kommt aus den
+MeterValues der Box (Power.Active.Import, ersatzweise aus der Differenz des
+Energiezählers); fehlt beides oder ist der Wert älter als
+PVUEB_CHARGE_W_MAX_AGE_S, wird er aus dem gesetzten Limit geschätzt — sonst
+sähe der Regler beim Ladestart einen PV-Einbruch, der keiner ist.
+
+Ladeleistung folgt dem gleitenden Mittel des echten PV-Überschusses (inkl.
+Batterie-Ladeleistung, die das Auto bekommen kann), gedeckelt auf den
+Momentanwert plus Batterie-Boost. Zwei Fenster: PVUEB_AVG_WINDOW_MIN beim
+Regeln der laufenden Ladung, PVUEB_START_AVG_MIN (kurz) für die
+Startentscheidung, damit der Start nicht dem trägen Mittel hinterherhinkt.
+Batterie-Boost (PVUEB_BOOST_*): bricht die PV-Leistung
+kurz ein (Wolke), schiebt die Hausbatterie bis zu PVUEB_BOOST_W nach, statt die
+Ladung herunterzuregeln — Tagesbudget PVUEB_BOOST_W × PVUEB_BOOST_H, nur bei
+laufender Ladung und SOC über PVUEB_BOOST_MIN_SOC. Nachgeladen wird die
+Batterie danach aus PV oder nachts über die Netzladung.
+
 Batterie-Netzladung (LUNA2000-Zwangsladung, Register verifiziert 2026-07-16):
 lädt mit PVUEB_BATT_CHARGE_W bis PVUEB_BATT_TARGET_SOC, der Wechselrichter
 stoppt am Ziel selbst. Manuell jederzeit über den Web-Toggle; Automatik
@@ -34,6 +52,7 @@ PVUEB_FORECAST_MIN_KWH liegt.
 
 import argparse
 import asyncio
+import collections
 import datetime
 import logging
 import os
@@ -100,10 +119,21 @@ class State:
     adjust_min_interval_s = 25   # Limit höchstens so oft ändern (aus .env)
     start_delay_s = 120          # Überschuss muss so lange reichen, bevor Start (aus .env)
     stop_delay_s = 180           # Überschuss muss so lange fehlen, bevor Stopp (aus .env)
-    minpv_start_factor = 1.25    # minpv: Start erst ab Faktor × Min-Leistung PV-Überschuss (aus .env)
+    minpv_start_factor = 1.10    # minpv: Start erst ab Faktor × Min-Leistung PV-Überschuss (aus .env)
     minpv_pause_factor = 0.75    # minpv: darunter beginnt der Wolkenloch-Timeout (aus .env)
     minpv_resume_factor = 0.90   # minpv: darüber wird der Timeout wieder verworfen (aus .env)
     minpv_timeout_s = 600        # minpv: so lange werden Wolken überbrückt (aus .env)
+    avg_window_s = 600           # Mittelungsfenster beim Regeln, 0 = aus (aus .env)
+    start_avg_window_s = 120     # kürzeres Fenster für die Startentscheidung (aus .env)
+    avg_active_s = 0             # gerade wirksames Fenster, nur fürs UI
+    pv_hist: collections.deque = collections.deque()  # (Loop-Zeit, PV-Überschuss W)
+    pv_avg_w: float | None = None           # geglätteter PV-Überschuss, nur fürs UI
+    boost_w = 2500               # Batterie darf so viel ins Auto nachschieben (aus .env)
+    boost_wh = 5000              # Tagesbudget dafür, 0 = Boost aus (aus .env)
+    boost_min_soc = 30.0         # darunter kein Boost mehr (aus .env)
+    boost_used_wh = 0.0          # heute schon verbrauchtes Boost-Budget
+    boost_day: datetime.date | None = None  # Tag, für den boost_used_wh gilt
+    boost_last_t: float | None = None       # Loop-Zeit des letzten Boost-Takts
     batt_low_soc = 30.0          # Automatik-Startschwelle in % (aus .env)
     batt_target_soc = 80.0       # Netzladung bis zu diesem SOC (aus .env)
     batt_charge_w = 500          # Leistung der Zwangsladung in W (aus .env)
@@ -119,8 +149,15 @@ class State:
     soc: float | None = None     # Batterie-SOC in %
     battery_w: float | None = None  # Batterie-Leistung, positiv = Laden
     charge_w = 0.0               # letzte bekannte Ladeleistung
+    charge_w_seen: float | None = None   # Loop-Zeit der letzten Messung dazu
+    charge_w_src = "keine"       # gemessen | Energie | geschätzt | keine (fürs UI)
+    charge_w_max_age_s = 30      # ältere Messung gilt als tot (aus .env)
+    charge_energy_wh: float | None = None   # letzter Zählerstand der Box
+    charge_energy_t: float | None = None    # Loop-Zeit dazu
     charging = False
-    current_limit = 0            # zuletzt gesetztes Limit in A
+    current_limit = 0.0          # zuletzt gesetztes Limit in A (Raster limit_step_a)
+    limit_step_a = 0.1           # Auflösung des Ladelimits in A (aus .env)
+    limit_deadband_a = 0.3       # so viel Abweichung, bevor neu gesetzt wird (aus .env)
     surplus_since: float | None = None   # Zeitstempel: Überschuss reicht seit ...
     deficit_since: float | None = None   # Zeitstempel: Überschuss fehlt seit ...
     minpv_low_since: float | None = None # Zeitstempel: PV-Überschuss unter Pause-Schwelle seit ...
@@ -143,6 +180,39 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
     if start < end:
         return start <= minutes < end
     return minutes >= start or minutes < end  # Fenster über Mitternacht (z. B. 23:00–08:00)
+
+
+def reset_charge_meter():
+    """Zählerstände der Wallbox verwerfen — nach Ladeende sind sie wertlos."""
+    state.charge_w = 0.0
+    state.charge_w_seen = None
+    state.charge_w_src = "keine"
+    state.charge_energy_wh = state.charge_energy_t = None
+
+
+def charge_power(now: float) -> float:
+    """Ladeleistung fürs Regeln, notfalls aus dem gesetzten Limit geschätzt.
+
+    Der Überschuss wird als grid_w + charge_w gerechnet — die eigene Ladung
+    muss also wieder herausgerechnet werden. Meldet die Box keine
+    Momentanleistung (kein Power.Active.Import, kein Energiezähler) oder ist
+    die letzte Messung tot, hielte der Regler sonst die eigene Ladung für
+    einen PV-Einbruch, stoppte über den minpv-Timeout und startete sofort neu.
+    Das Limit ist eine Obergrenze: zieht das Auto weniger, wird der Überschuss
+    überschätzt und es fließt kurz Netzstrom — besser als der Stopp-Kreisel.
+    """
+    if not state.charging:
+        return 0.0
+    if (state.charge_w_seen is not None
+            and now - state.charge_w_seen <= state.charge_w_max_age_s):
+        return state.charge_w
+    est = state.current_limit * VOLTAGE * PHASES
+    if state.charge_w_src != "geschätzt":
+        log.warning("Wallbox meldet keine Ladeleistung — schätze %.0f W aus dem "
+                    "Limit %.1f A", est, state.current_limit)
+        state.charge_w_src = "geschätzt"
+    state.charge_w = est
+    return est
 
 
 state = State()
@@ -195,7 +265,7 @@ class ChargePoint(OcppChargePoint):
             state.charging = True
         elif status in ("Available", "Finishing", "SuspendedEVSE", "SuspendedEV", "Faulted"):
             state.charging = False
-            state.charge_w = 0.0
+            reset_charge_meter()
         return call_result.StatusNotification()
 
     @on("Authorize")
@@ -216,27 +286,50 @@ class ChargePoint(OcppChargePoint):
     def on_stop_transaction(self, meter_stop, transaction_id, **kwargs):
         self.transaction_id = None
         state.charging = False
-        state.charge_w = 0.0
+        reset_charge_meter()
         log.info("Transaktion beendet (meter %s Wh)", meter_stop)
         return call_result.StopTransaction()
 
     @on("MeterValues")
     def on_meter_values(self, connector_id, meter_value, **kwargs):
         state.last_box_seen = datetime.datetime.now().timestamp()
+        now = asyncio.get_event_loop().time()
+        power_wh = energy_wh = None
         for entry in meter_value:
             for sample in entry.get("sampledValue", []):
-                if sample.get("measurand") == "Power.Active.Import":
+                # Ohne measurand meint OCPP 1.6 den Energiezähler
+                measurand = sample.get("measurand", "Energy.Active.Import.Register")
+                unit = (sample.get("unit") or "").lower()
+                try:
                     value = float(sample["value"])
-                    if sample.get("unit") == "kW":
-                        value *= 1000
-                    state.charge_w = value
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if measurand == "Power.Active.Import":
+                    power_wh = value * 1000 if unit == "kw" else value
+                elif measurand == "Energy.Active.Import.Register":
+                    energy_wh = value * 1000 if unit == "kwh" else value
+        if power_wh is not None:
+            state.charge_w, state.charge_w_seen = power_wh, now
+            state.charge_w_src = "gemessen"
+        if energy_wh is not None:
+            # Zähler mitschreiben: meldet die Box keine Momentanleistung,
+            # liefert die Differenz pro Zeit denselben Wert
+            if (power_wh is None and state.charge_energy_wh is not None
+                    and state.charge_energy_t is not None
+                    and now - state.charge_energy_t > 1
+                    and energy_wh >= state.charge_energy_wh):
+                delta_s = now - state.charge_energy_t
+                state.charge_w = (energy_wh - state.charge_energy_wh) * 3600 / delta_s
+                state.charge_w_seen = now
+                state.charge_w_src = "Energie"
+            state.charge_energy_wh, state.charge_energy_t = energy_wh, now
         return call_result.MeterValues()
 
     @on("DataTransfer")
     def on_data_transfer(self, vendor_id, **kwargs):
         return call_result.DataTransfer(status="Accepted")
 
-    async def set_limit(self, amps: int):
+    async def set_limit(self, amps: float):
         request = call.SetChargingProfile(
             connector_id=1,
             cs_charging_profiles={
@@ -253,9 +346,9 @@ class ChargePoint(OcppChargePoint):
         response = await self.call(request)
         if response and response.status == "Accepted":
             state.current_limit = amps
-            log.info("Limit gesetzt: %s A", amps)
+            log.info("Limit gesetzt: %.1f A", amps)
         else:
-            log.warning("Limit %s A abgelehnt: %s", amps, response)
+            log.warning("Limit %.1f A abgelehnt: %s", amps, response)
 
     async def remote_start(self):
         response = await self.call(call.RemoteStartTransaction(id_tag="pvueb", connector_id=1))
@@ -341,9 +434,71 @@ async def modbus_task(host: str):
         await asyncio.sleep(10)
 
 
-def target_amps(surplus_w: float) -> int:
-    amps = int(surplus_w / (VOLTAGE * PHASES))
-    return max(0, min(MAX_AMPS, amps))
+def pv_average(now: float, pv_surplus: float) -> float:
+    """Gleitender Mittelwert des PV-Überschusses.
+
+    Zwei Fenster: beim Regeln der laufenden Ladung das träge
+    PVUEB_AVG_WINDOW_MIN, damit einzelne Wolken das Limit nicht im
+    Sekundentakt treiben — für die Startentscheidung das kurze
+    PVUEB_START_AVG_MIN, damit die Ladung nicht dem Mittel hinterherhinkt.
+    Fenster 0 schaltet die jeweilige Glättung ab.
+    """
+    window = state.avg_window_s if state.charging else state.start_avg_window_s
+    state.avg_active_s = window
+    state.pv_hist.append((now, pv_surplus))
+    if window <= 0:
+        state.pv_avg_w = pv_surplus
+    else:
+        recent = [w for t, w in state.pv_hist if t >= now - window]
+        state.pv_avg_w = sum(recent) / len(recent) if recent else pv_surplus
+    # Historie nur so weit vorhalten, wie das größere Fenster sie braucht
+    keep = now - max(state.avg_window_s, state.start_avg_window_s)
+    while state.pv_hist and state.pv_hist[0][0] < keep:
+        state.pv_hist.popleft()
+    return state.pv_avg_w
+
+
+def boost_allowance(now: float) -> float:
+    """Wieviel Batterie-Entladung darf gerade ins Auto fließen (W).
+
+    Tagesbudget PVUEB_BOOST_WH, Leistung gedeckelt auf PVUEB_BOOST_W, Stopp
+    unter PVUEB_BOOST_MIN_SOC. Verbraucht wird nur, was die Batterie wirklich
+    entlädt, während das Auto lädt — Hausverbrauch aus der Batterie zählt
+    nicht. Budget-Reset um Mitternacht: tagsüber lädt die Batterie aus PV
+    nach, notfalls nachts über die Netzladung.
+    """
+    today = datetime.date.today()
+    if state.boost_day != today:
+        state.boost_day = today
+        state.boost_used_wh = 0.0
+    if state.boost_wh <= 0 or state.soc is None or state.soc < state.boost_min_soc:
+        state.boost_last_t = None
+        return 0.0
+    rest_wh = state.boost_wh - state.boost_used_wh
+    if rest_wh <= 0:
+        state.boost_last_t = None
+        return 0.0
+    if state.charging and state.battery_w is not None and state.battery_w < 0:
+        drawn = min(-state.battery_w, state.boost_w)
+        if state.boost_last_t is not None:
+            state.boost_used_wh += drawn * (now - state.boost_last_t) / 3600
+    state.boost_last_t = now if state.charging else None
+    # Restbudget für weniger als eine Minute Vollleistung nicht mehr anbieten
+    return state.boost_w if rest_wh * 60 >= state.boost_w else 0.0
+
+
+def target_amps(surplus_w: float) -> float:
+    """Sollstrom auf dem Raster PVUEB_LIMIT_STEP_A, immer abgerundet.
+
+    OCPP überträgt das Limit als Dezimalwert, die Box setzt also auch
+    Zwischenwerte um. Feines Raster heißt: der Rest, der beim Abrunden auf
+    ganze Ampere liegen bliebe (bis zu 690 W), geht ins Auto statt in die
+    Einspeisung. Abgerundet wird trotzdem, damit der Sollwert nie über dem
+    Überschuss liegt und Netzstrom zieht.
+    """
+    step = state.limit_step_a
+    amps = int(surplus_w / (VOLTAGE * PHASES) / step) * step
+    return round(max(0.0, min(float(MAX_AMPS), amps)), 3)
 
 
 async def start_battery_grid_charge() -> str | None:
@@ -478,85 +633,97 @@ async def control_task():
         await battery_night_check()
         if charge_point is None or state.grid_w is None:
             continue
-        now = loop.time()
+        await control_step(loop.time())
 
-        if not state.released:
-            if state.charging:
-                log.info("Freigabe fehlt — stoppe Ladung")
-                await charge_point.remote_stop()
-            state.surplus_since = state.deficit_since = state.minpv_low_since = None
-            continue
 
-        # Nachttarif-Fenster oder Modus "fast": volle Leistung
-        if state.mode == "fast" or in_night_window():
-            if state.current_limit != MAX_AMPS:
-                await charge_point.set_limit(MAX_AMPS)
-            if not state.charging:
-                await charge_point.remote_start()
-            continue
+async def control_step(now: float):
+    """Ein Regeltakt. Getrennt von control_task, damit test_sim.py ihn mit
+    simulierter Zeit und simulierter Wallbox durchspielen kann."""
+    if not state.released:
+        if state.charging:
+            log.info("Freigabe fehlt — stoppe Ladung")
+            await charge_point.remote_stop()
+        state.surplus_since = state.deficit_since = state.minpv_low_since = None
+        return
 
-        surplus = state.grid_w + state.charge_w
-        # Echter PV-Überschuss: Batterie-Ladung wäre für das Auto verfügbar,
-        # Batterie-Entladung täuscht Überschuss nur vor (Netzpunkt bleibt ~0)
-        pv_surplus = surplus + (state.battery_w or 0)
-        amps = target_amps(surplus)
-        min_w = state.min_amps * VOLTAGE * PHASES
-        if state.mode == "minpv":
-            amps = max(state.min_amps, amps)
-
+    # Nachttarif-Fenster oder Modus "fast": volle Leistung
+    if state.mode == "fast" or in_night_window():
+        if state.current_limit != MAX_AMPS:
+            await charge_point.set_limit(MAX_AMPS)
         if not state.charging:
-            if state.mode == "minpv":
-                ready = pv_surplus >= state.minpv_start_factor * min_w
-            else:
-                ready = amps >= MIN_AMPS
-            if ready:
-                state.deficit_since = None
-                state.surplus_since = state.surplus_since or now
-                if now - state.surplus_since >= state.start_delay_s:
-                    log.info("Überschuss %.0f W seit %ds — starte Ladung mit %d A",
-                             surplus, state.start_delay_s, amps)
-                    await charge_point.set_limit(amps)
-                    await charge_point.remote_start()
-                    state.last_adjust = now
-            else:
-                state.surplus_since = None
+            await charge_point.remote_start()
+        return
+
+    surplus = state.grid_w + charge_power(now)
+    # Echter PV-Überschuss: Batterie-Ladung wäre für das Auto verfügbar,
+    # Batterie-Entladung täuscht Überschuss nur vor (Netzpunkt bleibt ~0)
+    pv_surplus = surplus + (state.battery_w or 0)
+    pv_avg = pv_average(now, pv_surplus)
+    # Boost erst ab laufender Ladung: die Batterie hält eine Ladung durch
+    # Wolken, startet sie aber nicht
+    boost = boost_allowance(now) if state.charging else 0.0
+    # Ziel ist der Mittelwert, gedeckelt auf das, was gerade wirklich da
+    # ist (PV + Batterie-Boost) — sonst zöge die Lücke Strom aus dem Netz
+    avail = min(pv_avg, pv_surplus + boost)
+    amps = target_amps(avail)
+    min_w = state.min_amps * VOLTAGE * PHASES
+    if state.mode == "minpv":
+        amps = max(state.min_amps, amps)
+
+    if not state.charging:
+        if state.mode == "minpv":
+            ready = avail >= state.minpv_start_factor * min_w
         else:
-            if state.mode == "minpv":
-                # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
-                # Erholung über Resume-Schwelle verwirft ihn, Ablauf stoppt die Ladung
-                if pv_surplus > state.minpv_resume_factor * min_w:
-                    if state.minpv_low_since is not None:
-                        log.info("minpv: PV-Überschuss erholt (%.0f W) — Wolkenloch überbrückt",
-                                 pv_surplus)
-                    state.minpv_low_since = None
-                elif pv_surplus < state.minpv_pause_factor * min_w:
-                    if state.minpv_low_since is None:
-                        state.minpv_low_since = now
-                        log.info("minpv: PV-Überschuss nur %.0f W (< %.0f W) — stoppe in %ds, "
-                                 "falls keine Erholung", pv_surplus,
-                                 state.minpv_pause_factor * min_w, state.minpv_timeout_s)
-                if (state.minpv_low_since is not None
-                        and now - state.minpv_low_since >= state.minpv_timeout_s):
-                    log.info("minpv: PV-Überschuss seit %ds unter %.0f %% Min — stoppe Ladung",
-                             state.minpv_timeout_s, state.minpv_resume_factor * 100)
-                    await charge_point.remote_stop()
-                    state.minpv_low_since = None
-                    state.surplus_since = state.deficit_since = None
-                    continue
-            if amps < MIN_AMPS:
-                state.surplus_since = None
-                state.deficit_since = state.deficit_since or now
-                if now - state.deficit_since >= state.stop_delay_s:
-                    log.info("Überschuss weg (%.0f W) seit %ds — stoppe Ladung",
-                             surplus, state.stop_delay_s)
-                    await charge_point.remote_stop()
-            else:
-                state.deficit_since = None
-                if amps != state.current_limit and now - state.last_adjust >= state.adjust_min_interval_s:
-                    log.info("Überschuss %.0f W — passe Limit an: %d → %d A",
-                             surplus, state.current_limit, amps)
-                    await charge_point.set_limit(amps)
-                    state.last_adjust = now
+            ready = amps >= MIN_AMPS
+        if ready:
+            state.deficit_since = None
+            state.surplus_since = state.surplus_since or now
+            if now - state.surplus_since >= state.start_delay_s:
+                log.info("Überschuss %.0f W seit %ds — starte Ladung mit %.1f A",
+                         surplus, state.start_delay_s, amps)
+                await charge_point.set_limit(amps)
+                await charge_point.remote_start()
+                state.last_adjust = now
+        else:
+            state.surplus_since = None
+    else:
+        if state.mode == "minpv":
+            # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
+            # Erholung über Resume-Schwelle verwirft ihn, Ablauf stoppt die Ladung
+            if avail > state.minpv_resume_factor * min_w:
+                if state.minpv_low_since is not None:
+                    log.info("minpv: Überschuss erholt (%.0f W, davon %.0f W Batterie-Boost) "
+                             "— Wolkenloch überbrückt", avail, boost)
+                state.minpv_low_since = None
+            elif avail < state.minpv_pause_factor * min_w:
+                if state.minpv_low_since is None:
+                    state.minpv_low_since = now
+                    log.info("minpv: Überschuss nur %.0f W (< %.0f W) — stoppe in %ds, "
+                             "falls keine Erholung", avail,
+                             state.minpv_pause_factor * min_w, state.minpv_timeout_s)
+            if (state.minpv_low_since is not None
+                    and now - state.minpv_low_since >= state.minpv_timeout_s):
+                log.info("minpv: PV-Überschuss seit %ds unter %.0f %% Min — stoppe Ladung",
+                         state.minpv_timeout_s, state.minpv_resume_factor * 100)
+                await charge_point.remote_stop()
+                state.minpv_low_since = None
+                state.surplus_since = state.deficit_since = None
+                return
+        if amps < MIN_AMPS:
+            state.surplus_since = None
+            state.deficit_since = state.deficit_since or now
+            if now - state.deficit_since >= state.stop_delay_s:
+                log.info("Überschuss weg (%.0f W) seit %ds — stoppe Ladung",
+                         surplus, state.stop_delay_s)
+                await charge_point.remote_stop()
+        else:
+            state.deficit_since = None
+            if (abs(amps - state.current_limit) >= state.limit_deadband_a
+                    and now - state.last_adjust >= state.adjust_min_interval_s):
+                log.info("Überschuss %.0f W — passe Limit an: %.1f → %.1f A",
+                         surplus, state.current_limit, amps)
+                await charge_point.set_limit(amps)
+                state.last_adjust = now
 
 
 async def command_loop():
@@ -592,7 +759,7 @@ def status_line() -> str:
     surplus = (state.grid_w or 0) + state.charge_w
     return (f"Modus {state.mode} | Freigabe: {'ja' if state.released else 'NEIN'} "
             f"| Netz {state.grid_w} W | SOC {state.soc} % | Ladung {state.charge_w} W "
-            f"| Überschuss {surplus:.0f} W | Limit {state.current_limit} A "
+            f"| Überschuss {surplus:.0f} W | Limit {state.current_limit:.1f} A "
             f"| lädt: {state.charging} | Nachtfenster: {'ja' if in_night_window() else 'nein'} "
             f"| Batterie-Netzladung: {'ja' if state.battery_grid_charge else 'nein'} "
             f"| Box: {'ja' if charge_point else 'nein'}")
@@ -693,6 +860,25 @@ function minpvInfo() {
   if (s.charging) return "lädt – Timeout ab < " + Math.round(s.minpv_pause_factor * minW) + " W";
   return "wartet – Start ab " + Math.round(s.minpv_start_factor * minW) + " W";
 }
+function boostInfo() {
+  if (!s.boost_wh) return "aus";
+  const rest = Math.max(0, s.boost_wh - s.boost_used_wh);
+  const budget = (rest/1000).toFixed(1) + " / " + (s.boost_wh/1000).toFixed(1) + " kWh frei";
+  if (s.soc !== null && s.soc < s.boost_min_soc)
+    return "pausiert – SOC < " + s.boost_min_soc + " % (" + budget + ")";
+  if (rest <= 0) return "Budget heute aufgebraucht";
+  if (s.charging && s.battery_w !== null && s.battery_w < 0)
+    return "🔋→🚗 " + Math.round(Math.min(-s.battery_w, s.boost_w)) + " W – " + budget;
+  return "bereit, max " + s.boost_w + " W – " + budget;
+}
+function gridShare() {
+  if (s.grid_w === null) return "–";
+  const imp = Math.max(0, -s.grid_w);
+  if (imp < 1) return "0 W – alles aus PV/Batterie";
+  const txt = Math.round(imp) + " W ≈ " + (imp / WPA).toFixed(1) + " A";
+  if (s.charge_w < 1) return txt + " (Haus)";
+  return txt + " – " + Math.round(100 * Math.min(imp, s.charge_w) / s.charge_w) + " % der Ladung";
+}
 function heart(seen_s, limit) {
   const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
   return ok ? '<span class="heart">❤️</span>' : '<span class="heart dead">💔</span>';
@@ -708,17 +894,24 @@ async function refresh() {
     ["Nachtfenster", s.night ? "🌙 AKTIV – lädt mit voller Leistung" : "inaktiv"],
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
     ["Überschuss", Math.round(s.surplus_w) + " W ≈ " + (s.surplus_w / WPA).toFixed(1) + " A"],
-    ["Ladeleistung", Math.round(s.charge_w) + " W ≈ " + (s.charge_w / WPA).toFixed(1) + " A"],
+    ["Ladeleistung", Math.round(s.charge_w) + " W ≈ " + (s.charge_w / WPA).toFixed(1) + " A"
+      + (s.charge_w_src === "gemessen" || !s.charging ? "" : " (" + s.charge_w_src + ")")],
     ["Wallbox", heart(s.box_seen_s, boxLimit) + " "
       + (s.box_connected ? (s.charging ? "⚡ lädt" : "🔌 verbunden") : "⛔ getrennt")],
   ];
   document.getElementById("stat").innerHTML = rows.map(row).join("");
   const drows = [
     ["Box-Status (OCPP)", s.box_status],
-    ["Limit", s.current_limit + " A"],
+    ["Limit", s.current_limit.toFixed(1) + " A"],
     ["PV-Überschuss echt", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
     ["minpv-Hysterese", minpvInfo()],
+    ["Netzanteil", gridShare()],
+    ["PV-Mittel " + (s.avg_active_s ? Math.round(s.avg_active_s/60) + " min" : "aus")
+      + (s.charging ? "" : " (Start)"),
+      s.pv_avg_w === null ? "–"
+      : Math.round(s.pv_avg_w) + " W ≈ " + (s.pv_avg_w / WPA).toFixed(1) + " A"],
+    ["Batterie-Boost", boostInfo()],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
   ];
@@ -807,11 +1000,19 @@ async def http_status(_request):
         "forecast_kwh": relevant_forecast()[1],
         "forecast_min_kwh": state.forecast_min_kwh,
         "charge_w": state.charge_w,
+        "charge_w_src": state.charge_w_src,
         "surplus_w": (state.grid_w or 0) + state.charge_w,
         "pv_surplus_w": None if state.grid_w is None
                         else state.grid_w + state.charge_w + (state.battery_w or 0),
         "minpv_low_s": None if state.minpv_low_since is None
                        else round(asyncio.get_event_loop().time() - state.minpv_low_since),
+        "pv_avg_w": state.pv_avg_w,
+        "avg_window_s": state.avg_window_s,
+        "avg_active_s": state.avg_active_s,
+        "boost_w": state.boost_w,
+        "boost_wh": state.boost_wh,
+        "boost_used_wh": round(state.boost_used_wh),
+        "boost_min_soc": state.boost_min_soc,
         "minpv_timeout_s": state.minpv_timeout_s,
         "minpv_start_factor": state.minpv_start_factor,
         "minpv_pause_factor": state.minpv_pause_factor,
@@ -934,14 +1135,30 @@ async def main():
     state.batt_charge_w = int(os.environ.get("PVUEB_BATT_CHARGE_W", "500"))
     if not 0 < state.batt_low_soc < state.batt_target_soc <= 100:
         sys.exit("PVUEB_BATT_LOW_SOC/TARGET_SOC unplausibel (0 < low < target <= 100 nötig)")
+    state.limit_step_a = float(os.environ.get("PVUEB_LIMIT_STEP_A", "0.1"))
+    state.limit_deadband_a = float(os.environ.get("PVUEB_LIMIT_DEADBAND_A", "0.3"))
+    if not 0 < state.limit_step_a <= 1 or state.limit_deadband_a < state.limit_step_a:
+        sys.exit("PVUEB_LIMIT_STEP_A muss in (0, 1] liegen, DEADBAND >= STEP")
+    state.avg_window_s = int(float(os.environ.get("PVUEB_AVG_WINDOW_MIN", "10")) * 60)
+    state.start_avg_window_s = int(float(os.environ.get("PVUEB_START_AVG_MIN", "2")) * 60)
+    if state.avg_window_s < 0 or state.start_avg_window_s < 0:
+        sys.exit("PVUEB_AVG_WINDOW_MIN und PVUEB_START_AVG_MIN müssen >= 0 sein")
+    state.boost_w = int(os.environ.get("PVUEB_BOOST_W", "2500"))
+    state.boost_wh = int(float(os.environ.get("PVUEB_BOOST_H", "2")) * state.boost_w)
+    state.boost_min_soc = float(os.environ.get("PVUEB_BOOST_MIN_SOC", "30"))
+    if state.boost_w < 0 or state.boost_wh < 0 or not 0 <= state.boost_min_soc <= 100:
+        sys.exit("PVUEB_BOOST_W/_H müssen >= 0 sein, PVUEB_BOOST_MIN_SOC 0–100")
     state.poll_interval_s = int(os.environ.get("PVUEB_POLL_INTERVAL_S", "5"))
     state.adjust_min_interval_s = int(os.environ.get("PVUEB_ADJUST_MIN_INTERVAL_S", "25"))
     state.start_delay_s = int(os.environ.get("PVUEB_START_DELAY_S", "120"))
     state.stop_delay_s = int(os.environ.get("PVUEB_STOP_DELAY_S", "180"))
-    state.minpv_start_factor = float(os.environ.get("PVUEB_MINPV_START_FACTOR", "1.25"))
+    state.minpv_start_factor = float(os.environ.get("PVUEB_MINPV_START_FACTOR", "1.10"))
     state.minpv_pause_factor = float(os.environ.get("PVUEB_MINPV_PAUSE_FACTOR", "0.75"))
     state.minpv_resume_factor = float(os.environ.get("PVUEB_MINPV_RESUME_FACTOR", "0.90"))
     state.minpv_timeout_s = int(float(os.environ.get("PVUEB_MINPV_TIMEOUT_MIN", "10")) * 60)
+    state.charge_w_max_age_s = int(os.environ.get("PVUEB_CHARGE_W_MAX_AGE_S", "30"))
+    if state.charge_w_max_age_s < 1:
+        sys.exit("PVUEB_CHARGE_W_MAX_AGE_S muss >= 1 Sekunde sein")
     if not 0 < state.minpv_pause_factor < state.minpv_resume_factor <= state.minpv_start_factor:
         sys.exit("PVUEB_MINPV_*_FACTOR unplausibel (0 < pause < resume <= start nötig)")
     if min(state.poll_interval_s, state.adjust_min_interval_s,
