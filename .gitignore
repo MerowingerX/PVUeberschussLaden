@@ -9,3 +9,6 @@ __pycache__/
 
 # Logs
 *.log
+
+# Live-Mitschnitte des Status (Rohmaterial für Testfälle)
+recordings/

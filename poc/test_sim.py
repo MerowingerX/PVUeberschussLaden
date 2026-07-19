@@ -6,7 +6,8 @@ Aufruf:
     python test_sim.py 2 5        nur Szenario 2 und 5
     python test_sim.py --json d.json   Kurven als JSON für die Diagramme
 
-Modell je Takt: das Auto zieht genau das gesetzte Limit, der Rest des
+Modell je Takt: das Auto zieht genau das gesetzte Limit (car_amps deckelt es
+auf das, was es wirklich annimmt), der Rest des
 PV-Überschusses lädt die Hausbatterie (max BATT_MAX_W), eine Lücke deckt die
 Batterie bis BATT_MAX_W, was dann noch fehlt, kommt aus dem Netz. Damit gilt
 dieselbe Identität wie an der echten Anlage:
@@ -14,7 +15,13 @@ dieselbe Identität wie an der echten Anlage:
     pv_surplus = grid_w + charge_w + battery_w
 
 PV-Kurven sind in Ampere angegeben (1 A = 690 W = 3 × 230 V), also in der
-Einheit, in der auch das Ladelimit abgelesen wird.
+Einheit, in der auch das Ladelimit abgelesen wird. Sie beschreiben den
+Überschuss *nach* Hausverbrauch; house_w kommt für die Erzeugungsanzeige
+(Register 32080) wieder dazu.
+
+meter steuert, was die Wallbox meldet: "ok" (Momentanleistung), "none" (die
+Box kann es nicht) oder "stale" (Meldung eingefroren). Der Regler schätzt
+dann aus dem Limit — Tests 13-16 prüfen genau diese Pfade.
 """
 
 import asyncio
@@ -33,7 +40,8 @@ DT = 5                           # Takt in Sekunden (= poll_interval_s)
 class FakeBox:
     """Wallbox-Ersatz: merkt sich Limit und Transaktionszustand."""
 
-    def __init__(self):
+    def __init__(self, accept_start=True):
+        self.accept_start = accept_start
         self.transaction_id = 1
         self.events: list[tuple[float, str]] = []
 
@@ -41,9 +49,20 @@ class FakeBox:
         c.state.current_limit = amps
         self.events.append((Sim.t, f"Limit {amps:.1f} A"))
 
-    async def remote_start(self):
+    async def remote_start(self) -> str:
+        # accept=False: Box lehnt ab (z. B. hängt in "Finishing") — dann greift
+        # der Backoff in try_start, statt im Regeltakt weiterzufunken
+        if not self.accept_start:
+            self.events.append((Sim.t, "START abgelehnt"))
+            return "Rejected"
         c.state.charging = True
+        c.reset_start_backoff()          # entspricht StatusNotification "Charging"
         self.events.append((Sim.t, "START"))
+        return "Accepted"
+
+    async def wake_connector(self):
+        self.events.append((Sim.t, "ChangeAvailability-Zyklus"))
+        self.accept_start = True         # Box lässt sich aufwecken
 
     async def remote_stop(self):
         c.state.charging = False
@@ -55,10 +74,13 @@ class Sim:
     t = 0.0
 
     def __init__(self, curve, soc=50.0, mode="minpv", min_amps=6, night=False,
-                 batt_charge_max=BATT_MAX_W, meter="ok"):
+                 batt_charge_max=BATT_MAX_W, meter="ok", house_w=400.0, car_amps=None,
+                 accept_start=True):
         self.curve = curve            # Funktion: Minute -> verfügbare PV in A
         self.batt_charge_max = batt_charge_max   # 0 = Batterie nimmt nichts auf (voll/gesperrt)
         self.meter = meter            # ok | none (Box meldet nichts) | stale (Messung eingefroren)
+        self.house_w = house_w        # Grundlast des Hauses, steckt nicht in curve
+        self.car_amps = car_amps      # Funktion Minute -> was das Auto höchstens nimmt
         self.load_w = 0.0             # tatsächliche Ladeleistung, unabhängig von der Meldung
         self.soc = soc
         self.grid_import_wh = 0.0
@@ -82,13 +104,21 @@ class Sim:
         s.boost_used_wh, s.boost_day, s.boost_last_t = 0.0, None, None
         s.soc, s.battery_w, s.grid_w = soc, 0.0, 0.0
         s.poll_interval_s = DT
-        self.box = FakeBox()
+        s.start_retry_s, s.box_status = 30, "Preparing"
+        c.reset_start_backoff()
+        self.box = FakeBox(accept_start=accept_start)
         c.charge_point = self.box
 
     def step(self):
         s = c.state
-        pv_w = self.curve(Sim.t / 60) * WPA
-        self.load_w = s.current_limit * WPA if s.charging else 0.0
+        minute = Sim.t / 60
+        pv_w = self.curve(minute) * WPA
+        # Das Auto nimmt höchstens, was es kann — sonst genau das Limit
+        amps = s.current_limit if self.car_amps is None else min(s.current_limit,
+                                                                self.car_amps(minute))
+        self.load_w = max(0.0, amps) * WPA if s.charging else 0.0
+        # Erzeugung = Überschuss + Hauslast; der Regler liest sie aus Register 32080
+        s.pv_w = pv_w + self.house_w
         # Was die Wallbox davon meldet — der Regler sieht nur das hier
         if self.meter == "ok":
             s.charge_w, s.charge_w_seen, s.charge_w_src = self.load_w, Sim.t, "gemessen"
@@ -342,7 +372,46 @@ async def t14():
            "Erwartet: identisch zu Test 1 — die tote Messung wird nach 30 s verworfen.")
 
 
-TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14]
+async def t15():
+    # Box meldet "Charging", das Auto nimmt nichts an (voll oder Ladeabbruch)
+    sim = Sim(sunny, soc=50, mode="minpv", meter="none", car_amps=lambda m: 0.0)
+    await sim.run(480)
+    report("TEST 15 — Wallbox meldet Ladung, Auto nimmt nichts an", sim,
+           "Erwartet: Stopp über den minpv-Timeout. Ohne den Deckel aus der PV-Erzeugung "
+           "bliebe die Ladung offen, weil die geschätzte Leistung einen Überschuss vortäuscht.")
+
+
+async def t16():
+    # Auto nimmt hartnäckig nur 6 A, das Limit darf ihm nicht davonlaufen
+    sim = Sim(sunny, soc=50, mode="minpv", meter="none", car_amps=lambda m: 6.0)
+    await sim.run(480)
+    report("TEST 16 — Auto nimmt nur 6 A, Wallbox meldet keine Ladeleistung", sim,
+           "Erwartet: Limit bleibt in der Nähe dessen, was das Auto zieht, statt bis 16 A "
+           "hochzulaufen — der Deckel aus PV minus Netz minus Batterie hält es fest.")
+
+
+async def t17():
+    # Box hängt in "Finishing" und lehnt den Start ab, bis sie geweckt wird
+    sim = Sim(sunny, soc=50, mode="minpv", accept_start=False)
+    c.state.box_status = "Finishing"
+    await sim.run(480)
+    report("TEST 17 — Box lehnt Start ab (hängt in Finishing)", sim,
+           "Erwartet: ein abgelehnter Versuch, dann ChangeAvailability-Zyklus, danach Start. "
+           "Ohne Backoff liefe der RemoteStart im 5-Sekunden-Takt weiter.")
+
+
+async def t18():
+    # Fahrzeug voll: Box meldet SuspendedEV und nimmt keinen Start an
+    sim = Sim(sunny, soc=50, mode="minpv", accept_start=False)
+    c.state.box_status = "SuspendedEV"
+    await sim.run(480)
+    versuche = sum(1 for _, e in sim.box.events if "abgelehnt" in e)
+    report("TEST 18 — Fahrzeug voll (SuspendedEV), Box nimmt keinen Start an", sim,
+           f"Erwartet: wenige Startversuche über 8 h statt Dauerfunk — hier {versuche}. "
+           "Ohne Bremse wären es rund 4000 (alle 5 s).")
+
+
+TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18]
 
 
 JSON_OUT = ""

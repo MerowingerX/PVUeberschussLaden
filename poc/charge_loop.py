@@ -29,7 +29,10 @@ Ladung also wieder herausgerechnet. Die Ladeleistung kommt aus den
 MeterValues der Box (Power.Active.Import, ersatzweise aus der Differenz des
 Energiezählers); fehlt beides oder ist der Wert älter als
 PVUEB_CHARGE_W_MAX_AGE_S, wird er aus dem gesetzten Limit geschätzt — sonst
-sähe der Regler beim Ladestart einen PV-Einbruch, der keiner ist.
+sähe der Regler beim Ladestart einen PV-Einbruch, der keiner ist. Die
+Schätzung ist auf PV-Erzeugung minus Netz minus Batterie gedeckelt (das Haus
+verbraucht nie negativ), damit eine Ladung, die gar nicht stattfindet, nicht
+dauerhaft einen Überschuss vortäuscht.
 
 Ladeleistung folgt dem gleitenden Mittel des echten PV-Überschusses (inkl.
 Batterie-Ladeleistung, die das Auto bekommen kann), gedeckelt auf den
@@ -54,8 +57,10 @@ import argparse
 import asyncio
 import collections
 import datetime
+import json
 import logging
 import os
+import re
 import sys
 
 import aiohttp
@@ -94,6 +99,10 @@ MIN_CHARGE_W = MIN_AMPS * PHASES * VOLTAGE  # ~4140 W
 REG_GRID_POWER = 37113       # int32, W, positiv = Einspeisung (verifiziert 2026-07-15)
 REG_BATTERY_SOC = 37760      # uint16, ×0,1 % (verifiziert 2026-07-15)
 REG_BATTERY_POWER = 37001    # int32, W, positiv = Laden
+REG_PV_POWER = 32080         # int32, W, AC-Wirkleistung des Wechselrichters
+# Batterie (37001) und Netz (37113) am Stück lesen — nacheinander gelesen
+# stammen sie aus verschiedenen Momenten und die Summe zappelt
+REG_BLOCK_START, REG_BLOCK_COUNT = REG_BATTERY_POWER, 114
 
 # LUNA2000-Zwangsladung (verifiziert 2026-07-16 gegen huawei_solar 3.0.6)
 REG_FORCIBLE_CMD = 47100         # uint16: 0 = Stop, 1 = Laden, 2 = Entladen
@@ -148,6 +157,8 @@ class State:
     grid_w: float | None = None  # positiv = Einspeisung
     soc: float | None = None     # Batterie-SOC in %
     battery_w: float | None = None  # Batterie-Leistung, positiv = Laden
+    pv_w: float | None = None    # Erzeugung des Wechselrichters (AC)
+    modbus_block = True          # Batterie+Netz am Stück lesbar (SDongle-abhängig)
     charge_w = 0.0               # letzte bekannte Ladeleistung
     charge_w_seen: float | None = None   # Loop-Zeit der letzten Messung dazu
     charge_w_src = "keine"       # gemessen | Energie | geschätzt | keine (fürs UI)
@@ -158,6 +169,10 @@ class State:
     current_limit = 0.0          # zuletzt gesetztes Limit in A (Raster limit_step_a)
     limit_step_a = 0.1           # Auflösung des Ladelimits in A (aus .env)
     limit_deadband_a = 0.3       # so viel Abweichung, bevor neu gesetzt wird (aus .env)
+    start_retry_at: float | None = None  # frühester nächster Startversuch (Loop-Zeit)
+    start_attempts = 0           # abgelehnte Startversuche in Folge
+    start_retry_s = 30           # Basis für den Backoff zwischen Versuchen (aus .env)
+    wake_tried = False           # Aufweckversuch für diese Startphase schon gemacht
     surplus_since: float | None = None   # Zeitstempel: Überschuss reicht seit ...
     deficit_since: float | None = None   # Zeitstempel: Überschuss fehlt seit ...
     minpv_low_since: float | None = None # Zeitstempel: PV-Überschuss unter Pause-Schwelle seit ...
@@ -166,6 +181,9 @@ class State:
     forcible_cmd: int | None = None      # gelesenes Register 47100 (0/1/2)
     battery_charge_auto = False  # aktive Zwangsladung kam von der Nachtautomatik
     battery_auto_started = False # Automatik hat diese Nacht schon gestartet (einmal pro Nacht)
+    record_dir = ""              # Zielordner für den Mitschnitt, leer = aus (aus .env)
+    record_interval_s = 10       # Abstand der mitgeschriebenen Zeilen (aus .env)
+    record_keep_days = 14        # Ringbuffer: ältere Tage werden gelöscht (aus .env)
     last_box_seen: float | None = None     # Unix-Zeit: letzter OCPP-Heartbeat
     last_huawei_seen: float | None = None  # Unix-Zeit: letzter erfolgreicher Modbus-Poll
     box_status = "unbekannt"               # letzter StatusNotification-Status der Box
@@ -180,6 +198,47 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
     if start < end:
         return start <= minutes < end
     return minutes >= start or minutes < end  # Fenster über Mitternacht (z. B. 23:00–08:00)
+
+
+MAX_START_RETRY_S = 300      # Obergrenze für den Backoff zwischen Startversuchen
+
+
+async def try_start(now: float, amps: float):
+    """Ladung anstoßen, aber nicht im Regeltakt dagegenhämmern.
+
+    Ob wirklich Strom fließt, entscheidet am Ende das Auto: es kann die
+    Freigabe ignorieren (voll, Ladetimer, Ladeabbruch). Deshalb wird nach
+    jedem Versuch gewartet, mit wachsendem Abstand — sonst liefe bei einem
+    Auto, das nicht will, ein RemoteStart alle 5 Sekunden.
+    """
+    if state.start_retry_at is not None and now < state.start_retry_at:
+        return
+    # SuspendedEV heißt: die Box gibt frei, das Fahrzeug nimmt nichts (voll,
+    # Ladetimer). Dagegen hilft kein enger Takt, nur gelegentlich nachfragen.
+    wartezeit = MAX_START_RETRY_S if state.box_status == "SuspendedEV" else state.start_retry_s
+    await charge_point.set_limit(amps)
+    status = await charge_point.remote_start()
+    state.last_adjust = now
+    if status == "Accepted":
+        # Angenommen heißt nicht geladen — bis die Box "Charging" meldet,
+        # bleibt der Abstand stehen, danach setzt on_status alles zurück
+        state.start_retry_at = now + wartezeit
+        return
+    state.start_attempts += 1
+    delay = min(wartezeit * 2 ** (state.start_attempts - 1), MAX_START_RETRY_S)
+    state.start_retry_at = now + delay
+    log.warning("Start abgelehnt (%s), Box-Status %s — nächster Versuch in %.0fs",
+                status, state.box_status, delay)
+    if state.box_status == "Finishing" and not state.wake_tried:
+        state.wake_tried = True
+        await charge_point.wake_connector()
+
+
+def reset_start_backoff():
+    """Nach erfolgreichem Start oder weggefallenem Trigger wieder bei null."""
+    state.start_retry_at = None
+    state.start_attempts = 0
+    state.wake_tried = False
 
 
 def reset_charge_meter():
@@ -207,6 +266,14 @@ def charge_power(now: float) -> float:
             and now - state.charge_w_seen <= state.charge_w_max_age_s):
         return state.charge_w
     est = state.current_limit * VOLTAGE * PHASES
+    # Mehr als PV minus Netz minus Batterie kann nicht ins Auto gehen, denn das
+    # Haus verbraucht nie negativ. Ohne diesen Deckel bliebe eine Ladung, die
+    # gar nicht stattfindet (Auto voll, Box meldet trotzdem "Charging"),
+    # unbemerkt: der geschätzte Wert bläht den Überschuss genau so weit auf,
+    # dass der minpv-Timeout nie anläuft.
+    if state.pv_w is not None and state.grid_w is not None:
+        cap = state.pv_w - state.grid_w - (state.battery_w or 0)
+        est = max(0.0, min(est, cap))
     if state.charge_w_src != "geschätzt":
         log.warning("Wallbox meldet keine Ladeleistung — schätze %.0f W aus dem "
                     "Limit %.1f A", est, state.current_limit)
@@ -263,7 +330,11 @@ class ChargePoint(OcppChargePoint):
         state.box_status = status
         if status in ("Charging",):
             state.charging = True
+            reset_start_backoff()
         elif status in ("Available", "Finishing", "SuspendedEVSE", "SuspendedEV", "Faulted"):
+            # SuspendedEV = die Box gibt frei, das Fahrzeug nimmt nichts an;
+            # in aller Regel ist es voll. Kein Grund für uns zu stoppen, aber
+            # auch keiner, im Regeltakt neue Startversuche zu schicken.
             state.charging = False
             reset_charge_meter()
         return call_result.StatusNotification()
@@ -350,9 +421,31 @@ class ChargePoint(OcppChargePoint):
         else:
             log.warning("Limit %.1f A abgelehnt: %s", amps, response)
 
-    async def remote_start(self):
+    async def remote_start(self) -> str:
         response = await self.call(call.RemoteStartTransaction(id_tag="pvueb", connector_id=1))
-        log.info("RemoteStart: %s", response.status if response else "keine Antwort")
+        status = response.status if response else "keine Antwort"
+        log.info("RemoteStart: %s", status)
+        return status
+
+    async def wake_connector(self):
+        """Box aus "Finishing" holen: Verfügbarkeit kurz aus und wieder an.
+
+        Nach einer beendeten Transaktion bleiben manche Boxen in Finishing
+        hängen, bis das Kabel gezogen wird, und lehnen dort jeden RemoteStart
+        ab. Der Availability-Zyklus setzt den Zustand des Ladepunkts zurück,
+        ohne dass jemand zum Auto laufen muss.
+        """
+        for availability in ("Inoperative", "Operative"):
+            try:
+                response = await self.call(
+                    call.ChangeAvailability(connector_id=1, type=availability)
+                )
+                log.info("ChangeAvailability %s: %s", availability,
+                         response.status if response else "keine Antwort")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ChangeAvailability %s fehlgeschlagen: %s", availability, exc)
+                return
+            await asyncio.sleep(1)
 
     async def remote_stop(self):
         if self.transaction_id is None:
@@ -393,24 +486,48 @@ async def modbus_task(host: str):
             while client.connected:
                 try:
                     async with modbus_lock:
-                        result = await client.read_holding_registers(
-                            REG_GRID_POWER, count=2, device_id=1
+                        if state.modbus_block:
+                            # Ein Zeitpunkt für Batterie und Netz — sonst erbt der
+                            # berechnete PV-Überschuss den Versatz beider Messungen
+                            block = await client.read_holding_registers(
+                                REG_BLOCK_START, count=REG_BLOCK_COUNT, device_id=1
+                            )
+                            if block.isError():
+                                log.warning("Blockread %d+%d nicht möglich (%s) — lese einzeln",
+                                            REG_BLOCK_START, REG_BLOCK_COUNT, block)
+                                state.modbus_block = False
+                            else:
+                                registers = block.registers
+                                offset = REG_GRID_POWER - REG_BLOCK_START
+                                state.battery_w = decode_i32(registers[0:2])
+                                state.grid_w = decode_i32(registers[offset:offset + 2])
+                                state.last_huawei_seen = datetime.datetime.now().timestamp()
+                            await asyncio.sleep(0.3)  # SDongle nicht hetzen
+                        if not state.modbus_block:
+                            result = await client.read_holding_registers(
+                                REG_GRID_POWER, count=2, device_id=1
+                            )
+                            if not result.isError():
+                                state.grid_w = decode_i32(result.registers)
+                                state.last_huawei_seen = datetime.datetime.now().timestamp()
+                            await asyncio.sleep(0.3)
+                            batt_result = await client.read_holding_registers(
+                                REG_BATTERY_POWER, count=2, device_id=1
+                            )
+                            if not batt_result.isError():
+                                state.battery_w = decode_i32(batt_result.registers)
+                            await asyncio.sleep(0.3)
+                        pv_result = await client.read_holding_registers(
+                            REG_PV_POWER, count=2, device_id=1
                         )
-                        if not result.isError():
-                            state.grid_w = decode_i32(result.registers)
-                            state.last_huawei_seen = datetime.datetime.now().timestamp()
-                        await asyncio.sleep(0.3)  # SDongle nicht hetzen
+                        if not pv_result.isError():
+                            state.pv_w = decode_i32(pv_result.registers)
+                        await asyncio.sleep(0.3)
                         soc_result = await client.read_holding_registers(
                             REG_BATTERY_SOC, count=1, device_id=1
                         )
                         if not soc_result.isError():
                             state.soc = soc_result.registers[0] * 0.1
-                        await asyncio.sleep(0.3)
-                        batt_result = await client.read_holding_registers(
-                            REG_BATTERY_POWER, count=2, device_id=1
-                        )
-                        if not batt_result.isError():
-                            state.battery_w = decode_i32(batt_result.registers)
                         await asyncio.sleep(0.3)
                         cmd_result = await client.read_holding_registers(
                             REG_FORCIBLE_CMD, count=1, device_id=1
@@ -430,6 +547,7 @@ async def modbus_task(host: str):
         client.close()
         state.grid_w = None
         state.battery_w = None
+        state.pv_w = None
         log.warning("Modbus getrennt, Reconnect in 10 s")
         await asyncio.sleep(10)
 
@@ -648,10 +766,12 @@ async def control_step(now: float):
 
     # Nachttarif-Fenster oder Modus "fast": volle Leistung
     if state.mode == "fast" or in_night_window():
-        if state.current_limit != MAX_AMPS:
-            await charge_point.set_limit(MAX_AMPS)
-        if not state.charging:
-            await charge_point.remote_start()
+        if state.charging:
+            reset_start_backoff()
+            if state.current_limit != MAX_AMPS:
+                await charge_point.set_limit(MAX_AMPS)
+        else:
+            await try_start(now, MAX_AMPS)
         return
 
     surplus = state.grid_w + charge_power(now)
@@ -679,13 +799,13 @@ async def control_step(now: float):
             state.deficit_since = None
             state.surplus_since = state.surplus_since or now
             if now - state.surplus_since >= state.start_delay_s:
-                log.info("Überschuss %.0f W seit %ds — starte Ladung mit %.1f A",
-                         surplus, state.start_delay_s, amps)
-                await charge_point.set_limit(amps)
-                await charge_point.remote_start()
-                state.last_adjust = now
+                if state.start_retry_at is None:
+                    log.info("Überschuss %.0f W seit %ds — starte Ladung mit %.1f A",
+                             surplus, state.start_delay_s, amps)
+                await try_start(now, amps)
         else:
             state.surplus_since = None
+            reset_start_backoff()   # Trigger weg: nächster Anlauf beginnt von vorn
     else:
         if state.mode == "minpv":
             # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
@@ -903,6 +1023,8 @@ async function refresh() {
   const drows = [
     ["Box-Status (OCPP)", s.box_status],
     ["Limit", s.current_limit.toFixed(1) + " A"],
+    ["PV-Erzeugung", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
+    ["Hausverbrauch", s.house_w === null ? "–" : Math.round(s.house_w) + " W"],
     ["PV-Überschuss echt", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
     ["minpv-Hysterese", minpvInfo()],
@@ -980,8 +1102,9 @@ async def http_index(_request):
     return web.Response(text=INDEX_HTML, content_type="text/html")
 
 
-async def http_status(_request):
-    return web.json_response({
+def status_dict() -> dict:
+    """Alles, was UI und Mitschnitt brauchen — eine Quelle für beide."""
+    return {
         "mode": state.mode,
         "released": state.released,
         "min_amps": state.min_amps,
@@ -992,6 +1115,11 @@ async def http_status(_request):
         "grid_w": state.grid_w,
         "soc": state.soc,
         "battery_w": state.battery_w,
+        "pv_w": state.pv_w,
+        # Was das Haus zieht: Erzeugung minus Einspeisung, Batterie und Auto
+        "house_w": None if state.pv_w is None or state.grid_w is None
+                   else state.pv_w - state.grid_w - (state.battery_w or 0) - state.charge_w,
+        "modbus_block": state.modbus_block,
         "batt_target_soc": state.batt_target_soc,
         "batt_charge_w": state.batt_charge_w,
         "forcible_cmd": state.forcible_cmd,
@@ -1027,7 +1155,82 @@ async def http_status(_request):
                       else round(datetime.datetime.now().timestamp() - state.last_box_seen),
         "huawei_seen_s": None if state.last_huawei_seen is None
                          else round(datetime.datetime.now().timestamp() - state.last_huawei_seen),
-    })
+    }
+
+
+async def http_status(_request):
+    return web.json_response(status_dict())
+
+
+# Was je Abtastung mitgeschrieben wird. Die Schwellen und Faktoren stehen
+# einmal je Datei in der Kopfzeile — sie ändern sich im Betrieb praktisch nie
+# und würden den Mitschnitt sonst um ein Vielfaches aufblähen.
+RECORD_FIELDS = (
+    "grid_w", "battery_w", "pv_w", "house_w", "soc",
+    "charge_w", "charge_w_src", "current_limit", "charging", "box_status",
+    "surplus_w", "pv_surplus_w", "pv_avg_w", "avg_active_s", "minpv_low_s",
+    "mode", "min_amps", "night", "boost_used_wh", "battery_grid_charge",
+)
+RECORD_NAME = "status-%s.jsonl"          # je Tag eine Datei
+RECORD_GLOB = re.compile(r"^status-\d{4}-\d{2}-\d{2}\.jsonl$")
+
+
+def prune_recordings():
+    """Ringbuffer: alles löschen, was älter als record_keep_days ist.
+
+    Es werden ausschließlich Dateien angefasst, die dem Namensmuster des
+    Mitschnitts entsprechen — sonst räumt der Regler fremde Daten ab.
+    """
+    grenze = datetime.date.today() - datetime.timedelta(days=state.record_keep_days)
+    for name in os.listdir(state.record_dir):
+        if not RECORD_GLOB.match(name):
+            continue
+        try:
+            tag = datetime.date.fromisoformat(name[len("status-"):-len(".jsonl")])
+        except ValueError:
+            continue
+        if tag < grenze:
+            os.remove(os.path.join(state.record_dir, name))
+            log.info("Mitschnitt %s gelöscht (älter als %d Tage)", name, state.record_keep_days)
+
+
+async def record_task():
+    """Regelbetrieb mitschreiben — Rohmaterial für Testfälle in test_sim.py.
+
+    Eine JSON-Zeile je Abtastung, eine Datei pro Tag, ältere Tage fallen
+    hinten raus. Fehler dürfen den Regler nicht mitreißen: schlägt das
+    Schreiben fehl, wird geloggt und weiter gemessen.
+    curve_from_recording.py macht aus den Dateien PV-Kurven.
+    """
+    os.makedirs(state.record_dir, exist_ok=True)
+    log.info("Mitschnitt aktiv: %s (alle %ds, %d Tage)", state.record_dir,
+             state.record_interval_s, state.record_keep_days)
+    day, fh = None, None
+    try:
+        while True:
+            try:
+                now = datetime.datetime.now()
+                if now.date() != day:
+                    if fh:
+                        fh.close()
+                    day = now.date()
+                    path = os.path.join(state.record_dir, RECORD_NAME % day.isoformat())
+                    neu = not os.path.exists(path)
+                    fh = open(path, "a", buffering=1)
+                    if neu:   # Kopfzeile: alles, was nicht je Takt gebraucht wird
+                        fh.write(json.dumps({"t": now.isoformat(timespec="seconds"),
+                                             "config": status_dict()}) + "\n")
+                    prune_recordings()
+                sample = {"t": now.isoformat(timespec="seconds")}
+                voll = status_dict()
+                sample.update({k: voll[k] for k in RECORD_FIELDS})
+                fh.write(json.dumps(sample) + "\n")
+            except Exception as exc:  # noqa: BLE001 — Mitschnitt darf nie den Regler stoppen
+                log.warning("Mitschnitt fehlgeschlagen: %s", exc)
+            await asyncio.sleep(state.record_interval_s)
+    finally:
+        if fh:
+            fh.close()
 
 
 async def http_mode(request):
@@ -1159,6 +1362,14 @@ async def main():
     state.charge_w_max_age_s = int(os.environ.get("PVUEB_CHARGE_W_MAX_AGE_S", "30"))
     if state.charge_w_max_age_s < 1:
         sys.exit("PVUEB_CHARGE_W_MAX_AGE_S muss >= 1 Sekunde sein")
+    state.start_retry_s = int(os.environ.get("PVUEB_START_RETRY_S", "30"))
+    if state.start_retry_s < 1:
+        sys.exit("PVUEB_START_RETRY_S muss >= 1 Sekunde sein")
+    state.record_dir = os.environ.get("PVUEB_RECORD_DIR", "")
+    state.record_interval_s = int(os.environ.get("PVUEB_RECORD_INTERVAL_S", "10"))
+    state.record_keep_days = int(os.environ.get("PVUEB_RECORD_KEEP_DAYS", "14"))
+    if state.record_interval_s < 1 or state.record_keep_days < 1:
+        sys.exit("PVUEB_RECORD_INTERVAL_S und PVUEB_RECORD_KEEP_DAYS müssen >= 1 sein")
     if not 0 < state.minpv_pause_factor < state.minpv_resume_factor <= state.minpv_start_factor:
         sys.exit("PVUEB_MINPV_*_FACTOR unplausibel (0 < pause < resume <= start nötig)")
     if min(state.poll_interval_s, state.adjust_min_interval_s,
@@ -1175,10 +1386,11 @@ async def main():
 
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
-    await asyncio.gather(
-        server.wait_closed(), modbus_task(args.inverter), control_task(),
-        command_loop(), web_task(args.web_port), forecast_task(),
-    )
+    tasks = [server.wait_closed(), modbus_task(args.inverter), control_task(),
+             command_loop(), web_task(args.web_port), forecast_task()]
+    if state.record_dir:
+        tasks.append(record_task())
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
