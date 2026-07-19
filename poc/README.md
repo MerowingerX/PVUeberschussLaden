@@ -59,7 +59,7 @@ Minimaler OCPP-1.6J-Server (`ocpp_server.py`), gegen simulierte Wallbox end-to-e
 
 ## Erfolgskriterien
 
-- [x] Pulsar Pro verbindet sich und bootet gegen den Server (2026-07-15; ufw-Freigabe Port 9000 nötig)
+- [x] Pulsar Plus verbindet sich und bootet gegen den Server (2026-07-15; ufw-Freigabe Port 9000 nötig)
 - [x] SetChargingProfile wird mit "Accepted" quittiert
 - [ ] `limit 6` / `limit 16` ändert nachweislich die Ladeleistung (MeterValues oder FusionSolar-Verbrauch) — **braucht eingestecktes Auto**
 - [ ] `start`/`stop` funktioniert mit eingestecktem Auto

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M3-PoC: Regel-Loop — verbindet Sun2000-Messung mit Pulsar-Pro-Steuerung.
+"""M3-PoC: Regel-Loop — verbindet Sun2000-Messung mit Pulsar-Plus-Steuerung.
 
 Aufruf:
     python charge_loop.py [--inverter <ip>] [--port 9000]
@@ -52,6 +52,18 @@ startet höchstens einmal pro Nacht, wenn Nachtfenster aktiv, SOC unter
 PVUEB_BATT_LOW_SOC und die Sonnenprognose (forecast.solar) unter
 PVUEB_FORECAST_MIN_KWH liegt.
 
+Ladeleistung als Referenz (PVUEB_WALLBOX_*, optional): Die Box meldet ihre
+Leistung nicht über OCPP, liefert sie aber an die Hersteller-Cloud. Von dort
+geholt dient sie ausschließlich der Kontrolle — die Regelung rührt den Wert
+nicht an (30 s Aktualisierung gegen 5 s Regeltakt, und ein Internetausfall
+darf keine Ladung beeinflussen). Status und Mitschnitt führen die Differenz
+zur Schätzung als charge_w_abweichung mit.
+
+Die .env wird beim Start und nach Änderungen im Web-UI vollständig
+zurückgeschrieben — jede Einstellung mit dem wirksamen Wert und einer Erklärung,
+Sicherung in .env.bak. Damit überleben auch Schieberegler-Werte den Neustart.
+Liegt keine .env vor (Docker mit env_file), passiert nichts.
+
 Fahrzeugdaten (PVUEB_AUDI_*, optional): Ladestand, Reichweite und Ladestatus
 des Q4 kommen über carconnectivity aus der MyAudi-Cloud auf ein eigenes
 Slide. Reine Anzeige — geregelt wird weiter nach Netzleistung und
@@ -70,6 +82,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import re
 import sys
 
@@ -126,7 +139,26 @@ FORECAST_REFRESH_S = 6 * 3600    # Abruf-Rhythmus (Limit wäre 12/h — wir sind
 FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 
 # Audi connect (MyAudi-Cloud über carconnectivity; Zugang aus .env, PVUEB_AUDI_*)
+# myWallbox-Cloud (api.wall-box.com; Zugang aus .env, PVUEB_WALLBOX_*).
+# Nur Referenzmessung — die Regelung rührt diese Werte nicht an.
+WALLBOX_TOKEN_TTL_S = 45         # JWT hält rund 60 s, vorher erneuern
+WALLBOX_MIN_POLL_S = 30          # die Cloud aktualisiert nicht häufiger
+WALLBOX_STATUS = {               # nur die Zustände, die im Betrieb vorkommen
+    161: "bereit", 162: "bereit", 163: "getrennt", 164: "wartet", 165: "gesperrt",
+    166: "aktualisiert", 177: "geplant", 178: "pausiert", 179: "geplant",
+    180: "warte auf Auto", 181: "warte auf Auto", 182: "pausiert",
+    183: "warte auf Auto", 184: "warte auf Auto", 185: "warte auf Auto",
+    186: "warte auf Auto", 187: "warte auf Auto", 188: "warte auf Auto",
+    189: "warte auf Auto", 193: "lädt", 194: "lädt", 195: "lädt",
+    196: "entlädt", 209: "gesperrt", 210: "gesperrt, Auto verbunden",
+}
 AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
+# Nach Anmeldefehlern wird der Abstand verdoppelt. Hintergrund: Scheitert die
+# Anmeldung dauerhaft (Cariad ändert die Schnittstelle, der Connector hinkt
+# nach), liefe der Task sonst 144-mal am Tag ins Leere — genau so handelt man
+# sich eine temporäre Kontosperre ein, die dann auch die echte App trifft.
+AUDI_MAX_AUTH_BACKOFF_S = 6 * 3600   # Anmeldung abgelehnt: höchstens alle 6 h
+AUDI_MAX_ERROR_BACKOFF_S = 30 * 60   # Netz-/Cloud-Fehler: höchstens alle 30 min
 # Token und Antwort-Cache neben dem Skript ablegen, damit nicht jeder Abruf
 # einen neuen Login auslöst — beide enthalten Zugangsdaten, also gitignored.
 AUDI_TOKENSTORE = os.path.join(os.path.dirname(__file__), ".audi-tokenstore.json")
@@ -215,6 +247,14 @@ class State:
     audi_poll_s = 600            # Abstand der Cloud-Abrufe (aus .env)
     audi: dict = {}              # letzter Fahrzeug-Snapshot, siehe audi_snapshot()
     audi_error: str | None = None          # letzter Fehler, für die UI
+    audi_retry_s = 600           # aktueller Abstand, wächst nach Fehlern
+    wallbox_user = ""            # myWallbox-Konto, leer = Abfrage aus (aus .env)
+    wallbox_password = ""
+    wallbox_id = ""              # Charger-ID aus der App bzw. my.wall-box.com (aus .env)
+    wallbox_poll_s = 60          # Abstand der Cloud-Abrufe (aus .env)
+    wallbox: dict = {}           # letzter Snapshot, siehe wallbox_snapshot()
+    wallbox_error: str | None = None       # letzter Fehler, für die UI
+    last_wallbox_ok: float | None = None   # Unix-Zeit des letzten erfolgreichen Abrufs
     last_audi_ok: float | None = None      # Unix-Zeit: letzter erfolgreicher Abruf
 
 
@@ -840,8 +880,14 @@ async def audi_task():
         # Der Connector cacht selbst und lehnt kürzere Intervalle ab
         "interval": max(AUDI_MIN_INTERVAL_S, state.audi_poll_s),
     }}]}}
+    try:
+        from carconnectivity.errors import AuthenticationError
+    except ImportError:                      # ältere Fassungen kennen die Klasse nicht
+        AuthenticationError = ()
+
     loop = asyncio.get_running_loop()
     car = None
+    fehler_folge = 0
     while True:
         try:
             if car is None:
@@ -857,12 +903,21 @@ async def audi_task():
             state.audi = audi_snapshot(vehicles[0])
             state.audi_error = None
             state.last_audi_ok = datetime.datetime.now().timestamp()
+            fehler_folge = 0
+            state.audi_retry_s = state.audi_poll_s
             log.info("Audi: SOC %s %% (%s), %s, Reichweite %s km",
                      state.audi["soc"], state.audi["connection"],
                      state.audi["charge_state"], state.audi["range_km"])
         except Exception as exc:  # noqa: BLE001 — Cloud-Fehler dürfen den Regler nie stoppen
             state.audi_error = str(exc) or exc.__class__.__name__
-            log.warning("Audi-Abruf fehlgeschlagen: %s", state.audi_error)
+            fehler_folge += 1
+            # Abgelehnte Anmeldungen sind teurer als Netzfehler: dort droht die
+            # Kontosperre, hier hilft schlichtes Abwarten
+            abgelehnt = isinstance(exc, AuthenticationError) if AuthenticationError else False
+            grenze = AUDI_MAX_AUTH_BACKOFF_S if abgelehnt else AUDI_MAX_ERROR_BACKOFF_S
+            state.audi_retry_s = min(state.audi_poll_s * 2 ** (fehler_folge - 1), grenze)
+            log.warning("Audi-Abruf fehlgeschlagen (%d. Mal): %s — nächster Versuch in %d min",
+                        fehler_folge, state.audi_error, round(state.audi_retry_s / 60))
             # Sitzung verwerfen: nach Login-/Token-Fehlern hilft nur neu anmelden
             if car is not None:
                 try:
@@ -870,7 +925,75 @@ async def audi_task():
                 except Exception:  # noqa: BLE001
                     pass
                 car = None
-        await asyncio.sleep(state.audi_poll_s)
+        await asyncio.sleep(state.audi_retry_s)
+
+
+def wallbox_snapshot(daten: dict) -> dict:
+    """Die paar Felder aus ~200 Zeilen Cloud-Antwort, die uns angehen."""
+    leistung_kw = daten.get("charging_power")
+    config = daten.get("config_data") or {}
+    return {
+        # Die Cloud liefert kW, alles andere im Projekt rechnet in W
+        "power_w": None if leistung_kw is None else round(float(leistung_kw) * 1000),
+        "added_kwh": daten.get("added_energy"),
+        "added_km": daten.get("added_range"),
+        "charging_time_s": daten.get("charging_time"),
+        "status_id": daten.get("status_id"),
+        "status": WALLBOX_STATUS.get(daten.get("status_id"), "unbekannt"),
+        # Grenze aus der Wallbox-App. Im OCPP-Betrieb gilt unser Limit, aber
+        # fällt die Box je aus dem OCPP-Modus, deckelt dieser Wert die Ladung
+        "app_max_a": config.get("max_charging_current"),
+        "hw_max_a": config.get("max_available_current"),
+        "firmware": (config.get("software") or {}).get("currentVersion"),
+        "locked": config.get("locked"),
+        "last_sync": daten.get("last_sync"),
+    }
+
+
+async def wallbox_cloud_task():
+    """Holt die Ladeleistung aus der myWallbox-Cloud — als Referenz, nicht zum Regeln.
+
+    Die Pulsar Plus kennt ihre Ladeleistung, meldet sie über OCPP aber nicht
+    (kein Power.Active.Import). In der Hersteller-Cloud steht sie. Von dort
+    geregelt wird trotzdem nicht: Die Werte werden alle 30 s aktualisiert,
+    der Regler arbeitet mit 5 s, und ein Internetausfall dürfte niemals eine
+    Ladung beeinflussen. Der Wert dient dazu, die Schätzung aus dem Limit zu
+    überprüfen — die Abweichung landet im Status und im Mitschnitt.
+    """
+    anmeldung = base64.b64encode(
+        f"{state.wallbox_user}:{state.wallbox_password}".encode()).decode()
+    kopf = {"Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=utf-8"}
+    token, token_bis = None, 0.0
+    async with aiohttp.ClientSession() as sitzung:
+        while True:
+            try:
+                now = asyncio.get_running_loop().time()
+                if token is None or now >= token_bis:
+                    async with sitzung.post(
+                            "https://api.wall-box.com/auth/token/user",
+                            headers={**kopf, "Authorization": f"Basic {anmeldung}"},
+                            timeout=aiohttp.ClientTimeout(total=15)) as antwort:
+                        antwort.raise_for_status()
+                        token = (await antwort.json())["jwt"]
+                    # Das Token lebt kurz; früh genug erneuern, statt auf 401 zu warten
+                    token_bis = now + WALLBOX_TOKEN_TTL_S
+                    log.info("myWallbox: angemeldet")
+                async with sitzung.get(
+                        f"https://api.wall-box.com/chargers/status/{state.wallbox_id}",
+                        headers={**kopf, "Authorization": f"Bearer {token}"},
+                        timeout=aiohttp.ClientTimeout(total=15)) as antwort:
+                    if antwort.status in (401, 403):
+                        token = None          # abgelaufen: nächste Runde neu anmelden
+                        raise RuntimeError(f"Anmeldung abgelehnt (HTTP {antwort.status})")
+                    antwort.raise_for_status()
+                    state.wallbox = wallbox_snapshot(await antwort.json())
+                state.wallbox_error = None
+                state.last_wallbox_ok = datetime.datetime.now().timestamp()
+            except Exception as exc:  # noqa: BLE001 — Cloud-Fehler dürfen den Regler nie stoppen
+                state.wallbox_error = str(exc) or exc.__class__.__name__
+                log.warning("myWallbox-Abruf fehlgeschlagen: %s", state.wallbox_error)
+            await asyncio.sleep(state.wallbox_poll_s)
 
 
 async def battery_night_check():
@@ -1090,7 +1213,7 @@ INDEX_HTML = """<!doctype html>
   .note.err { color:#ef9a9a; }
 </style></head><body>
 <h1>PVueb – Überschussladen</h1>
-<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
 <div class="pages" id="pages">
 <section class="page">
 <div id="stat"></div>
@@ -1110,9 +1233,8 @@ INDEX_HTML = """<!doctype html>
 <button id="batt" onclick="toggleBatt()">…</button>
 </section>
 <section class="page">
-<h2>Audi Q4 <span id="aheart"></span></h2>
-<div id="audibar"></div>
-<div id="audistat"></div>
+<h2>Wallbox <span id="wheart"></span></h2>
+<div id="wbstat"></div>
 </section>
 <section class="page">
 <h2>Debug</h2>
@@ -1132,6 +1254,11 @@ INDEX_HTML = """<!doctype html>
          onchange="setConfig({heartbeat_s: +this.value})">
 </div>
 </section>
+<section class="page">
+<h2>Audi Q4 <span id="aheart"></span></h2>
+<div id="audibar"></div>
+<div id="audistat"></div>
+</section>
 </div>
 <script>
 let s = {};
@@ -1144,6 +1271,54 @@ function ago(sec) {
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
 }
+function renderWallbox() {
+  // Seite 4: was die Box selbst über sich sagt (Hersteller-Cloud)
+  const out = document.getElementById("wbstat");
+  const heart = document.getElementById("wheart");
+  const row = r => `<div class="row"><span>${r[0]}</span><span class="val">${r[1]}</span></div>`;
+  if (!s.wallbox_enabled) {
+    heart.textContent = "";
+    out.innerHTML = `<div class="note">Abfrage aus – PVUEB_WALLBOX_USER in der .env setzen,
+      um Ladeleistung und Sitzungsdaten aus der Hersteller-Cloud zu holen.</div>`;
+    return;
+  }
+  heart.textContent = s.wallbox_seen_s === null ? "⚪"
+    : (s.wallbox_seen_s < 180 ? "🟢" : "🟠");
+  const w = s.wallbox_cloud || {};
+  const rows = [
+    ["Ladeleistung (gemessen)", w.power_w === null || w.power_w === undefined ? "–"
+      : Math.round(w.power_w) + " W ≈ " + (w.power_w / WPA).toFixed(1) + " A"],
+    ["Regler schätzt", !s.charging ? "– (lädt nicht)"
+      : Math.round(s.charge_w) + " W" + (s.charge_w_abweichung === null ? ""
+        : " (" + (s.charge_w_abweichung >= 0 ? "+" : "") + s.charge_w_abweichung + " W)")],
+    ["Status der Box", (w.status || "–") + (w.status_id ? " (" + w.status_id + ")" : "")],
+    ["Sitzung geladen", w.added_kwh === undefined || w.added_kwh === null ? "–"
+      : w.added_kwh + " kWh" + (w.added_km ? " ≈ " + w.added_km + " km" : "")],
+    ["Ladezeit gesamt", w.charging_time_s ? (w.charging_time_s / 3600).toFixed(1) + " h" : "–"],
+    ["Grenze in der App", w.app_max_a === undefined || w.app_max_a === null ? "–"
+      : w.app_max_a + " A von " + (w.hw_max_a ?? "?") + " A"
+        + (w.app_max_a < 16 ? " ⚠" : "")],
+    ["Firmware", w.firmware || "–"],
+    ["Abgerufen", ago(s.wallbox_seen_s)],
+  ];
+  out.innerHTML = rows.map(row).join("")
+    + (s.wallbox_error ? `<div class="note err">${s.wallbox_error}</div>` : "")
+    + `<div class="note">Referenzmessung – der Regler nutzt diese Werte nicht.
+       Die Cloud aktualisiert alle 30 s.</div>`;
+}
+
+function wallboxCloud() {
+  // Referenzmessung aus der Hersteller-Cloud; die Regelung nutzt sie nicht
+  if (s.wallbox_error) return "⚠ " + s.wallbox_error;
+  const w = s.wallbox_cloud || {};
+  if (w.power_w === null || w.power_w === undefined) return "–";
+  const alter = s.wallbox_seen_s === null ? "" : " · vor " + s.wallbox_seen_s + " s";
+  const diff = s.charge_w_abweichung;
+  const abw = diff === null ? ""
+    : " · Schätzung " + (diff >= 0 ? "+" : "") + diff + " W";
+  return Math.round(w.power_w) + " W (" + (w.status || "?") + ")" + abw + alter;
+}
+
 function minpvInfo() {
   if (s.mode !== "minpv") return "–";
   const minW = s.min_amps * WPA;
@@ -1225,6 +1400,7 @@ async function refresh() {
     ["Limit", s.current_limit.toFixed(1) + " A"],
     ["PV-Erzeugung", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
     ["Hausverbrauch", s.house_w === null ? "–" : Math.round(s.house_w) + " W"],
+    ...(s.wallbox_enabled ? [["Wallbox-Cloud", wallboxCloud()]] : []),
     ["PV-Überschuss echt", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
     ["minpv-Hysterese", minpvInfo()],
@@ -1251,6 +1427,7 @@ async function refresh() {
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
+  renderWallbox();
   renderAudi(row);
   for (const m of ["pv","minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
@@ -1399,8 +1576,20 @@ def status_dict() -> dict:
                       else round(datetime.datetime.now().timestamp() - state.last_box_seen),
         "huawei_seen_s": None if state.last_huawei_seen is None
                          else round(datetime.datetime.now().timestamp() - state.last_huawei_seen),
+        "wallbox_enabled": bool(state.wallbox_user),
+        "wallbox_cloud": state.wallbox,
+        "wallbox_error": state.wallbox_error,
+        "wallbox_seen_s": None if state.last_wallbox_ok is None
+                          else round(datetime.datetime.now().timestamp() - state.last_wallbox_ok),
+        # Wie weit liegt die geschätzte Ladeleistung neben der gemessenen?
+        # Gerade 0 W bei laufender Ladung ist aussagekräftig — dann glaubt der
+        # Regler zu laden, während die Box nichts abgibt
+        "charge_w_abweichung": None if state.wallbox.get("power_w") is None
+                                       or not state.charging
+                               else round(state.charge_w - state.wallbox["power_w"]),
         "audi_enabled": bool(state.audi_user),
         "audi": state.audi,
+        "audi_retry_s": state.audi_retry_s,
         "audi_error": state.audi_error,
         "audi_poll_s": state.audi_poll_s,
         "audi_seen_s": None if state.last_audi_ok is None
@@ -1420,6 +1609,8 @@ RECORD_FIELDS = (
     "charge_w", "charge_w_src", "current_limit", "charging", "box_status",
     "surplus_w", "pv_surplus_w", "pv_avg_w", "avg_active_s", "minpv_low_s",
     "mode", "min_amps", "night", "boost_used_wh", "battery_grid_charge",
+    # Referenzmessung aus der Cloud: erlaubt später, die Schätzung zu bewerten
+    "wallbox_cloud", "charge_w_abweichung",
 )
 RECORD_NAME = "status-%s.jsonl"          # je Tag eine Datei
 RECORD_GLOB = re.compile(r"^status-\d{4}-\d{2}-\d{2}\.jsonl$")
@@ -1528,6 +1719,8 @@ async def http_config(request):
         log.info("Heartbeat (Web): %s s", hb)
         if charge_point is not None:
             await charge_point.change_configuration("HeartbeatInterval", str(hb))
+    # Im Web-UI geänderte Werte überleben so den nächsten Neustart
+    write_dotenv("Änderung im Web-UI")
     return web.json_response({"ok": True})
 
 
@@ -1593,17 +1786,199 @@ def parse_hhmm(text: str) -> int:
         sys.exit(f"Ungültige Uhrzeit {text!r} — erwartet HH:MM (z. B. 22:30)")
 
 
+ENV_PFAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".env")
+
+
 def load_dotenv():
     """Minimaler .env-Lader (Projektverzeichnis), ohne Zusatz-Dependency."""
-    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    if not os.path.exists(env_path):
+    if not os.path.exists(ENV_PFAD):
         return
-    with open(env_path) as f:
+    with open(ENV_PFAD) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip())
+
+
+def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
+    """Alle Einstellungen mit aktuellem Wert und Erklärung, nach Themen sortiert.
+
+    Grundlage für write_dotenv(): So steht in der .env immer der vollständige
+    Satz, auch für Werte, die bisher nur als Default im Code existierten.
+    """
+    def hhmm(minuten: int) -> str:
+        return f"{minuten // 60:02d}:{minuten % 60:02d}"
+
+    return [
+        ("Wechselrichter", [
+            ("PVUEB_INVERTER_IP", os.environ.get("PVUEB_INVERTER_IP", ""),
+             "IP des SDongle. Pflichtangabe, sonst startet der Regler nicht."),
+        ]),
+        ("Standort und Anlage (Sonnenprognose über forecast.solar)", [
+            ("PVUEB_LAT", state.lat, "Breitengrad"),
+            ("PVUEB_LON", state.lon, "Längengrad"),
+            ("PVUEB_PV_KWP", state.pv_kwp, "Anlagenleistung in kWp"),
+            ("PVUEB_PV_TILT", state.pv_tilt, "Modulneigung in Grad"),
+            ("PVUEB_PV_AZIMUT", state.pv_azimut,
+             "Ausrichtung: 0 = Süd, -90 = Ost, 90 = West"),
+        ]),
+        ("Nachttarif", [
+            ("PVUEB_NIGHT_START", hhmm(state.night_start_min),
+             "Beginn des Tariffensters, Format HH:MM"),
+            ("PVUEB_NIGHT_END", hhmm(state.night_end_min),
+             "Ende des Fensters. Über Mitternacht erlaubt (22:00 -> 06:00)."),
+        ]),
+        ("Regelzeiten", [
+            ("PVUEB_POLL_INTERVAL_S", state.poll_interval_s, "Takt der Messung und Regelung"),
+            ("PVUEB_ADJUST_MIN_INTERVAL_S", state.adjust_min_interval_s,
+             "Mindestabstand zwischen zwei Limit-Änderungen"),
+            ("PVUEB_START_DELAY_S", state.start_delay_s,
+             "So lange muss der Überschuss reichen, bevor die Ladung startet"),
+            ("PVUEB_STOP_DELAY_S", state.stop_delay_s,
+             "So lange muss er fehlen, bevor gestoppt wird"),
+            ("PVUEB_HEARTBEAT_S", state.heartbeat_s,
+             "OCPP-Heartbeat der Wallbox, auch im Web-UI einstellbar"),
+        ]),
+        ("minpv: Startschwelle und Wolkenloch-Überbrückung", [
+            ("PVUEB_MINPV_START_FACTOR", state.minpv_start_factor,
+             "Start erst ab Faktor × Mindestleistung echtem Überschuss"),
+            ("PVUEB_MINPV_PAUSE_FACTOR", state.minpv_pause_factor,
+             "Darunter läuft der Timeout an"),
+            ("PVUEB_MINPV_RESUME_FACTOR", state.minpv_resume_factor,
+             "Darüber wird er verworfen. Bedingung: 0 < pause < resume <= start."),
+            ("PVUEB_MINPV_TIMEOUT_MIN", round(state.minpv_timeout_s / 60, 2),
+             "So lange werden Wolkenlöcher überbrückt, in Minuten"),
+        ]),
+        ("Mittelung und Auflösung des Ladelimits", [
+            ("PVUEB_AVG_WINDOW_MIN", round(state.avg_window_s / 60, 2),
+             "Mittelungsfenster beim Regeln, 0 = aus"),
+            ("PVUEB_START_AVG_MIN", round(state.start_avg_window_s / 60, 2),
+             "Kürzeres Fenster für die Startentscheidung"),
+            ("PVUEB_LIMIT_STEP_A", state.limit_step_a, "Raster des Ladelimits in Ampere"),
+            ("PVUEB_LIMIT_DEADBAND_A", state.limit_deadband_a,
+             "Abweichung, ab der neu gesetzt wird"),
+        ]),
+        ("Messwerte der Wallbox", [
+            ("PVUEB_CHARGE_W_MAX_AGE_S", state.charge_w_max_age_s,
+             "Ältere Leistungsmeldung gilt als tot; dann wird aus dem Limit geschätzt"),
+            ("PVUEB_START_RETRY_S", state.start_retry_s,
+             "Grundabstand zwischen Startversuchen, verdoppelt sich bei Ablehnung"),
+        ]),
+        ("Batterie-Boost bei Wolkenlöchern", [
+            ("PVUEB_BOOST_W", state.boost_w, "Leistung, die die Hausbatterie nachschiebt"),
+            ("PVUEB_BOOST_H", round(state.boost_wh / state.boost_w, 2) if state.boost_w else 0,
+             "Tagesbudget in Stunden dieser Leistung, 0 = Boost aus"),
+            ("PVUEB_BOOST_MIN_SOC", state.boost_min_soc, "Darunter kein Boost mehr"),
+        ]),
+        ("Batterie-Netzladung im Nachtfenster", [
+            ("PVUEB_BATT_LOW_SOC", state.batt_low_soc, "Automatik startet unter diesem SOC"),
+            ("PVUEB_BATT_TARGET_SOC", state.batt_target_soc, "Ziel-SOC, dort stoppt der Wechselrichter"),
+            ("PVUEB_BATT_CHARGE_W", state.batt_charge_w, "Ladeleistung aus dem Netz"),
+            ("PVUEB_FORECAST_MIN_KWH", state.forecast_min_kwh,
+             "Nur laden, wenn die Prognose für morgen darunter liegt"),
+        ]),
+        ("Mitschnitt für Testfälle", [
+            ("PVUEB_RECORD_DIR", state.record_dir, "Zielordner, leer = kein Mitschnitt"),
+            ("PVUEB_RECORD_INTERVAL_S", state.record_interval_s, "Abstand der Zeilen"),
+            ("PVUEB_RECORD_KEEP_DAYS", state.record_keep_days,
+             "Ringbuffer: ältere Tage werden gelöscht"),
+        ]),
+        ("Anmeldung (leer = offen, wie bisher)", [
+            ("PVUEB_WEB_USER", state.web_user, "Basic Auth für die Web-UI"),
+            ("PVUEB_WEB_PASSWORD", state.web_password, ""),
+            ("PVUEB_OCPP_USER", state.ocpp_user,
+             "Basic Auth für OCPP. Erst in der Wallbox-App eintragen, dann hier!"),
+            ("PVUEB_OCPP_PASSWORD", state.ocpp_password, ""),
+        ]),
+        ("Ladeleistung als Referenz aus der myWallbox-Cloud", [
+            ("PVUEB_WALLBOX_USER", state.wallbox_user,
+             "Konto der Wallbox-App, leer = Abfrage aus"),
+            ("PVUEB_WALLBOX_PASSWORD", state.wallbox_password, ""),
+            ("PVUEB_WALLBOX_ID", state.wallbox_id, "Nummer der Box (App oder my.wall-box.com)"),
+            ("PVUEB_WALLBOX_POLL_S", state.wallbox_poll_s,
+             "Abrufabstand; die Cloud aktualisiert alle 30 s"),
+        ]),
+        ("Fahrzeugdaten aus der MyAudi-Cloud (reine Anzeige)", [
+            ("PVUEB_AUDI_USER", state.audi_user, "MyAudi-Konto, leer = Abfrage aus"),
+            ("PVUEB_AUDI_PASSWORD", state.audi_password, ""),
+            ("PVUEB_AUDI_SPIN", state.audi_spin, "S-PIN, nur für Steuerbefehle nötig"),
+            ("PVUEB_AUDI_VIN", state.audi_vin, "Nur nötig, wenn mehrere Autos im Konto hängen"),
+            ("PVUEB_AUDI_POLL_S", state.audi_poll_s, "Abrufabstand, Untergrenze 180 s"),
+        ]),
+    ]
+
+
+def write_dotenv(grund: str = "Start"):
+    """Die .env vollständig zurückschreiben: jeder Wert, jeder mit Erklärung.
+
+    Damit steht dort immer der komplette Satz — auch Einstellungen, die bisher
+    nur als Default im Code existierten oder über das Web-UI geändert wurden.
+
+    Die Datei enthält Zugangsdaten, deshalb mit Vorsicht: Es wird erst eine
+    Sicherung angelegt, dann in eine temporäre Datei geschrieben und diese
+    per Umbenennen an ihren Platz geschoben. Bricht etwas ab, bleibt entweder
+    die alte oder die neue Datei stehen, nie eine halbe. Unbekannte Zeilen
+    (eigene Variablen) werden am Ende angehängt, statt sie zu verlieren.
+    """
+    if not os.path.exists(ENV_PFAD):
+        # Im Container kommen die Werte über env_file aus der Umgebung, die
+        # Datei selbst liegt auf dem Host. Dort eine neue anzulegen, brächte
+        # nur eine Karteileiche, die der nächste Neustart wegwirft.
+        log.debug(".env nicht gefunden (%s) — nichts zurückzuschreiben", ENV_PFAD)
+        return
+
+    bekannte = {name for _, eintraege in env_spec() for name, _, _ in eintraege}
+    fremd: list[str] = []
+    with open(ENV_PFAD, encoding="utf-8") as fh:
+        for zeile in fh:
+            blank = zeile.strip()
+            if (blank and not blank.startswith("#") and "=" in blank
+                    and blank.partition("=")[0].strip() not in bekannte):
+                fremd.append(blank)
+
+    zeilen = [
+        "# PVueb-Konfiguration — beim Start automatisch vervollständigt.",
+        f"# Zuletzt geschrieben: {datetime.datetime.now():%d.%m.%Y %H:%M} ({grund}).",
+        "# Änderungen bleiben erhalten; fehlende Werte werden mit dem ergänzt,",
+        "# was gerade wirksam ist. Diese Datei enthält Zugangsdaten und gehört",
+        "# nicht ins Repository (.gitignore).",
+    ]
+    for gruppe, eintraege in env_spec():
+        zeilen += ["", f"# --- {gruppe} " + "-" * max(0, 60 - len(gruppe))]
+        for name, wert, kommentar in eintraege:
+            if kommentar:
+                zeilen.append(f"# {kommentar}")
+            zeilen.append(f"{name}={'' if wert is None else wert}")
+    if fremd:
+        zeilen += ["", "# --- Eigene Einträge (von PVueb nicht verwendet) " + "-" * 14]
+        zeilen += fremd
+
+    inhalt = "\n".join(zeilen) + "\n"
+    temp = ENV_PFAD + ".tmp"
+    try:
+        shutil.copy2(ENV_PFAD, ENV_PFAD + ".bak")
+        with open(temp, "w", encoding="utf-8") as fh:
+            fh.write(inhalt)
+        try:
+            os.replace(temp, ENV_PFAD)      # atomar: nie eine halbe Datei
+        except OSError:
+            # Als einzelne Datei eingebundenes Volume (Docker) lässt sich nicht
+            # ersetzen, nur beschreiben. Weniger sicher, aber die Sicherung von
+            # eben liegt daneben.
+            with open(ENV_PFAD, "w", encoding="utf-8") as fh:
+                fh.write(inhalt)
+            os.unlink(temp)
+        log.info(".env vervollständigt (%d Einstellungen, Sicherung in .env.bak)",
+                 len(bekannte))
+    except OSError as exc:
+        # Nur-lesend eingebundene Konfiguration ist ein legitimer Betriebsfall
+        log.warning(".env konnte nicht geschrieben werden: %s", exc)
+        if os.path.exists(temp):
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
 
 
 async def main():
@@ -1678,6 +2053,14 @@ async def main():
     state.forecast_min_kwh = float(os.environ.get("PVUEB_FORECAST_MIN_KWH", "5"))
     if state.night_start_min == state.night_end_min:
         sys.exit("PVUEB_NIGHT_START und PVUEB_NIGHT_END dürfen nicht gleich sein")
+    state.wallbox_user = os.environ.get("PVUEB_WALLBOX_USER", "")
+    state.wallbox_password = os.environ.get("PVUEB_WALLBOX_PASSWORD", "")
+    state.wallbox_id = os.environ.get("PVUEB_WALLBOX_ID", "")
+    state.wallbox_poll_s = max(WALLBOX_MIN_POLL_S,
+                               int(os.environ.get("PVUEB_WALLBOX_POLL_S", "60")))
+    if state.wallbox_user and not (state.wallbox_password and state.wallbox_id):
+        sys.exit("PVUEB_WALLBOX_USER gesetzt, aber PVUEB_WALLBOX_PASSWORD "
+                 "oder PVUEB_WALLBOX_ID fehlt")
     state.audi_user = os.environ.get("PVUEB_AUDI_USER", "")
     state.audi_password = os.environ.get("PVUEB_AUDI_PASSWORD", "")
     state.audi_spin = os.environ.get("PVUEB_AUDI_SPIN", "")
@@ -1689,6 +2072,10 @@ async def main():
         sys.exit(f"PVUEB_AUDI_POLL_S muss >= {AUDI_MIN_INTERVAL_S} sein "
                  "(kürzere Intervalle lehnt der Connector ab)")
 
+    # Konfiguration steht vollständig fest: zurückschreiben, damit die .env
+    # jeden wirksamen Wert enthält statt nur die abweichenden
+    write_dotenv()
+
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
     tasks = [server.wait_closed(), modbus_task(args.inverter), control_task(),
@@ -1697,6 +2084,8 @@ async def main():
         tasks.append(record_task())
     if state.audi_user:
         tasks.append(audi_task())
+    if state.wallbox_user:
+        tasks.append(wallbox_cloud_task())
     await asyncio.gather(*tasks)
 
 

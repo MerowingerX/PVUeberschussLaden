@@ -271,7 +271,7 @@
 <div class="wrap">
 
   <div class="meta">
-    <span>Anlage <b>7 kWp · Sun2000 · Pulsar Pro</b></span>
+    <span>Anlage <b>7 kWp · Sun2000 · Pulsar Plus</b></span>
     <span>Entstanden <b>16.–19.07.2026</b></span>
     <span>Betrieb <b>1 Haushalt</b></span>
     <span>Beitragende <b>1 Mensch, 1 Modell</b></span>
@@ -354,6 +354,12 @@
         verstehen, um die eine zu finden, die man braucht. Bei anderen Projekten kommt dazu, was
         mit freier Software eigentlich nichts zu tun hat — Werbung, Mitgliedschaften, ein Konto
         in einer fremden Cloud, damit das eigene Auto den eigenen Strom lädt.</p>
+
+      <p>Im konkreten Fall stand das sogar mit Preisschild in der Planung: Für OCPP-Wallboxen
+        verlangt EVCC ein Sponsor-Token — vier Dollar im Monat oder hundertfünfzig Euro einmalig
+        — und diese Box liefe dort ohnehin nur über ein fremdes Template mit bekannten Macken.
+        Das ist kein Wucher und finanziert echte Arbeit. Es verschiebt nur die Frage: Wer für
+        eine Lösung zahlt, die nicht ganz passt, kann auch die bauen, die passt.</p>
       <p>Diese Software passt genau auf mich. Jede Zeile darf annehmen, dass die Anlage so
         aussieht wie meine. Das macht sie kurz, verständlich und in jedem Detail überprüfbar.</p>
 
@@ -461,7 +467,7 @@
       <div class="reading">
         <span class="label">Erkenntnis, die niemand bekommt</span>
         <span class="value">1</span>
-        <p class="note">Pulsar Pro meldet kein Power.Active.Import. Steht jetzt in einem privaten Repo.</p>
+        <p class="note">Pulsar Plus meldet kein Power.Active.Import. Steht jetzt in einem privaten Repo.</p>
       </div>
     </div>
 
@@ -536,6 +542,21 @@
         Nutzer und niemanden, der ihre Narben liest. Das ist kein Wegwerfartikel. Es ist ein
         Einzelstück, und der Unterschied ist kleiner, als er klingt.</p>
 
+      <h4>Nachtrag am selben Tag</h4>
+      <p>Während dieser Bericht entstand, nannte der Betreiber ein Repository, das ich nicht
+        kannte: eine Dokumentation der Hersteller-Cloud dieser Wallbox. MIT-Lizenz, zwanzig
+        Commits, fünfundzwanzig Sterne, geschrieben von jemandem, der sich die Mühe gemacht und
+        das Ergebnis verschenkt hat. Darin steht ein Feld namens <em class="term">charging_power</em>.</p>
+      <p>Es ist genau die Größe, deren Fehlen dieses Projekt zu Schätzungen zwingt. Die Wallbox
+        kennt ihre Ladeleistung die ganze Zeit — sie schweigt nur gegenüber dem offenen Protokoll
+        und redet mit ihrem Hersteller. Ein Abruf, zwanzig Zeilen Code, und der Wert liegt vor:
+        beim ersten Versuch 0 kW, weil das Auto voll war, dazu 8,215 kWh der letzten Sitzung.</p>
+      <p>Das lässt sich in beide Richtungen lesen, und beide sind wahr. Die Allmende existiert
+        offensichtlich weiter: Jemand hat das aufgeschrieben, ohne Gegenleistung, und es lag
+        bereit. Gefunden hat es aber ein Mensch, nicht das Modell — ich habe eine Schätzung
+        gebaut, wo eine Messung verfügbar war, weil Bauen der Weg des geringsten Widerstands ist
+        und Suchen nicht. Wer immer nur baut, findet nichts mehr.</p>
+
       <h4>Wogegen sich die These verteidigen muss</h4>
       <p>Sie ist zu bequem, und sie stimmt vermutlich nur halb.</p>
       <ul>
@@ -571,9 +592,14 @@
           </thead>
           <tbody>
             <tr>
-              <td>Pulsar Pro meldet keine Ladeleistung</td>
+              <td>Pulsar Plus meldet keine Ladeleistung</td>
               <td>Als Issue an EVCC und die OCPP-Bibliothek, mit Messprotokoll</td>
               <td class="num">offen</td>
+            </tr>
+            <tr>
+              <td>Schätzung nie gegen eine Messung geprüft</td>
+              <td>Ladeleistung aus der Hersteller-Cloud als Referenz, im Mitschnitt protokolliert</td>
+              <td class="num">erledigt</td>
             </tr>
             <tr>
               <td>Tests prüfen gegen mein eigenes Modell</td>

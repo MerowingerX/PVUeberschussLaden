@@ -3,7 +3,18 @@ services:
     build: .
     container_name: pvueb
     env_file: .env            # PVUEB_INVERTER_IP=<ip-des-sdongle>
+    volumes:
+      # Die .env zusätzlich einbinden: env_file reicht die Werte nur herein,
+      # die Datei selbst bliebe auf dem Host. Erst so kann der Dienst sie beim
+      # Start vervollständigen und im Web-UI geänderte Werte dauerhaft sichern.
+      - ./.env:/app/.env
+      # Mitschnitt für Testfälle (PVUEB_RECORD_DIR=/data/recordings), sonst
+      # wäre er nach dem nächsten "docker compose up --build" verloren.
+      - ./recordings:/data/recordings
     ports:
+      # Nur im LAN erreichbar machen: beide Dienste kennen ohne
+      # PVUEB_WEB_USER / PVUEB_OCPP_USER keine Anmeldung. Docker umgeht
+      # ufw-Regeln, deshalb hier an die LAN-Adresse binden statt an 0.0.0.0.
       - "9000:9000"           # OCPP (Wallbox -> Server)
       - "8080:8080"           # Web-UI
     restart: unless-stopped

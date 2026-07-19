@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M2-PoC: Minimaler OCPP-1.6J-Server (CSMS) für die Wallbox Pulsar Pro.
+"""M2-PoC: Minimaler OCPP-1.6J-Server (CSMS) für die Wallbox Pulsar Plus.
 
 Aufruf:
     python ocpp_server.py [--port 9000]

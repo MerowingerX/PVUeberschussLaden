@@ -2,7 +2,7 @@
 
 Maßgeschneiderte App für Solar-Überschussladen auf dem Raspberry Pi: liest die
 PV-Anlage (HUAWEI Sun2000) per Modbus TCP aus und steuert die Wallbox
-(Wallbox Pulsar Pro) lokal per OCPP 1.6J — ohne Cloud, ohne Abo, ohne Fremd-Backend.
+(Wallbox Pulsar Plus) lokal per OCPP 1.6J — ohne Cloud, ohne Abo, ohne Fremd-Backend.
 
 Bewusst minimal: Der Code kennt genau diese drei Geräte und einen Haushalt.
 Keine Geräteabstraktionen, keine Konfigurierbarkeit auf Vorrat.
@@ -63,9 +63,17 @@ aber trotzdem zügig.
 - **Startversuche mit Backoff**: Ob wirklich Strom fließt, entscheidet das Fahrzeug.
   Lehnt es ab, wächst der Abstand zwischen Versuchen, statt im Regeltakt zu funken.
   Hängt die Box in `Finishing`, wird einmal ein `ChangeAvailability`-Zyklus versucht.
-- **Web-UI** fürs Handy: Live-Status (Netz, Überschuss, PV-Erzeugung, Hausverbrauch,
-  Ladeleistung samt Quelle, Batterie-SOC und -Leistung, Boost-Verbrauch, minpv-Hysterese,
-  Box-Status, Heartbeats), Freigabe-, Modus-, Automatik- und Batterie-Buttons
+- **Web-UI** fürs Handy, fünf Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
+  Ladeleistung, Freigabe, Modus, Nachtautomatik) · *Huawei-Batterie* (SOC, Leistung,
+  Netzladung, Prognose) · *Wallbox* (gemessene Ladeleistung, Sitzungsenergie, Firmware) ·
+  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Schieberegler) ·
+  *Audi Q4* (Ladestand, Reichweite, Stecker)
+- **Ladeleistung als Referenz** (optional, `PVUEB_WALLBOX_*`): Die Pulsar Plus meldet ihre
+  Ladeleistung nicht über OCPP, liefert sie aber an die Hersteller-Cloud
+  ([API-Doku](https://github.com/SKB-CGN/wallbox)). Von dort abgerufen dient sie nur der
+  Kontrolle — die Regelung nutzt den Wert nicht, weil die Cloud alle 30 s aktualisiert
+  und ein Internetausfall keine Ladung beeinflussen darf. Status und Mitschnitt führen
+  die Differenz zur Schätzung als `charge_w_abweichung` mit.
 - **Fahrzeugdaten aus der MyAudi-Cloud** (optional, `PVUEB_AUDI_*`): eigenes Slide mit
   Ladestand, Reichweite, Ladestatus, Zielladestand und Stecker-Zustand. Reine Anzeige —
   geregelt wird weiter nach Netzleistung und Wallbox-Meldung, weil das Auto oft offline
@@ -82,7 +90,7 @@ aber trotzdem zügig.
 |---|---|
 | HUAWEI Sun2000 | SDongle mit Modbus TCP „uneingeschränkt" freigeschaltet |
 | Smart Power Sensor (DTSU666-H) | am Netzanschlusspunkt (bei Speicher-Anlagen Standard) |
-| Wallbox Pulsar Pro | OCPP aktiviert, URL zeigt auf diesen Server; **App-eigene Zeitpläne löschen**, App-Slider auf 16 A |
+| Wallbox Pulsar Plus | OCPP aktiviert, URL zeigt auf diesen Server; **App-eigene Zeitpläne löschen**, App-Slider auf 16 A |
 | Server | Raspberry Pi oder beliebiger Linux-Rechner im selben LAN |
 
 Der SDongle nimmt **nur eine Modbus-Verbindung** an. Läuft PVueb, kommt kein zweites
@@ -105,8 +113,14 @@ Startet automatisch neu (`restart: unless-stopped`), auch nach Pi-Reboot.
 Zeitzone im Container: `Europe/Berlin` (Dockerfile) — wichtig fürs Nachttarif-Fenster.
 Nach Umzug auf den Pi: OCPP-URL in der Wallbox-App auf die Pi-IP ändern.
 
-Soll der Mitschnitt laufen, muss `PVUEB_RECORD_DIR` auf ein Volume zeigen — sonst ist
-er nach dem nächsten `--build` weg.
+Zwei Volumes sind in [docker-compose.yml](docker-compose.yml) vorbereitet: die `.env`
+selbst (damit der Dienst sie vervollständigen kann) und `./recordings` für den
+Mitschnitt — dafür `PVUEB_RECORD_DIR=/data/recordings` setzen, sonst ist er nach dem
+nächsten `--build` weg.
+
+Beide Ports werden derzeit an alle Schnittstellen gebunden. Steht der Pi in einem Netz,
+dem du nicht vollständig traust, im Compose-File die LAN-Adresse voranstellen
+(`"192.168.x.y:8080:8080"`) — Docker umgeht `ufw`-Regeln über eigene iptables-Ketten.
 
 ### Direkt (Entwicklung)
 
@@ -157,8 +171,28 @@ Anlage in `LOCAL.md` — beide sind gitignored und gehören nicht ins Repository
 cp .env.example .env        # PVUEB_INVERTER_IP eintragen
 ```
 
-Sämtliche Tuning-Parameter kommen aus der `.env`. Die vollständige Liste mit Defaults
-und Erklärungen steht in **[.env.example](.env.example)** — hier nur die Bereiche:
+**Die `.env` vervollständigt sich selbst.** Beim Start — und nach jeder Änderung im
+Web-UI — schreibt der Dienst sie zurück: jede Einstellung mit dem Wert, der gerade
+wirklich gilt, dazu eine Zeile Erklärung. Es genügt also, die Wechselrichter-IP
+einzutragen; alles andere steht nach dem ersten Start vollständig da und lässt sich
+dort ändern. Nebeneffekt: Mindeststrom und Heartbeat aus dem Web-UI überleben den
+Neustart.
+
+Vor jedem Schreiben entsteht eine Sicherung in `.env.bak`, geschrieben wird über eine
+temporäre Datei — eine halb geschriebene `.env` kann es nicht geben. Eigene Variablen
+bleiben in einem eigenen Abschnitt am Ende erhalten. Ist die Datei schreibgeschützt,
+läuft der Regler normal weiter und meldet es nur im Log.
+
+Im Docker-Betrieb passiert das nur, wenn die Datei zusätzlich eingebunden ist —
+`env_file:` allein reicht dafür nicht, weil sie dann nur auf dem Host liegt:
+
+```yaml
+volumes:
+  - ./.env:/app/.env
+```
+
+Die vollständige Liste mit Defaults und Erklärungen steht in
+**[.env.example](.env.example)** — hier nur die Bereiche:
 
 | Bereich | Was sich einstellen lässt |
 |---|---|
@@ -173,6 +207,8 @@ und Erklärungen steht in **[.env.example](.env.example)** — hier nur die Bere
 | Messwerte der Box | Höchstalter der gemeldeten Ladeleistung |
 | Startversuche | Grundabstand des Backoffs |
 | Mitschnitt | Zielordner, Abtastung, Aufbewahrungsdauer |
+| Anmeldung | Basic Auth für Web-UI und OCPP (leer = offen) |
+| Wallbox-Cloud | Konto, Charger-ID, Abrufintervall (Referenzmessung) |
 | Fahrzeugdaten | MyAudi-Zugang, Abrufintervall |
 
 Bewusst fest im Code (`poc/charge_loop.py`, siehe Designprinzip):
@@ -237,6 +273,29 @@ Versuchsabstand, `Wallbox meldet keine Ladeleistung`, und beim Start einmalig
 `Blockread 37001+114 nicht möglich`, falls der SDongle keine Sammelabfrage beherrscht
 (dann werden die Register einzeln gelesen — funktioniert, zappelt aber mehr).
 
+### Cloud-Zugänge einzeln prüfen
+
+Beide Anbindungen lassen sich testen, ohne den Regler zu starten:
+
+```bash
+python poc/read_wallbox_cloud.py          # Login, Charger-ID, Ladeleistung
+python poc/read_wallbox_cloud.py --watch  # alle 30 s, bis Strg-C
+python poc/read_audi.py                   # Login, Fahrzeug-Snapshot
+```
+
+Beide lesen die Zugangsdaten aus der `.env` und geben nie ein Passwort aus.
+`read_wallbox_cloud.py` ermittelt die Charger-ID selbst — sie muss also nicht
+vorab bekannt sein.
+
+Häufige Befunde:
+
+| Beobachtung | Bedeutung |
+|---|---|
+| `charging_power` 0 bei Status 181 | Box gibt frei, Fahrzeug nimmt nichts — meist voll |
+| `state_of_charge: None` | Normal bei AC ohne ISO 15118; die Box kennt den Ladestand nicht |
+| `max_charging_current` < 16 | Der Schieberegler in der Wallbox-App begrenzt; im OCPP-Betrieb überschreibt unser Limit ihn, sonst nicht |
+| MyAudi: `invalid assertion headers` | Cariad hat die Schnittstelle geändert, der Connector hinkt nach. Kein Passwortproblem, nicht selbst behebbar — der Abstand zwischen Versuchen verdoppelt sich dann bis auf sechs Stunden, damit das Konto nicht gesperrt wird |
+
 ## Projektstand & Struktur
 
 | Datei | Zweck |
@@ -245,6 +304,8 @@ Versuchsabstand, `Wallbox meldet keine Ladeleistung`, und beim Start einmalig
 | [poc/test_sim.py](poc/test_sim.py) | ✅ 18 Simulationsszenarien gegen den echten Regelcode |
 | [poc/curve_from_recording.py](poc/curve_from_recording.py) | ✅ macht aus Mitschnitten PV-Kurven für die Simulation |
 | [poc/record_status.py](poc/record_status.py) | Mitschnitt von außen über HTTP (der Dienst kann es selbst) |
+| [poc/read_wallbox_cloud.py](poc/read_wallbox_cloud.py) | ✅ myWallbox-Zugang prüfen, Charger-ID ermitteln |
+| [poc/read_audi.py](poc/read_audi.py) | MyAudi-Zugang prüfen (derzeit blockiert durch Cariad) |
 | [poc/read_sun2000.py](poc/read_sun2000.py) | ✅ Modbus-Registertest (Register verifiziert) |
 | [poc/ocpp_server.py](poc/ocpp_server.py) | ✅ OCPP-Server, Vorstufe des Regel-Loops |
 | [poc/read_battery_registers.py](poc/read_battery_registers.py) | ✅ LUNA2000-Steuerregister verifiziert (nur lesend) |

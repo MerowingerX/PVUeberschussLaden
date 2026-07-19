@@ -5,7 +5,7 @@ Ich habe einen raspberry pi, und möchte auf diesem eine angepasste app zum Sola
 ## Hardware:
 
 - HUAWEI Sun2000
-- Wallbox Pulsar Pro
+- Wallbox Pulsar Plus
 - Raspberry Pi
 
 Erstelle einen plan für eine PV ueb-App auf dem raspberry

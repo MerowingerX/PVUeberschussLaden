@@ -1,18 +1,18 @@
 # Plan: PV-Überschussladen auf dem Raspberry Pi
 
-Ziel: Eigene App auf dem Raspberry Pi, die den PV-Überschuss der HUAWEI-Sun2000-Anlage misst und die Wallbox Pulsar Pro so regelt, dass das Auto möglichst nur mit Überschussstrom lädt.
+Ziel: Eigene App auf dem Raspberry Pi, die den PV-Überschuss der HUAWEI-Sun2000-Anlage misst und die Wallbox Pulsar Plus so regelt, dass das Auto möglichst nur mit Überschussstrom lädt.
 
 ---
 
 ## 0. Entscheidung: Eigenbau (fix)
 
 Gründe:
-- evcc verlangt für OCPP-/kommerzielle Wallboxen ein Sponsor-Token (4 $/Monat oder 150 € Lifetime); Pulsar Pro dort ohnehin nur über Fremd-Template mit bekannten Macken.
+- evcc verlangt für OCPP-/kommerzielle Wallboxen ein Sponsor-Token (4 $/Monat oder 150 € Lifetime); Pulsar Plus dort ohnehin nur über Fremd-Template mit bekannten Macken.
 - Gewünscht ist eine exakt zugeschnittene Lösung: **nur die Features, die gebraucht werden — nichts darüber hinaus.**
 
 Die evcc-Quellen (Open Source) bleiben nützliche Referenz für Modbus-Register und OCPP-Verhalten.
 
-**Designprinzip:** Jedes Feature muss explizit gewollt sein. Keine Geräteabstraktionen für fremde Hardware, keine Konfigurierbarkeit auf Vorrat — der Code kennt genau diese drei Geräte (Smart Meter, Sun2000, Pulsar Pro) und diesen einen Haushalt.
+**Designprinzip:** Jedes Feature muss explizit gewollt sein. Keine Geräteabstraktionen für fremde Hardware, keine Konfigurierbarkeit auf Vorrat — der Code kennt genau diese drei Geräte (Smart Meter, Sun2000, Pulsar Plus) und diesen einen Haushalt.
 
 ## 1. Architekturüberblick
 
@@ -25,7 +25,7 @@ Die evcc-Quellen (Open Source) bleiben nützliche Referenz für Modbus-Register 
 │     (Netzleistg.)│               │  ├─ REST-API (FastAPI)       │
 └──────────────────┘               │  ├─ SQLite (Logging)         │
 ┌─────────────┐     OCPP 1.6J     │  └─ Web-UI (Vue 3)           │
-│ Pulsar Pro  │◀──────────────────▶│                              │
+│ Pulsar Plus  │◀──────────────────▶│                              │
 └─────────────┘     (WebSocket)    └──────────────────────────────┘
 ```
 
@@ -64,9 +64,9 @@ Fallback, falls wider Erwarten kein Sensor verbaut: IR-Lesekopf (~30 €) auf de
 
 Damit kommt **alles aus einer Quelle** (ein Modbus-Poll liefert Netz, PV und Batterie) — kein zusätzlicher Adapter, keine SMGW-Bürokratie.
 
-## 3. Wallbox-Steuerung: Pulsar Pro per OCPP
+## 3. Wallbox-Steuerung: Pulsar Plus per OCPP
 
-Die Pulsar Pro unterstützt OCPP 1.6J — der große Vorteil gegenüber der Pulsar Plus. Damit ist lokale Steuerung ohne Wallbox-Cloud möglich:
+Die Pulsar Plus unterstützt OCPP 1.6J (aktuelle Firmware). Damit ist lokale Steuerung ohne Wallbox-Cloud möglich:
 
 - Auf dem Pi läuft ein kleiner OCPP-Server (CSMS) mit der Python-Bibliothek [`ocpp`](https://github.com/mobilityhouse/ocpp) (The Mobility House), WebSocket z. B. `ws://<pi-ip>:9000/<charger-id>`.
 - In der Wallbox-App die OCPP-URL des Pi eintragen; die Box verbindet sich dann selbstständig.
@@ -79,7 +79,7 @@ Fallback (nicht empfohlen): inoffizielle Wallbox-Cloud-API — cloudabhängig, r
 
 Alle 5–10 s:
 
-Anlage: 3-phasig, 16 A (11 kW) → Regelbereich **4,2–11 kW** (unter 3 × 6 A × 230 V ≈ 4,14 kW kann kein Auto laden, IEC 61851; die Pulsar Pro kann nicht auf 1-phasig umschalten).
+Anlage: 3-phasig, 16 A (11 kW) → Regelbereich **4,2–11 kW** (unter 3 × 6 A × 230 V ≈ 4,14 kW kann kein Auto laden, IEC 61851; die Pulsar Plus kann nicht auf 1-phasig umschalten).
 
 Alle 5–10 s:
 
@@ -133,7 +133,7 @@ Defaults (bis anders gewünscht): Freigabe-Pflicht gilt auch nachts; Batterie-La
 ## 6. Meilensteine
 
 1. **M1 – Mess-PoC:** Modbus-Skript liest Netzleistung (37113), PV-Leistung, Batterie-SOC. Vorzeichen und Werte gegen FusionSolar-App verifizieren. Vorab: Power Sensor vorhanden? Modbus TCP am Dongle freigeschaltet?
-2. **M2 – OCPP-PoC:** Pulsar Pro verbindet sich mit dem Pi; Start/Stopp und Stromlimit funktionieren nachweisbar (Zangenamperemeter oder MeterValues).
+2. **M2 – OCPP-PoC:** Pulsar Plus verbindet sich mit dem Pi; Start/Stopp und Stromlimit funktionieren nachweisbar (Zangenamperemeter oder MeterValues).
 3. **M3 – Regel-Loop:** Beide PoCs verbunden, Hysterese/Verzögerungen, Modus fest "PV-Überschuss". Erste echte Überschussladung.
 4. **M3b – Freigabe + Nachttarif:** Freigabe-Flag im Loop; Zeitfenster-Logik 00–08 Uhr (Auto volle Leistung, Rückkehr in vorherigen Modus); Batterie-Zwangsladung inkl. Verifikation der Schreibregister am Gerät.
 5. **M4 – API + UI:** FastAPI-Backend, Vue-Dashboard (Live-Leistungsfluss, Modus-Umschalter, **Freigabe-Button**, Ladestatus).

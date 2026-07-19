@@ -1,5 +1,7 @@
 # Umgebungsspezifisches / Geheimnisse — bleibt lokal
 .env
+.env.bak
+.env.tmp
 LOCAL.md
 
 # MyAudi-Sitzung: Token und Antwort-Cache, enthalten Zugangsdaten
