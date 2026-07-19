@@ -2,6 +2,10 @@
 .env
 LOCAL.md
 
+# MyAudi-Sitzung: Token und Antwort-Cache, enthalten Zugangsdaten
+poc/.audi-tokenstore.json
+poc/.audi-cache.json
+
 # Python
 .venv/
 __pycache__/

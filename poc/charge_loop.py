@@ -51,15 +51,25 @@ stoppt am Ziel selbst. Manuell jederzeit über den Web-Toggle; Automatik
 startet höchstens einmal pro Nacht, wenn Nachtfenster aktiv, SOC unter
 PVUEB_BATT_LOW_SOC und die Sonnenprognose (forecast.solar) unter
 PVUEB_FORECAST_MIN_KWH liegt.
+
+Fahrzeugdaten (PVUEB_AUDI_*, optional): Ladestand, Reichweite und Ladestatus
+des Q4 kommen über carconnectivity aus der MyAudi-Cloud auf ein eigenes
+Slide. Reine Anzeige — geregelt wird weiter nach Netzleistung und
+Wallbox-Meldung, weil das Auto oft offline hängt und die Cloud dann alte
+Werte liefert, ohne das dazuzusagen. Deshalb zeigt die UI zu jedem Wert das
+Alter im Fahrzeug, nicht nur das des Abrufs.
 """
 
 import argparse
 import asyncio
+import base64
 import collections
 import datetime
+import enum
 import json
 import logging
 import os
+import secrets
 import re
 import sys
 
@@ -115,6 +125,13 @@ FORECAST_URL = "https://api.forecast.solar/estimate/{lat}/{lon}/{tilt}/{azimut}/
 FORECAST_REFRESH_S = 6 * 3600    # Abruf-Rhythmus (Limit wäre 12/h — wir sind weit drunter)
 FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 
+# Audi connect (MyAudi-Cloud über carconnectivity; Zugang aus .env, PVUEB_AUDI_*)
+AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
+# Token und Antwort-Cache neben dem Skript ablegen, damit nicht jeder Abruf
+# einen neuen Login auslöst — beide enthalten Zugangsdaten, also gitignored.
+AUDI_TOKENSTORE = os.path.join(os.path.dirname(__file__), ".audi-tokenstore.json")
+AUDI_CACHE = os.path.join(os.path.dirname(__file__), ".audi-cache.json")
+
 
 class State:
     mode = "pv"                  # pv | minpv | fast
@@ -146,8 +163,8 @@ class State:
     batt_low_soc = 30.0          # Automatik-Startschwelle in % (aus .env)
     batt_target_soc = 80.0       # Netzladung bis zu diesem SOC (aus .env)
     batt_charge_w = 500          # Leistung der Zwangsladung in W (aus .env)
-    lat = 52.25                  # Standort/Anlage für forecast.solar (aus .env)
-    lon = 10.66
+    lat = 52.27                  # Standort/Anlage für forecast.solar (aus .env)
+    lon = 10.52
     pv_tilt = 42
     pv_azimut = 0                # forecast.solar-Konvention: 0 = Süd
     pv_kwp = 7.0
@@ -181,12 +198,24 @@ class State:
     forcible_cmd: int | None = None      # gelesenes Register 47100 (0/1/2)
     battery_charge_auto = False  # aktive Zwangsladung kam von der Nachtautomatik
     battery_auto_started = False # Automatik hat diese Nacht schon gestartet (einmal pro Nacht)
+    web_user = ""                # Basic Auth für die Web-UI, leer = offen (aus .env)
+    web_password = ""
+    ocpp_user = ""               # Basic Auth für den OCPP-Endpunkt, leer = offen (aus .env)
+    ocpp_password = ""
     record_dir = ""              # Zielordner für den Mitschnitt, leer = aus (aus .env)
     record_interval_s = 10       # Abstand der mitgeschriebenen Zeilen (aus .env)
     record_keep_days = 14        # Ringbuffer: ältere Tage werden gelöscht (aus .env)
     last_box_seen: float | None = None     # Unix-Zeit: letzter OCPP-Heartbeat
     last_huawei_seen: float | None = None  # Unix-Zeit: letzter erfolgreicher Modbus-Poll
     box_status = "unbekannt"               # letzter StatusNotification-Status der Box
+    audi_user = ""               # MyAudi-Konto, leer = Abfrage aus (aus .env)
+    audi_password = ""
+    audi_spin = ""               # S-PIN, nur für Steuerbefehle nötig (aus .env)
+    audi_vin = ""                # gewünschtes Fahrzeug, leer = das erste (aus .env)
+    audi_poll_s = 600            # Abstand der Cloud-Abrufe (aus .env)
+    audi: dict = {}              # letzter Fahrzeug-Snapshot, siehe audi_snapshot()
+    audi_error: str | None = None          # letzter Fehler, für die UI
+    last_audi_ok: float | None = None      # Unix-Zeit: letzter erfolgreicher Abruf
 
 
 def in_night_window(now: datetime.datetime | None = None) -> bool:
@@ -457,6 +486,15 @@ class ChargePoint(OcppChargePoint):
 async def on_connect(websocket):
     global charge_point
     charge_point_id = websocket.request.path.strip("/") or "unknown"
+    # Basic Auth nur, wenn konfiguriert — die Wallbox-App muss dasselbe
+    # Passwort tragen, sonst kommt die Box nicht mehr herein
+    if state.ocpp_user and not basic_auth_ok(
+            websocket.request.headers.get("Authorization"),
+            state.ocpp_user, state.ocpp_password):
+        log.warning("OCPP-Verbindung von %r ohne gültige Anmeldung abgewiesen",
+                    charge_point_id)
+        await websocket.close(code=1008, reason="unauthorized")
+        return
     log.info("Wallbox verbunden: %r", charge_point_id)
     charge_point = ChargePoint(charge_point_id, websocket)
     try:
@@ -579,7 +617,8 @@ def pv_average(now: float, pv_surplus: float) -> float:
 def boost_allowance(now: float) -> float:
     """Wieviel Batterie-Entladung darf gerade ins Auto fließen (W).
 
-    Tagesbudget PVUEB_BOOST_WH, Leistung gedeckelt auf PVUEB_BOOST_W, Stopp
+    Tagesbudget PVUEB_BOOST_W × PVUEB_BOOST_H, Leistung gedeckelt auf
+    PVUEB_BOOST_W, Stopp
     unter PVUEB_BOOST_MIN_SOC. Verbraucht wird nur, was die Batterie wirklich
     entlädt, während das Auto lädt — Hausverbrauch aus der Batterie zählt
     nicht. Budget-Reset um Mitternacht: tagsüber lädt die Batterie aus PV
@@ -709,6 +748,129 @@ async def forecast_task():
             await asyncio.sleep(FORECAST_RETRY_S)
             continue
         await asyncio.sleep(FORECAST_REFRESH_S)
+
+
+def attr_value(attr):
+    """Wert eines carconnectivity-Attributs, Enums als Klartext."""
+    value = getattr(attr, "value", None)
+    return value.value if isinstance(value, enum.Enum) else value
+
+
+def attr_age_s(attr) -> int | None:
+    """Alter des Werts *im Fahrzeug* in Sekunden — nicht des Abrufs.
+
+    Der Q4 ist oft offline, die Cloud liefert dann bereitwillig alte Zahlen.
+    Ohne dieses Alter sähe ein Ladestand von gestern aus wie der von jetzt.
+    """
+    ts = getattr(attr, "last_updated", None)
+    if ts is None:
+        return None
+    now = datetime.datetime.now(ts.tzinfo) if ts.tzinfo else datetime.datetime.now()
+    return round((now - ts).total_seconds())
+
+
+def audi_snapshot(vehicle) -> dict:
+    """Fahrzeugobjekt auf das flache dict eindampfen, das die UI anzeigt.
+
+    Fehlende Werte bleiben None: welche Felder ein Auto meldet, hängt an
+    Modell und Ausstattung, und im Zweifel meldet es gerade gar nichts.
+    """
+    # Elektro-Antrieb heraussuchen (der Q4 hat genau einen, ein PHEV hätte zwei)
+    drive = next((d for d in vehicle.drives.drives.values() if hasattr(d, "battery")), None)
+    charging = getattr(vehicle, "charging", None)
+    snap = {
+        "vin": attr_value(vehicle.vin),
+        "name": attr_value(vehicle.name) or attr_value(vehicle.model),
+        "state": attr_value(vehicle.state),                    # parked | driving | …
+        "connection": attr_value(vehicle.connection_state),    # online | offline | …
+        "odometer_km": attr_value(vehicle.odometer),
+        "outside_c": attr_value(vehicle.outside_temperature),
+        "climate": attr_value(vehicle.climatization.state),
+        "soc": None, "soc_age_s": None, "range_km": None,
+        "capacity_kwh": None, "battery_c": None,
+        "charge_state": None, "charge_kw": None, "charge_type": None,
+        "charge_rate_kmh": None, "target_soc": None, "max_current_a": None,
+        "plug": None, "plug_lock": None, "ready_at": None,
+    }
+    if drive is not None:
+        snap["soc"] = attr_value(drive.level)
+        snap["soc_age_s"] = attr_age_s(drive.level)
+        snap["range_km"] = attr_value(drive.range)
+        snap["capacity_kwh"] = attr_value(drive.battery.total_capacity)
+        snap["battery_c"] = attr_value(drive.battery.temperature)
+    if charging is not None:
+        snap["charge_state"] = attr_value(charging.state)
+        snap["charge_kw"] = attr_value(charging.power)
+        snap["charge_type"] = attr_value(charging.type)
+        snap["charge_rate_kmh"] = attr_value(charging.rate)
+        snap["target_soc"] = attr_value(charging.settings.target_level)
+        snap["max_current_a"] = attr_value(charging.settings.maximum_current)
+        snap["plug"] = attr_value(charging.connector.connection_state)
+        snap["plug_lock"] = attr_value(charging.connector.lock_state)
+        ready = attr_value(charging.estimated_date_reached)
+        snap["ready_at"] = ready.isoformat(timespec="minutes") if ready else None
+    return snap
+
+
+async def audi_task():
+    """Fragt den Ladestand des Q4 aus der MyAudi-Cloud ab (carconnectivity).
+
+    Reine Anzeige — der Regler entscheidet weiter allein über Netzleistung
+    und die Meldungen der Wallbox. Das ist Absicht: das Auto hängt oft
+    offline (LTE-Antenne), und ein Regelkreis, der auf Werte wartet, die
+    stunden- oder tagelang nicht kommen, wäre schlechter als keiner.
+
+    Die Bibliothek ist synchron (requests), läuft also im Executor, damit
+    der Regel-Loop nicht auf der Cloud-Antwort steht. Fehler sind hier der
+    Normalfall, nicht die Ausnahme: sie landen in state.audi_error und in
+    der UI, aber sie stoppen weder diesen Task noch den Regler.
+    """
+    try:
+        from carconnectivity.carconnectivity import CarConnectivity
+    except ImportError:
+        state.audi_error = ("carconnectivity fehlt — "
+                            "pip install carconnectivity-connector-audi")
+        log.error("Audi-Abfrage aus: %s", state.audi_error)
+        return
+
+    config = {"carConnectivity": {"connectors": [{"type": "audi", "config": {
+        "username": state.audi_user,
+        "password": state.audi_password,
+        "spin": state.audi_spin or None,
+        # Der Connector cacht selbst und lehnt kürzere Intervalle ab
+        "interval": max(AUDI_MIN_INTERVAL_S, state.audi_poll_s),
+    }}]}}
+    loop = asyncio.get_running_loop()
+    car = None
+    while True:
+        try:
+            if car is None:
+                car = await loop.run_in_executor(
+                    None, CarConnectivity, config, AUDI_TOKENSTORE, AUDI_CACHE)
+                await loop.run_in_executor(None, car.startup)
+            await loop.run_in_executor(None, car.fetch_all)
+            vehicles = car.get_garage().list_vehicles()
+            if state.audi_vin:
+                vehicles = [v for v in vehicles if attr_value(v.vin) == state.audi_vin]
+            if not vehicles:
+                raise RuntimeError(f"kein Fahrzeug gefunden (VIN-Filter {state.audi_vin!r})")
+            state.audi = audi_snapshot(vehicles[0])
+            state.audi_error = None
+            state.last_audi_ok = datetime.datetime.now().timestamp()
+            log.info("Audi: SOC %s %% (%s), %s, Reichweite %s km",
+                     state.audi["soc"], state.audi["connection"],
+                     state.audi["charge_state"], state.audi["range_km"])
+        except Exception as exc:  # noqa: BLE001 — Cloud-Fehler dürfen den Regler nie stoppen
+            state.audi_error = str(exc) or exc.__class__.__name__
+            log.warning("Audi-Abruf fehlgeschlagen: %s", state.audi_error)
+            # Sitzung verwerfen: nach Login-/Token-Fehlern hilft nur neu anmelden
+            if car is not None:
+                try:
+                    await loop.run_in_executor(None, car.shutdown)
+                except Exception:  # noqa: BLE001
+                    pass
+                car = None
+        await asyncio.sleep(state.audi_poll_s)
 
 
 async def battery_night_check():
@@ -918,9 +1080,17 @@ INDEX_HTML = """<!doctype html>
   button.mode { padding-left:2.4rem; position:relative; }
   button.mode::before { content:"○"; position:absolute; left:.9rem; }
   button.mode.on::before { content:"●"; }
+  .bar { height:1.6rem; background:#333; border-radius:.3rem; overflow:hidden;
+         margin:.5rem 0; position:relative; }
+  .bar > i { display:block; height:100%; background:#2e7d32; }
+  .bar > b { position:absolute; inset:0; text-align:center; line-height:1.6rem;
+             font-weight:normal; font-variant-numeric:tabular-nums; }
+  .bar.stale > i { background:#555; }
+  .note { color:#aaa; font-size:.85rem; padding:.4rem 0; }
+  .note.err { color:#ef9a9a; }
 </style></head><body>
 <h1>PVueb – Überschussladen</h1>
-<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span></div>
+<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
 <div class="pages" id="pages">
 <section class="page">
 <div id="stat"></div>
@@ -938,6 +1108,11 @@ INDEX_HTML = """<!doctype html>
 <h2>Huawei-Batterie <span id="hheart"></span></h2>
 <div id="batstat"></div>
 <button id="batt" onclick="toggleBatt()">…</button>
+</section>
+<section class="page">
+<h2>Audi Q4 <span id="aheart"></span></h2>
+<div id="audibar"></div>
+<div id="audistat"></div>
 </section>
 <section class="page">
 <h2>Debug</h2>
@@ -999,6 +1174,31 @@ function gridShare() {
   if (s.charge_w < 1) return txt + " (Haus)";
   return txt + " – " + Math.round(100 * Math.min(imp, s.charge_w) / s.charge_w) + " % der Ladung";
 }
+// Enum-Werte der carconnectivity-Bibliothek auf Klartext. Unbekanntes fällt
+// durch (der Rohwert ist immer noch nützlicher als ein leeres Feld).
+const A_CONN = {online:"🛜 online", reachable:"🛜 erreichbar (schläft)", offline:"📵 offline"};
+const A_STATE = {parked:"geparkt", driving:"fährt", ignition_on:"Zündung an", offline:"offline"};
+const A_CHG = {off:"aus", ready_for_charging:"bereit", charging:"⚡ lädt",
+               conservation:"Erhaltungsladung", discharging:"entlädt", error:"⛔ Fehler"};
+const A_PLUG = {connected:"🔌 gesteckt", disconnected:"gezogen"};
+const A_LOCK = {locked:"🔒 verriegelt", unlocked:"🔓 entriegelt"};
+const A_CLIMA = {off:"aus", heating:"heizt", cooling:"kühlt", ventilation:"lüftet"};
+function amap(table, key) {
+  if (key === null || key === undefined) return "–";
+  return table[key] || key;
+}
+function anum(v, unit, digits) {
+  return (v === null || v === undefined) ? "–" : v.toFixed(digits === undefined ? 0 : digits) + unit;
+}
+// Alter des Werts im Fahrzeug — der Q4 hängt oft offline und die Cloud
+// liefert dann alte Zahlen, ohne das von sich aus dazuzusagen.
+function aage(sec) {
+  if (sec === null || sec === undefined) return "";
+  if (sec < 600) return "";
+  if (sec < 5400) return " (vor " + Math.round(sec/60) + " min)";
+  if (sec < 172800) return " (vor " + Math.round(sec/3600) + " h ⚠)";
+  return " (vor " + Math.round(sec/86400) + " Tagen ⚠)";
+}
 function heart(seen_s, limit) {
   const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
   return ok ? '<span class="heart">❤️</span>' : '<span class="heart dead">💔</span>';
@@ -1051,6 +1251,7 @@ async function refresh() {
     ["Netz", s.grid_w === null ? "–" : (s.grid_w >= 0 ? "Einspeisung " : "Bezug ") + Math.abs(s.grid_w) + " W"],
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
+  renderAudi(row);
   for (const m of ["pv","minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
   const mi = document.getElementById("minamps");
@@ -1073,6 +1274,49 @@ async function refresh() {
   bb.textContent = s.battery_grid_charge
     ? "Batterie-Netzladung stoppen (lädt mit " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)"
     : "Batterie-Netzladung starten (Test: " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)";
+}
+function renderAudi(row) {
+  const bar = document.getElementById("audibar");
+  const out = document.getElementById("audistat");
+  document.getElementById("aheart").innerHTML =
+    s.audi_enabled ? heart(s.audi_seen_s, 3 * s.audi_poll_s) : "";
+  if (!s.audi_enabled) {
+    bar.innerHTML = "";
+    out.innerHTML = '<div class="note">Abfrage aus – PVUEB_AUDI_USER und '
+      + 'PVUEB_AUDI_PASSWORD in der .env setzen.</div>';
+    return;
+  }
+  const a = s.audi || {};
+  // Alte Werte sichtbar entwerten, statt sie wie frische Messwerte zu zeigen
+  const stale = a.soc_age_s !== null && a.soc_age_s !== undefined && a.soc_age_s > 5400;
+  bar.innerHTML = a.soc === null || a.soc === undefined ? ""
+    : '<div class="bar' + (stale ? ' stale' : '') + '"><i style="width:'
+      + Math.max(0, Math.min(100, a.soc)) + '%"></i><b>' + a.soc.toFixed(0) + ' %'
+      + (a.target_soc ? ' / Ziel ' + a.target_soc.toFixed(0) + ' %' : '') + '</b></div>';
+  const arows = [
+    ["Verbindung", amap(A_CONN, a.connection)],
+    ["Fahrzeug", amap(A_STATE, a.state)],
+    ["Ladestand", anum(a.soc, " %") + aage(a.soc_age_s)],
+    ["Reichweite", anum(a.range_km, " km")],
+    ["Ladevorgang", amap(A_CHG, a.charge_state)],
+    ["Ladeleistung (Auto)", anum(a.charge_kw, " kW", 1)],
+    ["Ladeart", a.charge_type === null || a.charge_type === undefined
+      ? "–" : String(a.charge_type).toUpperCase()],
+    ["Ladetempo", anum(a.charge_rate_kmh, " km/h")],
+    ["voll um", a.ready_at ? a.ready_at.replace("T", " ") : "–"],
+    ["Ladestrom-Limit (Auto)", anum(a.max_current_a, " A")],
+    ["Stecker", amap(A_PLUG, a.plug) + " / " + amap(A_LOCK, a.plug_lock)],
+    ["Batterie", anum(a.capacity_kwh, " kWh", 1)
+      + (a.battery_c === null || a.battery_c === undefined ? "" : ", " + a.battery_c.toFixed(0) + " °C")],
+    ["Klimatisierung", amap(A_CLIMA, a.climate)],
+    ["Außentemperatur", anum(a.outside_c, " °C", 1)],
+    ["Kilometerstand", anum(a.odometer_km, " km")],
+    ["Cloud-Abruf", ago(s.audi_seen_s) + " (alle " + Math.round(s.audi_poll_s/60) + " min)"],
+  ];
+  out.innerHTML = arows.map(row).join("")
+    + (s.audi_error ? '<div class="note err">⚠ ' + s.audi_error + "</div>" : "")
+    + '<div class="note">Nur Anzeige – geregelt wird weiter nach Netzleistung '
+    + 'und Wallbox-Meldung.</div>';
 }
 async function toggleBatt() {
   const r = await fetch("/api/battery/"+(s.battery_grid_charge?"off":"on"), {method:"POST"});
@@ -1155,6 +1399,12 @@ def status_dict() -> dict:
                       else round(datetime.datetime.now().timestamp() - state.last_box_seen),
         "huawei_seen_s": None if state.last_huawei_seen is None
                          else round(datetime.datetime.now().timestamp() - state.last_huawei_seen),
+        "audi_enabled": bool(state.audi_user),
+        "audi": state.audi,
+        "audi_error": state.audi_error,
+        "audi_poll_s": state.audi_poll_s,
+        "audi_seen_s": None if state.last_audi_ok is None
+                       else round(datetime.datetime.now().timestamp() - state.last_audi_ok),
     }
 
 
@@ -1281,8 +1531,43 @@ async def http_config(request):
     return web.json_response({"ok": True})
 
 
+def basic_auth_ok(header: str | None, user: str, password: str) -> bool:
+    """Prüft einen Authorization-Header gegen Benutzer und Passwort.
+
+    Vergleich läuft über compare_digest, damit die Antwortzeit nichts über
+    den Treffer verrät.
+    """
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        entschluesselt = base64.b64decode(header[6:]).decode("utf-8")
+        gesendet_user, _, gesendet_pw = entschluesselt.partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return (secrets.compare_digest(gesendet_user, user)
+            and secrets.compare_digest(gesendet_pw, password))
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    """Basic Auth für die Web-UI, sofern PVUEB_WEB_USER gesetzt ist.
+
+    Ohne Zugangsdaten steuert jeder im Netz die Wallbox und die Hausbatterie.
+    Der Standard bleibt trotzdem offen, weil das Gerät im eigenen LAN steht
+    und ein plötzlich verlangtes Passwort den Betrieb bricht — wer den Port
+    weiter aufmacht, sollte die Variablen setzen.
+    """
+    if not state.web_user:
+        return await handler(request)
+    if basic_auth_ok(request.headers.get("Authorization"),
+                     state.web_user, state.web_password):
+        return await handler(request)
+    return web.Response(status=401, text="Anmeldung erforderlich\n",
+                        headers={"WWW-Authenticate": 'Basic realm="PVueb"'})
+
+
 async def web_task(port: int):
-    app = web.Application()
+    app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", http_index)
     app.router.add_get("/api/status", http_status)
     app.router.add_post("/api/mode/{mode}", http_mode)
@@ -1365,6 +1650,16 @@ async def main():
     state.start_retry_s = int(os.environ.get("PVUEB_START_RETRY_S", "30"))
     if state.start_retry_s < 1:
         sys.exit("PVUEB_START_RETRY_S muss >= 1 Sekunde sein")
+    state.web_user = os.environ.get("PVUEB_WEB_USER", "")
+    state.web_password = os.environ.get("PVUEB_WEB_PASSWORD", "")
+    state.ocpp_user = os.environ.get("PVUEB_OCPP_USER", "")
+    state.ocpp_password = os.environ.get("PVUEB_OCPP_PASSWORD", "")
+    for name, user, password in (("PVUEB_WEB", state.web_user, state.web_password),
+                                 ("PVUEB_OCPP", state.ocpp_user, state.ocpp_password)):
+        if user and not password:
+            sys.exit(f"{name}_USER gesetzt, aber {name}_PASSWORD fehlt")
+        if user:
+            log.info("%s: Anmeldung erforderlich (Benutzer %r)", name, user)
     state.record_dir = os.environ.get("PVUEB_RECORD_DIR", "")
     state.record_interval_s = int(os.environ.get("PVUEB_RECORD_INTERVAL_S", "10"))
     state.record_keep_days = int(os.environ.get("PVUEB_RECORD_KEEP_DAYS", "14"))
@@ -1375,14 +1670,24 @@ async def main():
     if min(state.poll_interval_s, state.adjust_min_interval_s,
            state.start_delay_s, state.stop_delay_s) < 1:
         sys.exit("Regelzeit-Parameter (PVUEB_*_S) müssen >= 1 Sekunde sein")
-    state.lat = float(os.environ.get("PVUEB_LAT", "52.25"))
-    state.lon = float(os.environ.get("PVUEB_LON", "10.66"))
+    state.lat = float(os.environ.get("PVUEB_LAT", "52.27"))
+    state.lon = float(os.environ.get("PVUEB_LON", "10.52"))
     state.pv_tilt = int(os.environ.get("PVUEB_PV_TILT", "42"))
     state.pv_azimut = int(os.environ.get("PVUEB_PV_AZIMUT", "0"))
     state.pv_kwp = float(os.environ.get("PVUEB_PV_KWP", "7"))
     state.forecast_min_kwh = float(os.environ.get("PVUEB_FORECAST_MIN_KWH", "5"))
     if state.night_start_min == state.night_end_min:
         sys.exit("PVUEB_NIGHT_START und PVUEB_NIGHT_END dürfen nicht gleich sein")
+    state.audi_user = os.environ.get("PVUEB_AUDI_USER", "")
+    state.audi_password = os.environ.get("PVUEB_AUDI_PASSWORD", "")
+    state.audi_spin = os.environ.get("PVUEB_AUDI_SPIN", "")
+    state.audi_vin = os.environ.get("PVUEB_AUDI_VIN", "")
+    state.audi_poll_s = int(os.environ.get("PVUEB_AUDI_POLL_S", "600"))
+    if state.audi_user and not state.audi_password:
+        sys.exit("PVUEB_AUDI_USER gesetzt, aber PVUEB_AUDI_PASSWORD fehlt")
+    if state.audi_poll_s < AUDI_MIN_INTERVAL_S:
+        sys.exit(f"PVUEB_AUDI_POLL_S muss >= {AUDI_MIN_INTERVAL_S} sein "
+                 "(kürzere Intervalle lehnt der Connector ab)")
 
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
@@ -1390,6 +1695,8 @@ async def main():
              command_loop(), web_task(args.web_port), forecast_task()]
     if state.record_dir:
         tasks.append(record_task())
+    if state.audi_user:
+        tasks.append(audi_task())
     await asyncio.gather(*tasks)
 
 

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Bremse gegen versehentlich eingecheckte Geheimnisse.
+#
+# Einmalig aktivieren:
+#     git config core.hooksPath .githooks
+#
+# Ein Secret, das einmal gepusht wurde, gilt als kompromittiert — Löschen aus
+# der Historie hilft nicht mehr, nur Rotieren. Deshalb hier abfangen, solange
+# es noch nichts kostet.
+
+set -euo pipefail
+
+fehler=0
+
+# 1. Dateien, die grundsätzlich nicht ins Repo gehören
+verbotene_pfade='(^|/)\.env$|(^|/)LOCAL\.md$|\.audi-.*\.json$|(^|/)recordings/|\.pem$|\.key$|(^|/)id_(rsa|ed25519)$'
+while IFS= read -r pfad; do
+    [ -z "$pfad" ] && continue
+    echo "  ABBRUCH: $pfad gehört nicht ins Repository"
+    fehler=1
+done < <(git diff --cached --name-only --diff-filter=ACM | grep -E "$verbotene_pfade" || true)
+
+# 2. Inhalte: bekannte Schlüsselformate und Zugangsdaten im Klartext
+muster='AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{20,}|://[^/[:space:]]+:[^@[:space:]]+@'
+while IFS= read -r pfad; do
+    [ -z "$pfad" ] && continue
+    # .env.example darf Variablennamen enthalten, aber keine Werte
+    treffer=$(git show ":$pfad" 2>/dev/null | grep -nIE "$muster" || true)
+    if [ -n "$treffer" ]; then
+        echo "  ABBRUCH: $pfad enthält offenbar ein Geheimnis"
+        echo "$treffer" | head -3 | sed 's/^/           /'
+        fehler=1
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+# 3. Ausgefüllte Werte in .env.example — dort gehören nur Platzhalter hin
+if git diff --cached --name-only | grep -qx ".env.example"; then
+    gefuellt=$(git show ":.env.example" | grep -nE "^PVUEB_(AUDI|WEB|OCPP)_(USER|PASSWORD|SPIN|VIN)=.+" || true)
+    if [ -n "$gefuellt" ]; then
+        echo "  ABBRUCH: .env.example enthält ausgefüllte Zugangsdaten"
+        echo "$gefuellt" | sed 's/^/           /'
+        fehler=1
+    fi
+fi
+
+if [ "$fehler" -ne 0 ]; then
+    echo
+    echo "  Commit abgebrochen. Mit --no-verify erzwingbar, falls Fehlalarm."
+    exit 1
+fi

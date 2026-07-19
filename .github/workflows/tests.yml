@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  simulation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Syntax aller Skripte prüfen
+        run: python -m compileall -q poc
+
+      - name: Simulationsszenarien fahren
+        working-directory: poc
+        run: python test_sim.py
+
+      - name: Mitschnitt in Kurve umwandeln
+        working-directory: poc
+        run: |
+          # Kurzer Mitschnitt als Testfixture, damit der Konverter mitgeprüft wird
+          printf '%s\n' \
+            '{"t":"2026-07-18T12:00:00","pv_surplus_w":6210,"charging":true}' \
+            '{"t":"2026-07-18T12:00:10","pv_surplus_w":5980,"charging":true}' \
+            '{"t":"2026-07-18T12:00:20","pv_surplus_w":4140,"charging":true}' \
+            > /tmp/probe.jsonl
+          python curve_from_recording.py /tmp/probe.jsonl

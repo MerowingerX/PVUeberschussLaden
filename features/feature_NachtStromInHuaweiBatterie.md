@@ -17,8 +17,8 @@ Defaults im Code, Eintrag in `.env.example`:
 | `PVUEB_BATT_TARGET_SOC` | 80 | Netzladung stoppen ab diesem SOC (%) |
 | `PVUEB_BATT_CHARGE_W` | 500 | Ladeleistung der Zwangsladung (W), nach Test erhöhen |
 | `PVUEB_FORECAST_MIN_KWH` | 5 | „keine Sonne“ = Prognose morgen unter diesem Wert (kWh) |
-| `PVUEB_LAT` | 52.25 | Standort Breitengrad (Cremlingen) |
-| `PVUEB_LON` | 10.66 | Standort Längengrad |
+| `PVUEB_LAT` | 52.27 | Standort Breitengrad |
+| `PVUEB_LON` | 10.52 | Standort Längengrad |
 | `PVUEB_PV_KWP` | 7 | Anlagenleistung (kWp) |
 | `PVUEB_PV_TILT` | 42 | Modulneigung (°) |
 | `PVUEB_PV_AZIMUT` | 0 | Ausrichtung (0 = Süd, forecast.solar-Konvention) |

@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Selbstkritischer Prüfbericht zum PVueb-Projekt: was die Software tut, warum nicht EVCC, und was KI mit Open Source macht.">
+<title>Prüfbericht in eigener Sache</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; }
+  img { max-width: 100%; }
+</style>
+
+<style>
+  :root {
+    --ground: #EEF0EC;
+    --ground-2: #E4E8E3;
+    --ink: #16201C;
+    --muted: #6B7A73;
+    --rule: #C9D1CB;
+    --accent: #2F6F5E;
+    --rust: #A8442A;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    --measure: 66ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #101513;
+      --ground-2: #171E1B;
+      --ink: #DCE4DF;
+      --muted: #8A9A92;
+      --rule: #2A3531;
+      --accent: #63B99D;
+      --rust: #E08063;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #101513;
+    --ground-2: #171E1B;
+    --ink: #DCE4DF;
+    --muted: #8A9A92;
+    --rule: #2A3531;
+    --accent: #63B99D;
+    --rust: #E08063;
+  }
+  :root[data-theme="light"] {
+    --ground: #EEF0EC;
+    --ground-2: #E4E8E3;
+    --ink: #16201C;
+    --muted: #6B7A73;
+    --rule: #C9D1CB;
+    --accent: #2F6F5E;
+    --rust: #A8442A;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: clamp(2rem, 5vw, 5rem) clamp(1.25rem, 4vw, 3rem) 6rem;
+  }
+
+  /* ---- Kopf: Metazeile wie auf einem Messprotokoll ---- */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.75rem;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.9rem;
+  }
+  .meta b { color: var(--ink); font-weight: 500; }
+
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(2rem, 5.5vw, 3.4rem);
+    line-height: 1.02;
+    letter-spacing: -0.03em;
+    font-weight: 600;
+    text-wrap: balance;
+    margin: 2.5rem 0 0;
+  }
+  .standfirst {
+    font-size: clamp(1.05rem, 2vw, 1.3rem);
+    line-height: 1.5;
+    color: var(--muted);
+    max-width: 48ch;
+    margin-top: 1.2rem;
+    text-wrap: pretty;
+  }
+
+  /* ---- Skalenband als Kapiteltrenner ---- */
+  .scale {
+    height: 12px;
+    margin: 3.5rem 0 2.25rem;
+    background-image: repeating-linear-gradient(to right,
+      var(--rule) 0 1px, transparent 1px 12px);
+    border-bottom: 1px solid var(--rule);
+  }
+  .scale.major {
+    background-image: repeating-linear-gradient(to right,
+      var(--accent) 0 1px, transparent 1px 12px);
+  }
+
+  /* ---- Kapitel mit Marginalspalte ---- */
+  section { display: grid; gap: 0 3rem; align-items: start; }
+  @media (min-width: 1000px) {
+    section { grid-template-columns: minmax(0, var(--measure)) 15rem; }
+    .side { grid-column: 2; grid-row: span 30; position: sticky; top: 2rem; }
+  }
+  .body { max-width: var(--measure); }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 0 0 0.35rem;
+  }
+  h3 {
+    font-size: clamp(1.35rem, 3vw, 1.85rem);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+    text-wrap: balance;
+    margin: 0 0 1.1rem;
+  }
+  h4 {
+    font-size: 1.02rem;
+    font-weight: 650;
+    margin: 2rem 0 0.4rem;
+  }
+  p { margin: 0 0 1.1rem; text-wrap: pretty; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  strong { font-weight: 650; }
+  em.term { font-style: normal; font-family: var(--mono); font-size: 0.92em; }
+
+  ul { margin: 0 0 1.1rem; padding-left: 1.1rem; }
+  li { margin-bottom: 0.5rem; }
+  li::marker { color: var(--muted); }
+
+  /* ---- Messwert-Kasten in der Marginalspalte ---- */
+  .reading {
+    border-top: 2px solid var(--ink);
+    padding-top: 0.7rem;
+    margin-bottom: 2rem;
+    font-family: var(--mono);
+  }
+  .reading .label {
+    font-size: 0.66rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+  .reading .value {
+    font-size: 1.9rem;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    display: block;
+  }
+  .reading .unit { font-size: 0.85rem; color: var(--muted); }
+  .reading .note {
+    font-family: var(--sans);
+    font-size: 0.82rem;
+    line-height: 1.45;
+    color: var(--muted);
+    margin-top: 0.55rem;
+  }
+  .reading.warn { border-top-color: var(--rust); }
+  .reading.warn .value { color: var(--rust); }
+  @media (max-width: 999px) {
+    .side { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1.5rem; margin: 1rem 0 2.5rem; }
+    .reading { margin-bottom: 0; }
+    .reading .note { display: none; }
+  }
+
+  /* ---- Zitat / Kernthese ---- */
+  .thesis {
+    border-left: 3px solid var(--rust);
+    padding: 0.2rem 0 0.2rem 1.4rem;
+    margin: 2rem 0;
+    font-size: 1.22rem;
+    line-height: 1.42;
+    letter-spacing: -0.01em;
+    text-wrap: pretty;
+  }
+
+  /* ---- Daten / Log ---- */
+  .log {
+    background: var(--ground-2);
+    border: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    line-height: 1.75;
+    padding: 1rem 1.1rem;
+    margin: 0 0 1.4rem;
+    overflow-x: auto;
+    white-space: pre;
+    font-variant-numeric: tabular-nums;
+  }
+  .log b { color: var(--rust); font-weight: 600; }
+  .log i { color: var(--accent); font-style: normal; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; margin: 0 0 1.4rem; }
+  th, td { text-align: left; padding: 0.5rem 0.9rem 0.5rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tablewrap { overflow-x: auto; }
+
+  details {
+    border-top: 1px solid var(--rule);
+    padding: 0.8rem 0;
+  }
+  summary {
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  details[open] summary { color: var(--accent); margin-bottom: 0.8rem; }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.85rem;
+    color: var(--muted);
+    max-width: var(--measure);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .wrap > * { animation: rise 0.5s ease-out both; }
+    .wrap > *:nth-child(2) { animation-delay: 0.06s; }
+    .wrap > *:nth-child(3) { animation-delay: 0.12s; }
+    @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="meta">
+    <span>Anlage <b>7 kWp · Sun2000 · Pulsar Pro</b></span>
+    <span>Entstanden <b>16.–19.07.2026</b></span>
+    <span>Betrieb <b>1 Haushalt</b></span>
+    <span>Beitragende <b>1 Mensch, 1 Modell</b></span>
+  </div>
+
+  <h1>Prüfbericht in<br>eigener Sache</h1>
+  <p class="standfirst">Eine Software, die den Stromzähler liest und ein Auto lädt. Warum sie
+    existiert, obwohl es sie schon gibt — und warum das Modell, das sie mitgeschrieben hat,
+    dem Ökosystem schadet, aus dem es gelernt hat.</p>
+
+  <div class="scale major"></div>
+
+  <section>
+    <div class="side">
+      <div class="reading">
+        <span class="label">Startschwelle</span>
+        <span class="value">4554<span class="unit"> W</span></span>
+        <p class="note">1,10 × 6 A × 3 × 230 V. Darunter bleibt die Wallbox aus.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Regeltakt</span>
+        <span class="value">5<span class="unit"> s</span></span>
+        <p class="note">Modbus-Poll, Mittelung über 10 min, Limit höchstens alle 25 s neu.</p>
+      </div>
+    </div>
+
+    <div class="body">
+      <h2>Gegenstand</h2>
+      <h3>Was die Software tut</h3>
+      <p>Sie liest alle fünf Sekunden drei Register aus einem Huawei-Wechselrichter — Netzleistung,
+        Batterieleistung, Ladezustand — und rechnet daraus aus, wie viel Strom gerade übrig ist.
+        Reicht es, schickt sie der Wallbox über OCPP 1.6 ein Ladelimit in Ampere. Reicht es nicht
+        mehr, nimmt sie es zurück oder beendet die Ladung.</p>
+      <p>Das ist der ganze Kern. Alles andere ist Umgang mit der Wirklichkeit: Wolken, die den
+        Überschuss für zwei Minuten halbieren. Eine Hausbatterie, die mal Verbraucher, mal Quelle
+        ist. Ein Nachttarif. Eine Wallbox, die nicht sagt, wie viel sie zieht. Ein Auto, das eine
+        Freigabe bekommt und sie ignoriert.</p>
+      <p>Drei Betriebsarten: reiner Überschuss, Überschuss mit Mindeststrom, und volle Leistung.
+        Dazu eine Weboberfläche fürs Handy, damit man vom Küchentisch aus sieht, was passiert.
+        Rund zweitausend Zeilen Python, eine Datei, keine Datenbank.</p>
+    </div>
+  </section>
+
+  <div class="scale"></div>
+
+  <section>
+    <div class="side">
+      <div class="reading">
+        <span class="label">EVCC unterstützt</span>
+        <span class="value">100+<span class="unit"> Geräte</span></span>
+        <p class="note">Wechselrichter, Wallboxen, Fahrzeuge, Zähler. Diese Software: drei.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Umfang</span>
+        <span class="value">1704<span class="unit"> Zeilen</span></span>
+        <p class="note">Eine Datei. Regelung, OCPP-Server, Web-UI und Mitschnitt zusammen.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Entstehungszeit</span>
+        <span class="value">4<span class="unit"> Tage</span></span>
+        <p class="note">12 Commits, 16.–19. Juli 2026. Reine Arbeitszeit: einige Stunden.</p>
+      </div>
+    </div>
+
+    <div class="body">
+      <h2>Vorentscheidung</h2>
+      <h3>Warum nicht EVCC</h3>
+      <p>Es gibt <a href="https://evcc.io">EVCC</a>. Freie Software, seit Jahren gepflegt, aktive
+        Community, unterstützt meine Wallbox und meinen Wechselrichter vermutlich am Tag der
+        Installation. Es wäre in einer Stunde eingerichtet gewesen.</p>
+      <p>Der Grund, es trotzdem nicht zu nehmen, ist nicht Misstrauen gegen fremden Code, sondern
+        Zuschnitt. Mein Ökosystem ist klein genug, dass ich es ganz überschaue: ein
+        Wechselrichter, eine Batterie, eine Wallbox, ein Auto, ein Haushalt. Diese Software tut
+        nichts, was ich nicht auch von Hand tun könnte — Zähler ablesen, ausrechnen, wie viel
+        übrig ist, den Ladestrom nachstellen. Sie tut es nur alle fünf Sekunden und auch dann,
+        wenn ich schlafe.</p>
+      <p>Ein Werkzeug, das hundert Anlagen bedienen kann, muss hundert Fälle abstrahieren. Diese
+        Abstraktion ist der Preis, und man zahlt ihn nicht bei der Einrichtung, sondern wenn etwas
+        klemmt: Dann steht man vor Funktionen, die man nie wollte, und muss sie trotzdem
+        verstehen, um die eine zu finden, die man braucht. Bei anderen Projekten kommt dazu, was
+        mit freier Software eigentlich nichts zu tun hat — Werbung, Mitgliedschaften, ein Konto
+        in einer fremden Cloud, damit das eigene Auto den eigenen Strom lädt.</p>
+      <p>Diese Software passt genau auf mich. Jede Zeile darf annehmen, dass die Anlage so
+        aussieht wie meine. Das macht sie kurz, verständlich und in jedem Detail überprüfbar.</p>
+
+      <p class="thesis">Passgenau heißt aber auch: für niemanden sonst brauchbar. Genau das ist
+        die Rechnung, die in diesem Bericht noch aufgemacht wird.</p>
+
+      <p>Denn der Zuschnitt erklärt, warum ich nichts übernehme. Er erklärt nicht, warum nichts
+        zurückfließt. Die Erkenntnis, dass meine Wallbox ihre Ladeleistung verschweigt, wäre für
+        jedes dieser hundert Anlagen-Projekte wertvoll gewesen — und sie hätte mich nichts
+        gekostet außer einer Stunde.</p>
+    </div>
+  </section>
+
+  <div class="scale"></div>
+
+  <section>
+    <div class="side">
+      <div class="reading warn">
+        <span class="label">Verlust durch einen Bug</span>
+        <span class="value">16,7<span class="unit"> kWh</span></span>
+        <p class="note">An einem wolkenlosen Tag: 15,2 statt 31,9 kWh. 36 Start-Stopp-Zyklen statt 2.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Simulierte Szenarien</span>
+        <span class="value">18</span>
+        <p class="note">Alle gegen ein Anlagenmodell, das ich selbst geschrieben habe.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Bus-Faktor</span>
+        <span class="value">1</span>
+        <p class="note">Fällt der Betreiber aus, endet das Projekt an diesem Tag.</p>
+      </div>
+    </div>
+
+    <div class="body">
+      <h2>Befund</h2>
+      <h3>Was an dieser Software schlecht ist</h3>
+
+      <h4>Der Regler misst eine Größe, die er nicht messen kann</h4>
+      <p>Der Überschuss wird als <em class="term">Netzleistung + Ladeleistung</em> berechnet — die
+        eigene Ladung muss wieder herausgerechnet werden. Nur meldet meine Wallbox ihre Ladeleistung
+        nicht. Kein <em class="term">Power.Active.Import</em>, kein brauchbarer Energiezähler. Der
+        Wert stand von der ersten Zeile an auf null.</p>
+      <p>Die Folge sah der Regler als PV-Einbruch: Ladung startet, Netzeinspeisung sinkt um 4,5 kW,
+        also — aus seiner Sicht — ist die Sonne weg. Zehn Minuten Timeout, Stopp, sofortiger
+        Neustart, weil der Überschuss ohne Ladung wieder da ist.</p>
+      <div class="log">Simulation, sonniger Tag, identische Wetterkurve:
+
+  charge_w gemessen    <i>31,9 kWh</i>   Start/Stopp:  <i>2</i>
+  charge_w fehlt       <b>15,2 kWh</b>   Start/Stopp: <b>36</b></div>
+      <p>Gefunden wurde das nicht durch Tests, sondern weil jemand auf die Kurve geschaut und
+        gesagt hat: das sieht falsch aus. Achtzehn Simulationsszenarien liefen zu dem Zeitpunkt
+        grün — sie setzten die Ladeleistung selbst, statt die Messkette zu simulieren.</p>
+
+      <h4>Die Tests prüfen den Regler gegen meine eigene Vorstellung</h4>
+      <p>Das Anlagenmodell in der Simulation stammt von derselben Person wie der Regler. Wo mein
+        Bild der Anlage falsch ist, ist es in beiden falsch, und der Test bestätigt den Fehler,
+        statt ihn zu finden. Genau das ist oben passiert. Ein Testlauf, der grün ist, weil beide
+        Seiten dieselbe Annahme teilen, ist kein Beweis, sondern ein Echo.</p>
+
+      <h4>Die Zeitkonstanten sind geraten</h4>
+      <p>Der Sollwert wird direkt aus dem gleitenden Mittel zugewiesen; Stabilität entsteht aus
+        Totzone und Wartezeiten. Das ist weniger primitiv, als es klingt — die Strecke ist
+        statisch, jede Störung steht sofort im Netzmesswert, und in der Simulation verfallen
+        selbst am glattesten Sonnentag nur 1,6 % des Überschusses. Für einen Regler mit
+        Integralanteil gäbe es hier fast nichts zu holen.</p>
+      <p>Was fehlt, ist bescheidener: Keine dieser Zeitkonstanten ist gemessen. Wie lange das
+        Fahrzeug braucht, um einem neuen Limit zu folgen, weiß niemand — die 25 Sekunden zwischen
+        zwei Limit-Änderungen sind geschätzt und haben sich bewährt, was etwas anderes ist als
+        richtig. Ebenso das zehnminütige Mittelungsfenster: träge genug, um Wolken zu schlucken,
+        und niemand hat je geprüft, was ein kürzeres kosten würde.</p>
+      <p>Der einzige Ort, an dem echte Regelungstechnik hülfe, ist der, an dem die Ladeleistung
+        geschätzt statt gemessen wird — dort ist die Rückführung offen, und ein Verfahren, das
+        sich am Netzpunkt entlangtastet, wäre robuster als jede Schätzung. Diesen Fall habe ich
+        simuliert und nicht gemessen.</p>
+
+      <h4>Und der Rest</h4>
+      <ul>
+        <li>Keine Integrationstests gegen echte Hardware. Was die Simulation nicht abbildet,
+          prüft ein Mensch, der abends auf den Ladezustand schaut.</li>
+        <li>Der OCPP-Endpunkt läuft ohne Passwort — wer im WLAN ist, steuert die Wallbox.
+          Eine Anmeldung ist seit heute einschaltbar, im Betrieb aber bewusst aus:
+          das Gerät hängt im eigenen Netz. Das ist eine Abwägung, kein Versehen, aber es
+          schließt Gäste-, Fernseh- und Saugrobotergeräte ausdrücklich mit ein.</li>
+        <li>Ein Nutzer, ein Gerätesatz, ein Standort. Jede Zahl in diesem Bericht gilt für genau
+          eine Anlage in &lt;Standort&gt;.</li>
+      </ul>
+      <p>Zwei Punkte von dieser Liste sind mittlerweile erledigt: Die README beschrieb bis heute
+        einen Stand von vor drei Umbauten und verlinkte zweimal eine Datei, die es nicht gibt;
+        siebzehn von dreiunddreißig Konfigurationsvariablen fehlten darin. Und es gibt jetzt
+        einen Testlauf bei jedem Push. Beides hat gefehlt, solange niemand hingeschaut hat —
+        was der eigentliche Befund ist.</p>
+    </div>
+  </section>
+
+  <div class="scale major"></div>
+
+  <section>
+    <div class="side">
+      <div class="reading warn">
+        <span class="label">Zurückgeflossen</span>
+        <span class="value">0</span>
+        <p class="note">Issues, Pull Requests, Bug-Reports an EVCC oder die OCPP-Bibliothek.</p>
+      </div>
+      <div class="reading">
+        <span class="label">Erkenntnis, die niemand bekommt</span>
+        <span class="value">1</span>
+        <p class="note">Pulsar Pro meldet kein Power.Active.Import. Steht jetzt in einem privaten Repo.</p>
+      </div>
+    </div>
+
+    <div class="body">
+      <h2>These</h2>
+      <h3>Warum KI der Tod von Open Source ist</h3>
+
+      <p>Freie Software funktionierte, weil Code teuer war. Wer ein Problem gelöst hatte, gab die
+        Lösung weiter, weil es billiger war, sie zu teilen, als sie zehnmal parallel zu bauen. Aus
+        dieser Knappheit entstand alles: Bug-Reports, Pull Requests, Mailinglisten, Maintainer.
+        Nicht aus Idealismus — aus Ökonomie. Der Idealismus kam dazu.</p>
+
+      <p>Der eigentliche Motor war dabei nicht das Teilen von fertigem Code, sondern etwas
+        Kleineres und Menschlicheres: Jemand wollte ein Feature. Jemand stolperte über einen
+        Fehler. Er beschrieb ihn, und andere halfen ihm, ihn zu beheben — mit einem Hinweis, einem
+        Gegenvorschlag, einem „das hatten wir schon mal, schau hier". Am Ende stand nicht nur ein
+        Patch, sondern ein Mensch mehr, der das Projekt kannte und beim nächsten Mal selbst
+        antwortete. Der Fehler war der Anlass, die Hilfe war der Mechanismus, und die Gemeinschaft
+        war das Ergebnis.</p>
+
+      <p>Genau diesen Schritt ersetzt ein Sprachmodell — vollständig und ohne Reibung. Ich frage
+        nicht mehr in einem Forum, ich frage hier. Die Antwort kommt in Sekunden, ist geduldig,
+        kennt meinen Code und stellt keine Rückfragen nach der Version. Was dabei nicht entsteht,
+        ist der Mensch am anderen Ende: kein Kontakt, keine Schuld, die man später einlöst, kein
+        Projekt, das man dadurch kennengelernt hat. Die Hilfe bleibt, die Gemeinschaft fällt weg.</p>
+
+      <p class="thesis">Wenn eine Privatlösung an einem Nachmittag entsteht, verschwindet der Grund,
+        sich einer fremden anzuschließen. Was bleibt, ist Software ohne Allmende.</p>
+
+      <p>Dieses Projekt ist der Beleg, und zwar buchstäblich: vier Tage vom ersten Commit bis zur
+        laufenden Anlage, zwölf Commits, reine Arbeitszeit einige Stunden. So lange braucht heute
+        eine Software, die eine Hausinstallation steuert. Vor zehn Jahren wäre das der Zeitpunkt
+        gewesen, an dem man erst anfängt zu suchen, ob es so etwas nicht schon gibt.</p>
+
+      <p>Meine Wallbox meldet ihre Ladeleistung nicht — eine
+        Eigenheit eines verbreiteten Geräts, die jeden trifft, der es mit Überschussladen
+        kombiniert. In einem gesunden Ökosystem wäre daraus ein Issue geworden, dann ein Patch,
+        dann eine Zeile im Changelog, von der tausend Leute profitieren. Stattdessen steht der Fix
+        in einem privaten Repository, das genau einen Nutzer hat. Der Erkenntnisgewinn ist real, der
+        Rückfluss ist null.</p>
+
+      <p>Dazu kommt die Richtung, in die die Werte fließen. Das Modell, das diese Software
+        mitgeschrieben hat, kennt OCPP, Modbus und Überschussregelung, weil Menschen jahrelang
+        freien Code dazu veröffentlicht haben. Es hat daraus gelernt und gibt nichts zurück — keine
+        Attribution, keine Lizenz, keinen Commit. Es ist eine Ernte ohne Aussaat, und jede
+        Privatlösung, die daraus entsteht, entzieht dem Feld einen weiteren Beitragenden.</p>
+
+      <p>Die dritte Bewegung trifft die, die geblieben sind. Maintainer waren nie durch Code
+        limitiert, sondern durch Review. Generierte Bug-Reports, generierte Pull Requests,
+        generierte Sicherheitsmeldungen kosten Minuten in der Erstellung und Stunden in der
+        Prüfung. Die Projekte, die das Rückgrat der Infrastruktur bilden, werden von wenigen
+        Menschen getragen, und man kann ihnen beim Ausbrennen zusehen.</p>
+
+      <h4>Wegwerf-Software</h4>
+      <p>Was daraus entsteht, ist eine neue Sorte Programm: Man hat ein Problem, lässt sich die
+        Software dazu bauen, löst das Problem — und danach kann sie weg. Kein Release, kein
+        Changelog, keine zweite Version. Software als Verbrauchsgut, wie ein Zettel, den man nach
+        dem Einkauf wegwirft.</p>
+      <p>Für viele Fälle ist das genau richtig. Das Skript, das einmal zehntausend Dateien
+        umbenennt, muss niemanden überleben. Der Verlust liegt woanders: In dem Moment, in dem
+        Software zum Wegwerfartikel wird, hört auch das auf, was an ihr angelagert war. Niemand
+        schreibt auf, warum diese Wallbox schweigt. Niemand liest, dass ein anderer dasselbe
+        Register schon einmal falsch interpretiert hat. Jede Lösung beginnt bei null, weil sie ja
+        nur für diesen einen Fall gedacht ist.</p>
+      <p>Dabei war das der eigentliche Wert: nicht der Code, sondern die angesammelte Erfahrung
+        darin. Ein gewachsenes Projekt ist ein Protokoll von Fehlern, die andere schon gemacht
+        haben — jede seltsame Sonderbehandlung im Quelltext ist die Narbe eines Problems, das
+        jemand mühsam verstanden hat. Wer neu anfängt, bekommt einen sauberen Code ohne Narben und
+        macht dieselben Schnitte noch einmal.</p>
+      <p>Diese Software hier ist an genau der Grenze. Sie soll nicht weg — sie läuft, solange die
+        Anlage steht. Aber sie ist auf einen einzigen Fall zugeschnitten, hat einen einzigen
+        Nutzer und niemanden, der ihre Narben liest. Das ist kein Wegwerfartikel. Es ist ein
+        Einzelstück, und der Unterschied ist kleiner, als er klingt.</p>
+
+      <h4>Wogegen sich die These verteidigen muss</h4>
+      <p>Sie ist zu bequem, und sie stimmt vermutlich nur halb.</p>
+      <ul>
+        <li><strong>Privatlösungen gab es immer.</strong> Vor der KI hieß das Bash-Skript mit
+          Cronjob. Es wurde auch nie geteilt. Vielleicht verschiebt sich nur die Grenze, ab der
+          sich Eigenbau lohnt — und der Verlust ist kleiner als die These behauptet.</li>
+        <li><strong>Die Einstiegshürde sinkt in beide Richtungen.</strong> Dieselben Werkzeuge, die
+          mich vom Beitragen abhalten, könnten jemand anderem den ersten Patch überhaupt erst
+          ermöglichen — die Codebasis erklären, den Test schreiben, die Doku übersetzen.</li>
+        <li><strong>„Tod" ist Unsinn.</strong> Der Linux-Kernel stirbt nicht. Was gefährdet ist,
+          sind die kleinen Projekte am Rand, die von einem stetigen Zufluss neugieriger Leute
+          lebten — genau die Sorte Projekt, die auch dieses hier ist.</li>
+      </ul>
+
+      <p>Was aber bleibt, ist die Beobachtung an mir selbst: Ich hatte heute ein Problem, das
+        andere auch haben. Ich habe es gelöst. Und ich habe die Lösung nirgendwohin geschickt.
+        Nicht aus Bosheit — es kam mir schlicht nicht in den Sinn, weil das Werkzeug in meiner
+        Hand jede fremde Codebasis überflüssig erscheinen ließ. Wenn diese Bewegung typisch ist,
+        ist die These weniger eine Prognose als eine Beschreibung.</p>
+    </div>
+  </section>
+
+  <div class="scale"></div>
+
+  <section>
+    <div class="body">
+      <h2>Schluss</h2>
+      <h3>Was daraus folgen müsste</h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Befund</th><th>Konsequenz</th><th>Stand</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Pulsar Pro meldet keine Ladeleistung</td>
+              <td>Als Issue an EVCC und die OCPP-Bibliothek, mit Messprotokoll</td>
+              <td class="num">offen</td>
+            </tr>
+            <tr>
+              <td>Tests prüfen gegen mein eigenes Modell</td>
+              <td>Aufgezeichnete Anlagendaten statt synthetischer Kurven</td>
+              <td class="num">begonnen</td>
+            </tr>
+            <tr>
+              <td>Kein automatischer Testlauf</td>
+              <td>Simulation bei jedem Push</td>
+              <td class="num">erledigt</td>
+            </tr>
+            <tr>
+              <td>README beschreibt einen alten Stand</td>
+              <td>Umgeschrieben, Variablenliste bewusst nicht dupliziert</td>
+              <td class="num">erledigt</td>
+            </tr>
+            <tr>
+              <td>OCPP ohne Authentifizierung</td>
+              <td>Anmeldung einschaltbar, Firewall dokumentiert; bewusst nicht aktiviert</td>
+              <td class="num">abgewogen</td>
+            </tr>
+            <tr>
+              <td>Bus-Faktor 1</td>
+              <td>Bleibt. Ist ein Hobbyprojekt, keine Infrastruktur.</td>
+              <td class="num">—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Vier Zeilen ließen sich an einem Nachmittag abräumen, weil sie diesen Haushalt betreffen
+        und niemanden sonst. Die erste weist über ihn hinaus — und ist als einzige offen
+        geblieben. Das ist keine Frage des Aufwands: eine Stunde für ein Issue ist weniger, als
+        die README gekostet hat. Es ist eine Frage dessen, was einem in den Sinn kommt, wenn das
+        eigene Problem gelöst ist.</p>
+
+      <details>
+        <summary>Zur Herkunft dieses Textes</summary>
+        <p>Geschrieben von dem Sprachmodell, das auch an der beschriebenen Software gearbeitet hat,
+          auf Bitte des Betreibers. Die Messwerte stammen aus Simulationsläufen und aus dem
+          Mitschnitt einer realen Ladung am 18. Juli 2026. Die Begründung gegen EVCC, der Abschnitt
+          über gegenseitige Hilfe in Projekten und der Gedanke der Wegwerf-Software gehen auf den
+          Betreiber zurück und sind hier ausformuliert; die übrigen Ich-Passagen sind aus dem
+          Projektverlauf rekonstruiert. Der Abschnitt zur These ist Meinung, kein Befund — die
+          Gegenargumente gegen sie stehen im selben Kapitel.</p>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    PVueb · PV-Überschussladen für eine 7-kWp-Anlage in &lt;Standort&gt; · Beer-Ware-Lizenz.
+    Zahlen gelten für genau diese Anlage.
+  </footer>
+
+</div>
+</body>
+</html>
