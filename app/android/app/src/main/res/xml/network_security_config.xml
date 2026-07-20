@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Der Regler läuft im Heimnetz und spricht HTTP; Android verbietet Klartext seit
+  API 28 standardmäßig, sonst bliebe die WebView schwarz. Die Ausnahme gilt
+  bewusst allgemein: Anwender tragen mal eine IP, mal einen Namen wie
+  pvueb.fritz.box ein, und private IP-Bereiche lassen sich hier nicht ausdrücken.
+  Wer den Port ins Internet legt, stellt in den Einstellungen HTTPS an.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
