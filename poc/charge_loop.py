@@ -1173,6 +1173,13 @@ async def control_step(now: float):
         else:
             state.surplus_since = None
             reset_start_backoff()   # Trigger weg: nächster Anlauf beginnt von vorn
+            # Ohne Ladeabsicht bleibt sonst der Mindeststrom der letzten Regelung
+            # in der Box stehen — sie speichert das TxDefaultProfile und zeigt es
+            # in der Hersteller-App als feste Grenze an. Wer dann per RFID oder
+            # App lädt, hängt an 6 A fest. Der nächste geregelte Start setzt
+            # ohnehin wieder den passenden Wert (try_start).
+            if limit_due(now, MAX_AMPS):
+                await apply_limit(now, MAX_AMPS)
     else:
         if state.mode == "minpv":
             # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
