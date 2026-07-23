@@ -38,15 +38,28 @@ DT = 5                           # Takt in Sekunden (= poll_interval_s)
 
 
 class FakeBox:
-    """Wallbox-Ersatz: merkt sich Limit und Transaktionszustand."""
+    """Wallbox-Ersatz: merkt sich Limit und Transaktionszustand.
 
-    def __init__(self, accept_start=True):
+    obeys_limit=False bildet die Box nach, die ein Ladeprofil zwar mit
+    "Accepted" quittiert, sich aber nicht daran hält (siehe
+    docs/issue_limit_to_6A.md). Sie meldet dann weiter ihren eigenen Wert.
+    """
+
+    def __init__(self, accept_start=True, obeys_limit=True, stuck_amps=6.0):
         self.accept_start = accept_start
+        self.obeys_limit = obeys_limit
+        self.stuck_amps = stuck_amps      # was die Box wirklich freigibt
         self.transaction_id = 1
         self.events: list[tuple[float, str]] = []
 
+    @property
+    def real_amps(self) -> float:
+        """Was tatsächlich fließen darf — nicht, was der Regler glaubt."""
+        return c.state.current_limit if self.obeys_limit else self.stuck_amps
+
     async def set_limit(self, amps: float):
         c.state.current_limit = amps
+        c.state.limit_known = True
         self.events.append((Sim.t, f"Limit {amps:.1f} A"))
 
     async def remote_start(self) -> str:
@@ -75,7 +88,7 @@ class Sim:
 
     def __init__(self, curve, soc=50.0, mode="minpv", min_amps=6, night=False,
                  batt_charge_max=BATT_MAX_W, meter="ok", house_w=400.0, car_amps=None,
-                 accept_start=True):
+                 accept_start=True, obeys_limit=True, stuck_amps=6.0):
         self.curve = curve            # Funktion: Minute -> verfügbare PV in A
         self.batt_charge_max = batt_charge_max   # 0 = Batterie nimmt nichts auf (voll/gesperrt)
         self.meter = meter            # ok | none (Box meldet nichts) | stale (Messung eingefroren)
@@ -96,6 +109,8 @@ class Sim:
         s.mode, s.min_amps, s.released = mode, min_amps, True
         s.night_enabled = night
         s.charging, s.charge_w, s.current_limit = False, 0.0, 0
+        s.limit_known, s.limit_set_t, s.limit_warned = False, 0.0, False
+        s.limit_refresh_s, s.limit_warn_factor = 300, 0.6
         s.charge_w_seen, s.charge_w_src = None, "keine"
         s.charge_energy_wh = s.charge_energy_t = None
         s.charge_w_max_age_s = 30
@@ -106,16 +121,18 @@ class Sim:
         s.poll_interval_s = DT
         s.start_retry_s, s.box_status = 30, "Preparing"
         c.reset_start_backoff()
-        self.box = FakeBox(accept_start=accept_start)
+        self.box = FakeBox(accept_start=accept_start, obeys_limit=obeys_limit,
+                           stuck_amps=stuck_amps)
         c.charge_point = self.box
 
     def step(self):
         s = c.state
         minute = Sim.t / 60
         pv_w = self.curve(minute) * WPA
-        # Das Auto nimmt höchstens, was es kann — sonst genau das Limit
-        amps = s.current_limit if self.car_amps is None else min(s.current_limit,
-                                                                self.car_amps(minute))
+        # Das Auto nimmt höchstens, was es kann — sonst genau das, was die Box
+        # wirklich freigibt (nicht zwingend das, was der Regler gesetzt hat)
+        frei = self.box.real_amps
+        amps = frei if self.car_amps is None else min(frei, self.car_amps(minute))
         self.load_w = max(0.0, amps) * WPA if s.charging else 0.0
         # Erzeugung = Überschuss + Hauslast; der Regler liest sie aus Register 32080
         s.pv_w = pv_w + self.house_w
@@ -411,7 +428,55 @@ async def t18():
            "Ohne Bremse wären es rund 4000 (alle 5 s).")
 
 
-TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18]
+async def t19():
+    """Regression zu docs/issue_limit_to_6A.md.
+
+    Der Regler hat im PV-Betrieb zuletzt 6 A gesetzt und glaubt weiter daran.
+    Dann bootet die Wallbox — was in ihr steht, weiß danach niemand mehr — und
+    das Nachtfenster beginnt. Vor dem Fix unterblieb das Setzen, weil der
+    Merker "6 A" gegen MAX_AMPS verglichen wurde und die Ladung dann tatsächlich
+    mit 6 A lief.
+    """
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        sim = Sim(lambda m: 0.0, soc=50, mode="minpv", night=True,
+                  obeys_limit=False, stuck_amps=6.0)
+        # Ausgangslage: 6 A aus dem PV-Betrieb, Box gebootet
+        c.state.current_limit, c.state.limit_known = 6.0, False
+        await sim.run(120)
+        gesetzt = [e for _, e in sim.box.events if e.startswith("Limit")]
+        report("TEST 19 — Nachtfenster nach Box-Boot, Merker steht auf 6 A", sim,
+               f"Erwartet: sofort {c.MAX_AMPS} A, obwohl der Merker 6 A sagte. "
+               f"Gesetzte Limits: {gesetzt[:3]}")
+    finally:
+        c.in_night_window = orig
+
+
+async def t20():
+    """Box quittiert das Limit, hält sich aber nicht daran.
+
+    Dagegen hilft kein Nachsetzen — der Regler soll es wenigstens bemerken und
+    in regelmäßigem Abstand erneut versuchen, statt es einmal zu setzen und den
+    Rest der Nacht darauf zu vertrauen.
+    """
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        sim = Sim(lambda m: 0.0, soc=50, mode="minpv", night=True,
+                  obeys_limit=False, stuck_amps=6.0)
+        await sim.run(60)
+        wiederholt = sum(1 for _, e in sim.box.events if e.startswith("Limit"))
+        report("TEST 20 — Box ignoriert das Ladeprofil, 1 h Nachtfenster", sim,
+               f"Erwartet: Limit wird über die Stunde mehrfach nachgesetzt "
+               f"(hier {wiederholt}×, Abstand {c.state.limit_refresh_s} s) und die "
+               f"Diskrepanz einmal geloggt. Vor dem Fix blieb es bei einem Versuch.")
+    finally:
+        c.in_night_window = orig
+
+
+TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18,
+         t19, t20]
 
 
 JSON_OUT = ""

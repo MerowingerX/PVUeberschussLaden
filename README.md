@@ -63,6 +63,13 @@ aber trotzdem zügig.
 - **Startversuche mit Backoff**: Ob wirklich Strom fließt, entscheidet das Fahrzeug.
   Lehnt es ab, wächst der Abstand zwischen Versuchen, statt im Regeltakt zu funken.
   Hängt die Box in `Finishing`, wird einmal ein `ChangeAvailability`-Zyklus versucht.
+- **Das Limit wird nachgehalten**, nicht nur einmal gesetzt: spätestens alle
+  `PVUEB_LIMIT_REFRESH_S` (Standard 300 s) geht es erneut raus, nach einem Boot der
+  Box sofort, und bei laufender Ladung als `TxProfile` statt `TxDefaultProfile`.
+  Fließt trotzdem deutlich weniger als erlaubt, steht eine Warnung im Log und
+  `limit_effective` im Status auf `false`. Ohne das lud das Auto eine Nacht lang
+  mit 6 A statt 16 A, während der Regler 16 A für gesetzt hielt
+  ([docs/issue_limit_to_6A.md](docs/issue_limit_to_6A.md)).
 - **Web-UI** fürs Handy, fünf Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
   Ladeleistung, Freigabe, Modus, Nachtautomatik) · *Huawei-Batterie* (SOC, Leistung,
   Netzladung, Prognose) · *Wallbox* (gemessene Ladeleistung, Sitzungsenergie, Firmware) ·

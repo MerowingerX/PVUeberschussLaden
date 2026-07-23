@@ -216,8 +216,13 @@ class State:
     charge_energy_t: float | None = None    # Loop-Zeit dazu
     charging = False
     current_limit = 0.0          # zuletzt gesetztes Limit in A (Raster limit_step_a)
+    limit_known = False          # gilt current_limit noch? (nach Box-Boot: nein)
+    limit_set_t = 0.0            # Loop-Zeit des letzten gesendeten Limits
     limit_step_a = 0.1           # Auflösung des Ladelimits in A (aus .env)
     limit_deadband_a = 0.3       # so viel Abweichung, bevor neu gesetzt wird (aus .env)
+    limit_refresh_s = 300        # Limit spätestens so oft wiederholen (aus .env)
+    limit_warn_factor = 0.6      # darunter gilt das Limit als wirkungslos (aus .env)
+    limit_warned = False         # Warnung für diesen Ladevorgang schon raus
     start_retry_at: float | None = None  # frühester nächster Startversuch (Loop-Zeit)
     start_attempts = 0           # abgelehnte Startversuche in Folge
     start_retry_s = 30           # Basis für den Backoff zwischen Versuchen (aus .env)
@@ -272,6 +277,28 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
 MAX_START_RETRY_S = 300      # Obergrenze für den Backoff zwischen Startversuchen
 
 
+async def apply_limit(now: float, amps: float):
+    """Limit an die Box schicken und den Zeitpunkt merken."""
+    await charge_point.set_limit(amps)
+    state.limit_set_t = now
+
+
+def limit_due(now: float, amps: float) -> bool:
+    """Muss das Limit raus, obwohl der Sollwert unverändert scheint?
+
+    Drei Gründe, aus denen der Merker nicht reicht:
+    ist er ungültig (Box gebootet, Setzen abgelehnt), weicht der Sollwert ab,
+    oder liegt das letzte Setzen länger zurück als limit_refresh_s. Der letzte
+    Fall ist der Schutz gegen stille Divergenz: übernimmt die Box ein Profil
+    nicht oder überschreibt es jemand über die Hersteller-App, fällt das sonst
+    nie auf — in der Nacht zum 2026-07-20 lud das Auto so 40 Minuten mit 6 A
+    statt 16 A (docs/issue_limit_to_6A.md).
+    """
+    return (not state.limit_known
+            or state.current_limit != amps
+            or now - state.limit_set_t >= state.limit_refresh_s)
+
+
 async def try_start(now: float, amps: float):
     """Ladung anstoßen, aber nicht im Regeltakt dagegenhämmern.
 
@@ -285,7 +312,7 @@ async def try_start(now: float, amps: float):
     # SuspendedEV heißt: die Box gibt frei, das Fahrzeug nimmt nichts (voll,
     # Ladetimer). Dagegen hilft kein enger Takt, nur gelegentlich nachfragen.
     wartezeit = MAX_START_RETRY_S if state.box_status == "SuspendedEV" else state.start_retry_s
-    await charge_point.set_limit(amps)
+    await apply_limit(now, amps)
     status = await charge_point.remote_start()
     state.last_adjust = now
     if status == "Accepted":
@@ -303,6 +330,28 @@ async def try_start(now: float, amps: float):
         await charge_point.wake_connector()
 
 
+def warn_limit_ineffective(now: float):
+    """Meldet, wenn bei voller Freigabe deutlich weniger fließt als erlaubt.
+
+    Der Fall, der das nötig macht: die Box nimmt das Ladeprofil an, richtet
+    sich aber nicht danach. Dagegen hilft kein Nachsetzen, nur Hinsehen — die
+    Nacht zum 2026-07-20 fiel erst am Morgen auf. Ein Fahrzeug darf legitim
+    weniger ziehen (einphasig, eigene Begrenzung), deshalb bleibt es bei einer
+    Warnung pro Ladevorgang und greift nicht in die Regelung ein.
+    """
+    if state.limit_warned or state.charge_w_src not in ("gemessen", "Energie"):
+        return
+    if state.charge_w_seen is None or now - state.charge_w_seen > state.charge_w_max_age_s:
+        return
+    erlaubt_w = state.current_limit * VOLTAGE * PHASES
+    if state.charge_w >= state.limit_warn_factor * erlaubt_w:
+        return
+    state.limit_warned = True
+    log.warning("Wallbox lädt mit %.0f W, erlaubt sind %.1f A (%.0f W) — Limit "
+                "wirkt nicht. In der Wallbox-App nachsehen.",
+                state.charge_w, state.current_limit, erlaubt_w)
+
+
 def reset_start_backoff():
     """Nach erfolgreichem Start oder weggefallenem Trigger wieder bei null."""
     state.start_retry_at = None
@@ -312,6 +361,7 @@ def reset_start_backoff():
 
 def reset_charge_meter():
     """Zählerstände der Wallbox verwerfen — nach Ladeende sind sie wertlos."""
+    state.limit_warned = False
     state.charge_w = 0.0
     state.charge_w_seen = None
     state.charge_w_src = "keine"
@@ -363,6 +413,11 @@ class ChargePoint(OcppChargePoint):
     @on("BootNotification")
     def on_boot(self, charge_point_vendor, charge_point_model, **kwargs):
         log.info("Wallbox gebootet: %s %s", charge_point_vendor, charge_point_model)
+        # Was in der Box an Ladeprofil steht, weiß nach einem Boot niemand mehr.
+        # Ohne diese Zeile hielte der Regler seinen alten Merker für die
+        # Wahrheit und schickte nie wieder ein Limit — die Box lädt dann mit
+        # ihrem eigenen Default weiter (siehe docs/issue_limit_to_6A.md).
+        state.limit_known = False
         asyncio.get_event_loop().create_task(self.configure_metering())
         return call_result.BootNotification(
             current_time=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -470,12 +525,29 @@ class ChargePoint(OcppChargePoint):
         return call_result.DataTransfer(status="Accepted")
 
     async def set_limit(self, amps: float):
-        request = call.SetChargingProfile(
-            connector_id=1,
-            cs_charging_profiles={
+        # Läuft gerade eine Transaktion, geht das Limit als TxProfile mit ihrer
+        # ID und höherem stack_level raus. Ein TxDefaultProfile ist laut OCPP
+        # 1.6 zwar auch auf eine laufende Ladung anzuwenden, aber Boxen halten
+        # sich daran unterschiedlich streng — manche übernehmen es erst zur
+        # nächsten Transaktion. Genau so bliebe ein Nachtstart bei den 6 A des
+        # PV-Betriebs hängen (docs/issue_limit_to_6A.md).
+        if self.transaction_id is not None:
+            profil = {
+                "charging_profile_id": 2,
+                "stack_level": 1,
+                "transaction_id": self.transaction_id,
+                "charging_profile_purpose": ChargingProfilePurposeType.tx_profile,
+            }
+        else:
+            profil = {
                 "charging_profile_id": 1,
                 "stack_level": 0,
                 "charging_profile_purpose": ChargingProfilePurposeType.tx_default_profile,
+            }
+        request = call.SetChargingProfile(
+            connector_id=1,
+            cs_charging_profiles={
+                **profil,
                 "charging_profile_kind": ChargingProfileKindType.absolute,
                 "charging_schedule": {
                     "charging_rate_unit": ChargingRateUnitType.amps,
@@ -486,8 +558,11 @@ class ChargePoint(OcppChargePoint):
         response = await self.call(request)
         if response and response.status == "Accepted":
             state.current_limit = amps
+            state.limit_known = True
             log.info("Limit gesetzt: %.1f A", amps)
         else:
+            # Abgelehnt heißt: in der Box steht jetzt irgendetwas anderes.
+            state.limit_known = False
             log.warning("Limit %.1f A abgelehnt: %s", amps, response)
 
     async def remote_start(self) -> str:
@@ -1047,14 +1122,21 @@ async def control_step(now: float):
             log.info("Freigabe fehlt — stoppe Ladung")
             await charge_point.remote_stop()
         state.surplus_since = state.deficit_since = state.minpv_low_since = None
+        # Ohne Freigabe regeln wir nicht mehr, aber die Box lädt weiter, wenn
+        # jemand sie per RFID oder Hersteller-App startet. Das gedrosselte
+        # Limit aus dem letzten PV-Takt bliebe dabei stehen — deshalb hier
+        # zurück auf Maximum, damit unbeaufsichtigtes Laden voll läuft.
+        if limit_due(now, MAX_AMPS):
+            await apply_limit(now, MAX_AMPS)
         return
 
     # Nachttarif-Fenster oder Modus "fast": volle Leistung
     if state.mode == "fast" or in_night_window():
         if state.charging:
             reset_start_backoff()
-            if state.current_limit != MAX_AMPS:
-                await charge_point.set_limit(MAX_AMPS)
+            if limit_due(now, MAX_AMPS):
+                await apply_limit(now, MAX_AMPS)
+            warn_limit_ineffective(now)
         else:
             await try_start(now, MAX_AMPS)
         return
@@ -1123,11 +1205,15 @@ async def control_step(now: float):
                 await charge_point.remote_stop()
         else:
             state.deficit_since = None
-            if (abs(amps - state.current_limit) >= state.limit_deadband_a
-                    and now - state.last_adjust >= state.adjust_min_interval_s):
+            # Das Totband hält das Funken klein, darf aber die Auffrischung
+            # nicht verschlucken — sonst stünde ein abgewiesenes oder von außen
+            # überschriebenes Limit unbemerkt bis zum nächsten Wolkenzug.
+            faellig = (abs(amps - state.current_limit) >= state.limit_deadband_a
+                       or limit_due(now, amps))
+            if faellig and now - state.last_adjust >= state.adjust_min_interval_s:
                 log.info("Überschuss %.0f W — passe Limit an: %.1f → %.1f A",
                          surplus, state.current_limit, amps)
-                await charge_point.set_limit(amps)
+                await apply_limit(now, amps)
                 state.last_adjust = now
 
 
@@ -1567,6 +1653,9 @@ def status_dict() -> dict:
         "minpv_pause_factor": state.minpv_pause_factor,
         "minpv_resume_factor": state.minpv_resume_factor,
         "current_limit": state.current_limit,
+        # Trägt das Limit? Im Mitschnitt ist damit später nachweisbar, ob die
+        # Box sich an das Ladeprofil gehalten hat (docs/issue_limit_to_6A.md).
+        "limit_effective": not state.limit_warned,
         "charging": state.charging,
         "night": in_night_window(),
         "battery_grid_charge": state.battery_grid_charge,
@@ -1606,7 +1695,8 @@ async def http_status(_request):
 # und würden den Mitschnitt sonst um ein Vielfaches aufblähen.
 RECORD_FIELDS = (
     "grid_w", "battery_w", "pv_w", "house_w", "soc",
-    "charge_w", "charge_w_src", "current_limit", "charging", "box_status",
+    "charge_w", "charge_w_src", "current_limit", "limit_effective",
+    "charging", "box_status",
     "surplus_w", "pv_surplus_w", "pv_avg_w", "avg_active_s", "minpv_low_s",
     "mode", "min_amps", "night", "boost_used_wh", "battery_grid_charge",
     # Referenzmessung aus der Cloud: erlaubt später, die Schätzung zu bewerten
@@ -1858,6 +1948,10 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
             ("PVUEB_LIMIT_STEP_A", state.limit_step_a, "Raster des Ladelimits in Ampere"),
             ("PVUEB_LIMIT_DEADBAND_A", state.limit_deadband_a,
              "Abweichung, ab der neu gesetzt wird"),
+            ("PVUEB_LIMIT_REFRESH_S", state.limit_refresh_s,
+             "Limit spätestens so oft wiederholen, auch unverändert"),
+            ("PVUEB_LIMIT_WARN_FACTOR", state.limit_warn_factor,
+             "Unter diesem Anteil des erlaubten Stroms gilt das Limit als wirkungslos"),
         ]),
         ("Messwerte der Wallbox", [
             ("PVUEB_CHARGE_W_MAX_AGE_S", state.charge_w_max_age_s,
@@ -2002,6 +2096,9 @@ async def main():
     state.limit_deadband_a = float(os.environ.get("PVUEB_LIMIT_DEADBAND_A", "0.3"))
     if not 0 < state.limit_step_a <= 1 or state.limit_deadband_a < state.limit_step_a:
         sys.exit("PVUEB_LIMIT_STEP_A muss in (0, 1] liegen, DEADBAND >= STEP")
+    state.limit_warn_factor = float(os.environ.get("PVUEB_LIMIT_WARN_FACTOR", "0.6"))
+    if not 0 <= state.limit_warn_factor < 1:
+        sys.exit("PVUEB_LIMIT_WARN_FACTOR muss in [0, 1) liegen")
     state.avg_window_s = int(float(os.environ.get("PVUEB_AVG_WINDOW_MIN", "10")) * 60)
     state.start_avg_window_s = int(float(os.environ.get("PVUEB_START_AVG_MIN", "2")) * 60)
     if state.avg_window_s < 0 or state.start_avg_window_s < 0:
@@ -2013,6 +2110,9 @@ async def main():
         sys.exit("PVUEB_BOOST_W/_H müssen >= 0 sein, PVUEB_BOOST_MIN_SOC 0–100")
     state.poll_interval_s = int(os.environ.get("PVUEB_POLL_INTERVAL_S", "5"))
     state.adjust_min_interval_s = int(os.environ.get("PVUEB_ADJUST_MIN_INTERVAL_S", "25"))
+    state.limit_refresh_s = int(os.environ.get("PVUEB_LIMIT_REFRESH_S", "300"))
+    if state.limit_refresh_s < state.adjust_min_interval_s:
+        sys.exit("PVUEB_LIMIT_REFRESH_S muss >= PVUEB_ADJUST_MIN_INTERVAL_S sein")
     state.start_delay_s = int(os.environ.get("PVUEB_START_DELAY_S", "120"))
     state.stop_delay_s = int(os.environ.get("PVUEB_STOP_DELAY_S", "180"))
     state.minpv_start_factor = float(os.environ.get("PVUEB_MINPV_START_FACTOR", "1.10"))
