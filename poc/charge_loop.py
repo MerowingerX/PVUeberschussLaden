@@ -148,18 +148,20 @@ FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 WALLBOX_TOKEN_TTL_S = 45         # JWT hält rund 60 s, vorher erneuern
 WALLBOX_MIN_POLL_S = 30          # die Cloud aktualisiert nicht häufiger
 WALLBOX_STATUS = {               # nur die Zustände, die im Betrieb vorkommen
-    # „gesperrt" heißt hier immer: in der Wallbox-App gesperrt. Mit der Freigabe
-    # in PVueb hat es nichts zu tun — ohne den Zusatz liest sich das, als hätte
-    # der Regler die Box abgeschaltet.
+    # 209/210 und 165 melden „locked". Gemeint ist die Autorisierung der Box
+    # selbst (App/RFID), nicht die Freigabe in PVueb — und ohne aktiviertes
+    # RFID steht sie dauerhaft, ohne etwas zu verhindern: die Ladung in der
+    # Nacht zum 23.07. lief trotzdem über RemoteStart. Deshalb wird der Zustand
+    # nur genannt, nicht als Hindernis ausgelegt.
     161: "bereit", 162: "bereit", 163: "kein Auto", 164: "wartet",
-    165: "in der Wallbox-App gesperrt",
+    165: "kein Auto · Box nicht freigeschaltet",
     166: "aktualisiert", 177: "geplant", 178: "pausiert", 179: "geplant",
     180: "warte auf Auto", 181: "warte auf Auto", 182: "pausiert",
     183: "warte auf Auto", 184: "warte auf Auto", 185: "warte auf Auto",
     186: "warte auf Auto", 187: "warte auf Auto", 188: "warte auf Auto",
     189: "warte auf Auto", 193: "lädt", 194: "lädt", 195: "lädt",
-    196: "entlädt", 209: "in der Wallbox-App gesperrt",
-    210: "in der Wallbox-App gesperrt, Auto verbunden",
+    196: "entlädt", 209: "kein Auto · Box nicht freigeschaltet",
+    210: "Auto verbunden · Box nicht freigeschaltet",
 }
 AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
 # Nach Anmeldefehlern wird der Abstand verdoppelt. Hintergrund: Scheitert die
@@ -1038,7 +1040,28 @@ def wallbox_snapshot(daten: dict) -> dict:
         "firmware": (config.get("software") or {}).get("currentVersion"),
         "locked": config.get("locked"),
         "last_sync": daten.get("last_sync"),
+        "last_sync_s": sync_alter(daten.get("last_sync")),
     }
+
+
+def sync_alter(text: str | None) -> int | None:
+    """Wie lange die Box zuletzt mit ihrer Cloud gesprochen hat, in Sekunden.
+
+    Nicht zu verwechseln mit dem Alter *unseres* Abrufs: die Box kann per OCPP
+    munter antworten und trotzdem seit Stunden nichts an die Cloud gemeldet
+    haben. Dann steht in der UI ein Standbild, das frisch aussieht.
+
+    Der Zeitstempel kommt ohne Zonenangabe. Ergibt die Rechnung etwas
+    Unplausibles, wird lieber nichts angezeigt als eine falsche Zahl.
+    """
+    if not text:
+        return None
+    try:
+        gesehen = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    alter = (datetime.datetime.now() - gesehen).total_seconds()
+    return round(alter) if 0 <= alter <= 30 * 86400 else None
 
 
 async def wallbox_cloud_task():
@@ -1399,12 +1422,19 @@ function renderWallbox() {
     ["Ladezeit gesamt", w.charging_time_s ? (w.charging_time_s / 3600).toFixed(1) + " h" : "–"],
     ["Grenze in der App", w.app_max_a === undefined || w.app_max_a === null ? "–"
       : w.app_max_a + " A von " + (w.hw_max_a ?? "?") + " A"
-        + (w.app_max_a < 16 ? " ⚠" : "")],
+        + (w.hw_max_a && w.app_max_a < w.hw_max_a ? " ⚠ deckelt die Ladung" : "")],
     ["Firmware", w.firmware || "–"],
-    ["Abgerufen", ago(s.wallbox_seen_s)],
+    ["Box meldete sich zuletzt", ago(w.last_sync_s)],
+    ["Cloud abgefragt", ago(s.wallbox_seen_s)],
   ];
+  // Die Box kann per OCPP antworten und trotzdem seit Stunden nichts an ihre
+  // Cloud gemeldet haben. Ohne diesen Hinweis sieht ein Standbild frisch aus.
+  const alt = w.last_sync_s !== null && w.last_sync_s !== undefined && w.last_sync_s > 600;
   out.innerHTML = rows.map(row).join("")
     + (s.wallbox_error ? `<div class="note err">${s.wallbox_error}</div>` : "")
+    + (alt ? `<div class="note err">Die Box hat seit ${ago(w.last_sync_s)} nichts
+        an ihre Cloud gemeldet – die Werte oben sind ein Standbild von damals.
+        Was PVueb direkt über OCPP sieht, steht auf der Debug-Seite.</div>` : "")
     + `<div class="note">Referenzmessung – der Regler nutzt diese Werte nicht.
        Die Cloud aktualisiert alle 30 s.</div>`;
 }
