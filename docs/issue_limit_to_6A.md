@@ -16,44 +16,46 @@ Eventuell Ladedaten könntest Du vom 192.168.100.2 herunterladen
 
 ---
 
-## Was die Logs sagen (2026-07-23, `docker logs pvueb` vom Pi)
+## Der Logauszug der Nacht (2026-07-23)
 
-Vorhanden sind der 19.–21.07.; die Nacht 19.→20.07. ist die einzige mit einem
-angesteckten Fahrzeug. Der Befund passt **nicht** zur ersten Vermutung:
+Aus `/var/lib/docker/containers/<id>/<id>-json.log` auf dem Pi. **Nicht** über
+`docker logs`: das bricht an den pymodbus-Hexdumps ab und zeigte nur bis zum
+21.07., was zu einer falschen Zwischenanalyse geführt hat. Die Rohdatei lesen.
 
-- **Der Regler hat nie 6 A gesetzt.** Im gesamten Log kommt
-  `Limit gesetzt: 6.0 A` kein einziges Mal vor. Gesetzt wurden 7,1–9,1 A
-  (PV-Regelung am Tag) und 16,0 A (Nachtfenster). Die 6 A der Box stammen also
-  nicht aus dem `minpv`-Betrieb.
-- **Das Nachtfenster hat sauber gearbeitet.** Ab 00:00:04 ging alle paar Minuten
-  `Limit gesetzt: 16.0 A` raus, über Stunden.
-- **Die Box hat jeden Start abgelehnt:** `RemoteStart: Rejected`, Box-Status
-  `Preparing`. Zwischen 00:00 und 06:52 kam kein einziges `Charging`.
-- **Geladen wurde trotzdem** — laut FusionSolar 00:00–00:40 mit 4 kW. Der Regler
-  hat davon nichts gesehen: erst um 06:52:32 meldet die Box neun Sekunden lang
-  `Charging`, dann `Finishing` und `Transaktion beendet (meter 7425880 Wh)`.
-- **Die Box bootet täglich gegen 07:23**, also nach der Ladung, nicht davor.
+```
+00:00:04  Limit gesetzt: 16.0 A          TxDefaultProfile, 2 s vor der Transaktion
+00:00:04  RemoteStart: Accepted
+00:00:05  Wallbox-Status: SuspendedEV
+00:00:06  Transaktion gestartet (meter 7425880 Wh)
+00:00:09  Wallbox-Status: Charging
+00:36:50  Modus (Web): fast              manuelle Eingriffe, ohne Wirkung
+00:43:53  Modus (Web): minpv
+03:50:52  Wallbox-Status: SuspendedEV    Ladung vorbei
+03:50:55  Limit gesetzt: 16.0 A          erst jetzt wieder
+```
 
-Daraus folgt eine andere Erklärung als zunächst angenommen: **die Ladung lief
-außerhalb der OCPP-Transaktion des Reglers.** Die Box hat selbst gestartet (RFID
-oder App) und dabei ihre eigene Stromgrenze verwendet — den App-Slider, der laut
-[README](../README.md#hardware-voraussetzungen) zusätzlich zum OCPP-Limit
-deckelt. Ein `TxDefaultProfile` greift auf so eine Session nicht zu; genau
-deshalb half das manuelle Hochsetzen in der App sofort.
+Zwischen 00:00:04 und 03:50:55 liegt **keine einzige** weitere Limit-Nachricht.
+Drei Stunden fünfzig Ladung, ein einziger Sendeversuch — und der ging raus,
+bevor es die Transaktion überhaupt gab.
 
-Beweisen lässt sich das nicht abschließend, weil der Mitschnitt nicht lief
-(`PVUEB_RECORD_DIR=` leer). Ohne ihn gibt es keine Zeitreihe von `charge_w`
-gegen `current_limit`.
+Damit ist die Ursache belegt:
 
-## Zuerst zu tun
+1. Das Limit geht als `TxDefaultProfile` raus, während noch keine Transaktion
+   läuft. Die Box eröffnet ihre Session danach und nimmt dabei ihren eigenen
+   Wert (6 A) statt des Profils.
+2. `current_limit` steht auf 16, also ist `state.current_limit != MAX_AMPS`
+   falsch und der Nachtzweig schweigt für den Rest der Ladung.
+3. Die Modus-Klicks um 00:36–00:43 konnten nichts ausrichten: `fast` und
+   Nachtfenster laufen in denselben Zweig, der aus demselben Grund nichts tut.
 
-1. **App-Slider der Wallbox auf 16 A** und dort lassen. Er deckelt unabhängig
-   vom OCPP-Profil und ist der wahrscheinlichste Grund für die 4 kW.
-2. **Mitschnitt einschalten**: `PVUEB_RECORD_DIR=/data/recordings` in der `.env`
-   auf dem Pi. Ohne ihn ist die nächste solche Nacht genauso wenig nachweisbar.
-3. Prüfen, warum die Box jeden `RemoteStart` mit `Rejected` beantwortet, obwohl
-   ein Fahrzeug angesteckt ist — solange das so bleibt, regelt PVueb gar nicht,
-   sondern die Box lädt nach ihren eigenen Einstellungen.
+Der Regler hat übrigens nie 6 A gesetzt — `Limit gesetzt: 6.0 A` kommt im
+gesamten Log nicht vor. Die 6 A sind der Eigenwert der Box.
+
+## Noch zu tun
+
+**Mitschnitt einschalten**: `PVUEB_RECORD_DIR=/data/recordings` in der `.env`
+auf dem Pi steht leer. Damit gäbe es eine Zeitreihe von `charge_w` gegen
+`current_limit` statt nur der Ereignisse aus dem Log.
 
 ## Behoben
 
