@@ -16,31 +16,44 @@ Eventuell Ladedaten könntest Du vom 192.168.100.2 herunterladen
 
 ---
 
-## Analyse (2026-07-23)
+## Was die Logs sagen (2026-07-23, `docker logs pvueb` vom Pi)
 
-Der Nachtzweig in `control_step` hat das Richtige gewollt:
+Vorhanden sind der 19.–21.07.; die Nacht 19.→20.07. ist die einzige mit einem
+angesteckten Fahrzeug. Der Befund passt **nicht** zur ersten Vermutung:
 
-```python
-if state.charging:
-    if state.current_limit != MAX_AMPS:
-        await charge_point.set_limit(MAX_AMPS)
-```
+- **Der Regler hat nie 6 A gesetzt.** Im gesamten Log kommt
+  `Limit gesetzt: 6.0 A` kein einziges Mal vor. Gesetzt wurden 7,1–9,1 A
+  (PV-Regelung am Tag) und 16,0 A (Nachtfenster). Die 6 A der Box stammen also
+  nicht aus dem `minpv`-Betrieb.
+- **Das Nachtfenster hat sauber gearbeitet.** Ab 00:00:04 ging alle paar Minuten
+  `Limit gesetzt: 16.0 A` raus, über Stunden.
+- **Die Box hat jeden Start abgelehnt:** `RemoteStart: Rejected`, Box-Status
+  `Preparing`. Zwischen 00:00 und 06:52 kam kein einziges `Charging`.
+- **Geladen wurde trotzdem** — laut FusionSolar 00:00–00:40 mit 4 kW. Der Regler
+  hat davon nichts gesehen: erst um 06:52:32 meldet die Box neun Sekunden lang
+  `Charging`, dann `Finishing` und `Transaktion beendet (meter 7425880 Wh)`.
+- **Die Box bootet täglich gegen 07:23**, also nach der Ladung, nicht davor.
 
-Nur hängt alles an `state.current_limit` — einem Merker, der still von der Box
-abweichen kann. Drei Wege dorthin, alle passen zum beobachteten Ablauf:
+Daraus folgt eine andere Erklärung als zunächst angenommen: **die Ladung lief
+außerhalb der OCPP-Transaktion des Reglers.** Die Box hat selbst gestartet (RFID
+oder App) und dabei ihre eigene Stromgrenze verwendet — den App-Slider, der laut
+[README](../README.md#hardware-voraussetzungen) zusätzlich zum OCPP-Limit
+deckelt. Ein `TxDefaultProfile` greift auf so eine Session nicht zu; genau
+deshalb half das manuelle Hochsetzen in der App sofort.
 
-1. **Die Box hat neu gebootet.** Die neue Authentifizierung im Smartphone deutet
-   genau darauf. `on_boot` hat den Merker nicht zurückgesetzt, also glaubte der
-   Regler weiter an sein zuletzt gesetztes Limit und schickte nie wieder eines.
-2. **`TxDefaultProfile` bei laufender Transaktion.** OCPP 1.6 verlangt, dass es
-   auch auf eine laufende Ladung wirkt; Boxen halten sich unterschiedlich streng
-   daran. Die 6 A stammen aus dem `minpv`-Betrieb davor.
-3. **Kein Nachfassen.** Einmal „Accepted", nie wieder geprüft. Ob das Profil
-   wirklich greift, hat der Regler nie erfahren.
+Beweisen lässt sich das nicht abschließend, weil der Mitschnitt nicht lief
+(`PVUEB_RECORD_DIR=` leer). Ohne ihn gibt es keine Zeitreihe von `charge_w`
+gegen `current_limit`.
 
-Die Simulation reproduziert das Symptom exakt: eine Box, die das Profil
-quittiert aber bei 6 A bleibt, lädt 4,1 kWh pro Stunde — die 4 kW aus den
-FusionSolar-Daten.
+## Zuerst zu tun
+
+1. **App-Slider der Wallbox auf 16 A** und dort lassen. Er deckelt unabhängig
+   vom OCPP-Profil und ist der wahrscheinlichste Grund für die 4 kW.
+2. **Mitschnitt einschalten**: `PVUEB_RECORD_DIR=/data/recordings` in der `.env`
+   auf dem Pi. Ohne ihn ist die nächste solche Nacht genauso wenig nachweisbar.
+3. Prüfen, warum die Box jeden `RemoteStart` mit `Rejected` beantwortet, obwohl
+   ein Fahrzeug angesteckt ist — solange das so bleibt, regelt PVueb gar nicht,
+   sondern die Box lädt nach ihren eigenen Einstellungen.
 
 ## Behoben
 
