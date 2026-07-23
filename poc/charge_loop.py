@@ -148,20 +148,19 @@ FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 WALLBOX_TOKEN_TTL_S = 45         # JWT hält rund 60 s, vorher erneuern
 WALLBOX_MIN_POLL_S = 30          # die Cloud aktualisiert nicht häufiger
 WALLBOX_STATUS = {               # nur die Zustände, die im Betrieb vorkommen
-    # 209/210 und 165 melden „locked". Gemeint ist die Autorisierung der Box
-    # selbst (App/RFID), nicht die Freigabe in PVueb — und ohne aktiviertes
-    # RFID steht sie dauerhaft, ohne etwas zu verhindern: die Ladung in der
-    # Nacht zum 23.07. lief trotzdem über RemoteStart. Deshalb wird der Zustand
-    # nur genannt, nicht als Hindernis ausgelegt.
+    # 165/209/210 melden „locked" — die Autorisierung der Box selbst (App/RFID),
+    # nicht die Freigabe in PVueb. Ohne aktiviertes RFID steht das dauerhaft und
+    # verhindert nichts: die Ladung in der Nacht zum 23.07. lief über
+    # RemoteStart trotzdem an. Der Text sagt deshalb nur, was der Fall ist.
     161: "bereit", 162: "bereit", 163: "kein Auto", 164: "wartet",
-    165: "kein Auto · Box nicht freigeschaltet",
+    165: "gesperrt",
     166: "aktualisiert", 177: "geplant", 178: "pausiert", 179: "geplant",
     180: "warte auf Auto", 181: "warte auf Auto", 182: "pausiert",
     183: "warte auf Auto", 184: "warte auf Auto", 185: "warte auf Auto",
     186: "warte auf Auto", 187: "warte auf Auto", 188: "warte auf Auto",
     189: "warte auf Auto", 193: "lädt", 194: "lädt", 195: "lädt",
-    196: "entlädt", 209: "kein Auto · Box nicht freigeschaltet",
-    210: "Auto verbunden · Box nicht freigeschaltet",
+    196: "entlädt", 209: "gesperrt, kein Auto",
+    210: "gesperrt, Auto verbunden",
 }
 AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
 # Nach Anmeldefehlern wird der Abstand verdoppelt. Hintergrund: Scheitert die
