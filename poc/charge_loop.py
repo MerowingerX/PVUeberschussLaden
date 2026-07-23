@@ -123,6 +123,10 @@ REG_GRID_POWER = 37113       # int32, W, positiv = Einspeisung (verifiziert 2026
 REG_BATTERY_SOC = 37760      # uint16, ×0,1 % (verifiziert 2026-07-15)
 REG_BATTERY_POWER = 37001    # int32, W, positiv = Laden
 REG_PV_POWER = 32080         # int32, W, AC-Wirkleistung des Wechselrichters
+# Was die Module liefern (DC-Eingang der Strings). Erst damit stimmt die
+# Hausbilanz: 32080 ist der AC-Ausgang und enthält die Batterie bereits — lädt
+# sie, ist er kleiner als die Dachleistung, entlädt sie, größer.
+REG_PV_DC_POWER = 32064      # int32, W, DC-Eingangsleistung
 # Batterie (37001) und Netz (37113) am Stück lesen — nacheinander gelesen
 # stammen sie aus verschiedenen Momenten und die Summe zappelt
 REG_BLOCK_START, REG_BLOCK_COUNT = REG_BATTERY_POWER, 114
@@ -144,13 +148,18 @@ FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 WALLBOX_TOKEN_TTL_S = 45         # JWT hält rund 60 s, vorher erneuern
 WALLBOX_MIN_POLL_S = 30          # die Cloud aktualisiert nicht häufiger
 WALLBOX_STATUS = {               # nur die Zustände, die im Betrieb vorkommen
-    161: "bereit", 162: "bereit", 163: "getrennt", 164: "wartet", 165: "gesperrt",
+    # „gesperrt" heißt hier immer: in der Wallbox-App gesperrt. Mit der Freigabe
+    # in PVueb hat es nichts zu tun — ohne den Zusatz liest sich das, als hätte
+    # der Regler die Box abgeschaltet.
+    161: "bereit", 162: "bereit", 163: "kein Auto", 164: "wartet",
+    165: "in der Wallbox-App gesperrt",
     166: "aktualisiert", 177: "geplant", 178: "pausiert", 179: "geplant",
     180: "warte auf Auto", 181: "warte auf Auto", 182: "pausiert",
     183: "warte auf Auto", 184: "warte auf Auto", 185: "warte auf Auto",
     186: "warte auf Auto", 187: "warte auf Auto", 188: "warte auf Auto",
     189: "warte auf Auto", 193: "lädt", 194: "lädt", 195: "lädt",
-    196: "entlädt", 209: "gesperrt", 210: "gesperrt, Auto verbunden",
+    196: "entlädt", 209: "in der Wallbox-App gesperrt",
+    210: "in der Wallbox-App gesperrt, Auto verbunden",
 }
 AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
 # Nach Anmeldefehlern wird der Abstand verdoppelt. Hintergrund: Scheitert die
@@ -206,7 +215,8 @@ class State:
     grid_w: float | None = None  # positiv = Einspeisung
     soc: float | None = None     # Batterie-SOC in %
     battery_w: float | None = None  # Batterie-Leistung, positiv = Laden
-    pv_w: float | None = None    # Erzeugung des Wechselrichters (AC)
+    pv_w: float | None = None    # Wechselrichter-Ausgang (AC, Batterie schon verrechnet)
+    pv_dc_w: float | None = None # was die Module liefern (DC-Eingang, Register 32064)
     modbus_block = True          # Batterie+Netz am Stück lesbar (SDongle-abhängig)
     charge_w = 0.0               # letzte bekannte Ladeleistung
     charge_w_seen: float | None = None   # Loop-Zeit der letzten Messung dazu
@@ -675,6 +685,12 @@ async def modbus_task(host: str):
                         )
                         if not pv_result.isError():
                             state.pv_w = decode_i32(pv_result.registers)
+                        await asyncio.sleep(0.3)
+                        pv_dc_result = await client.read_holding_registers(
+                            REG_PV_DC_POWER, count=2, device_id=1
+                        )
+                        if not pv_dc_result.isError():
+                            state.pv_dc_w = decode_i32(pv_dc_result.registers)
                         await asyncio.sleep(0.3)
                         soc_result = await client.read_holding_registers(
                             REG_BATTERY_SOC, count=1, device_id=1
@@ -1333,13 +1349,6 @@ INDEX_HTML = """<!doctype html>
 <h2>Debug</h2>
 <button id="frei" onclick="toggleRelease()">…</button>
 <div id="dbgstat"></div>
-<h2>Mindest-Ladestrom: <span id="minlabel2">6</span> A</h2>
-<div class="slider-row">
-  <input type="range" id="minamps" min="6" max="16" step="1"
-         oninput="document.getElementById('minlabel').textContent=this.value;
-                  document.getElementById('minlabel2').textContent=this.value"
-         onchange="setConfig({min_amps: +this.value})">
-</div>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
   <input type="range" id="heartbeat" min="5" max="120" step="5"
@@ -1491,10 +1500,12 @@ async function refresh() {
   const drows = [
     ["Box-Status (OCPP)", s.box_status],
     ["Limit", s.current_limit.toFixed(1) + " A"],
-    ["PV-Erzeugung", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
+    ["PV vom Dach", s.pv_dc_w === null || s.pv_dc_w === undefined ? "–"
+      : Math.round(s.pv_dc_w) + " W"],
+    ["Wechselrichter raus (AC)", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
     ["Hausverbrauch", s.house_w === null ? "–" : Math.round(s.house_w) + " W"],
     ...(s.wallbox_enabled ? [["Wallbox-Cloud", wallboxCloud()]] : []),
-    ["PV-Überschuss echt", s.pv_surplus_w === null ? "–"
+    ["Fürs Auto frei", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
     ["minpv-Hysterese", minpvInfo()],
     ["Netzanteil", gridShare()],
@@ -1524,12 +1535,7 @@ async function refresh() {
   renderAudi(row);
   for (const m of ["pv","minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
-  const mi = document.getElementById("minamps");
-  if (document.activeElement !== mi) {
-    mi.value = s.min_amps;
-    document.getElementById("minlabel").textContent = s.min_amps;
-    document.getElementById("minlabel2").textContent = s.min_amps;
-  }
+  document.getElementById("minlabel").textContent = s.min_amps;
   const hb = document.getElementById("heartbeat");
   if (document.activeElement !== hb) {
     hb.value = s.heartbeat_s;
@@ -1616,6 +1622,28 @@ async def http_index(_request):
     return web.Response(text=INDEX_HTML, content_type="text/html")
 
 
+def house_power() -> float | None:
+    """Hausverbrauch aus der Energiebilanz.
+
+    Alles, was die Module liefern, geht in die Batterie, ins Netz, ins Auto
+    oder ins Haus:
+
+        Haus = PV(DC) − Batterieladung − Einspeisung − Auto
+
+    Über die Dachleistung gerechnet, weil sie als einzige unabhängig von der
+    Batterie ist. Fehlt sie, tritt der AC-Ausgang an ihre Stelle; der hat die
+    Batterie schon verrechnet, weshalb sie dann nicht noch einmal abgezogen
+    werden darf.
+    """
+    if state.grid_w is None:
+        return None
+    if state.pv_dc_w is not None:
+        return state.pv_dc_w - (state.battery_w or 0) - state.grid_w - state.charge_w
+    if state.pv_w is None:
+        return None
+    return state.pv_w - state.grid_w - state.charge_w
+
+
 def status_dict() -> dict:
     """Alles, was UI und Mitschnitt brauchen — eine Quelle für beide."""
     return {
@@ -1630,9 +1658,13 @@ def status_dict() -> dict:
         "soc": state.soc,
         "battery_w": state.battery_w,
         "pv_w": state.pv_w,
-        # Was das Haus zieht: Erzeugung minus Einspeisung, Batterie und Auto
-        "house_w": None if state.pv_w is None or state.grid_w is None
-                   else state.pv_w - state.grid_w - (state.battery_w or 0) - state.charge_w,
+        "pv_dc_w": state.pv_dc_w,
+        # Was das Haus zieht. Aufgestellt über die Dachleistung, weil nur sie
+        # von der Batterie unabhängig ist: was die Module liefern, geht in die
+        # Batterie, ins Netz, ins Auto oder ins Haus. Ist 32064 nicht lesbar,
+        # bleibt der AC-Ausgang als Näherung — der enthält die Batterie bereits,
+        # deshalb dort ohne battery_w.
+        "house_w": house_power(),
         "modbus_block": state.modbus_block,
         "batt_target_soc": state.batt_target_soc,
         "batt_charge_w": state.batt_charge_w,
@@ -1701,7 +1733,7 @@ async def http_status(_request):
 # einmal je Datei in der Kopfzeile — sie ändern sich im Betrieb praktisch nie
 # und würden den Mitschnitt sonst um ein Vielfaches aufblähen.
 RECORD_FIELDS = (
-    "grid_w", "battery_w", "pv_w", "house_w", "soc",
+    "grid_w", "battery_w", "pv_w", "pv_dc_w", "house_w", "soc",
     "charge_w", "charge_w_src", "current_limit", "limit_effective",
     "charging", "box_status",
     "surplus_w", "pv_surplus_w", "pv_avg_w", "avg_active_s", "minpv_low_s",

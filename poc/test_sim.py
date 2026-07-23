@@ -134,8 +134,9 @@ class Sim:
         frei = self.box.real_amps
         amps = frei if self.car_amps is None else min(frei, self.car_amps(minute))
         self.load_w = max(0.0, amps) * WPA if s.charging else 0.0
-        # Erzeugung = Überschuss + Hauslast; der Regler liest sie aus Register 32080
-        s.pv_w = pv_w + self.house_w
+        # Erzeugung = Überschuss + Hauslast. Das Modell kennt keine
+        # DC/AC-Wandlung, also steht dieselbe Zahl in beiden Registern.
+        s.pv_w = s.pv_dc_w = pv_w + self.house_w
         # Was die Wallbox davon meldet — der Regler sieht nur das hier
         if self.meter == "ok":
             s.charge_w, s.charge_w_seen, s.charge_w_src = self.load_w, Sim.t, "gemessen"
