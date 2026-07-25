@@ -354,10 +354,13 @@ async def t9():
 
 
 async def t10():
-    sim = Sim(just_under, soc=50, mode="minpv")
+    # SOC unter boost_start_soc (50 %), Batterie nimmt nichts auf, damit er
+    # dort bleibt — sonst schöbe die Starthilfe die 0,3 A Lücke zu (Test 21)
+    sim = Sim(just_under, soc=45, mode="minpv", batt_charge_max=0)
     await sim.run(180)
-    report("TEST 10 — Dauerhaft 6,3 A bei minpv 6 A (Startschwelle 1,10 × 6 A = 6,6 A)", sim,
-           "Erwartet: kein Start — 6,3 A reichen für den minpv-Trigger nicht.")
+    report("TEST 10 — Dauerhaft 6,3 A bei minpv 6 A (Startschwelle 1,10 × 6 A = 6,6 A), SOC 45 %", sim,
+           "Erwartet: kein Start — 6,3 A reichen für den minpv-Trigger nicht, und die "
+           "Starthilfe der Batterie ist unter 50 % SOC gesperrt.")
 
 
 async def t11():
@@ -476,8 +479,36 @@ async def t20():
         c.in_night_window = orig
 
 
+async def t21():
+    """Starthilfe aus der Hausbatterie (PVUEB_BOOST_START_W).
+
+    Dieselbe Kurve wie Test 10, nur mit voller Batterie: 6,3 A PV fehlen 0,3 A
+    (207 W) zur minpv-Startschwelle. Die Batterie legt sie drauf, danach trägt
+    der normale Boost (2500 W) die Ladung — die Stopp-Schwellen bleiben
+    unangetastet, weil das 10-min-Mittel weiter über der Resume-Schwelle liegt.
+    """
+    sim = Sim(just_under, soc=70, mode="minpv")
+    await sim.run(180)
+    report("TEST 21 — wie Test 10, aber SOC 70 % (Starthilfe 500 W)", sim,
+           "Erwartet: Start trotz 6,3 A, danach stabile Ladung ohne Stopp-Start-Kreisel "
+           "und ohne nennenswerten Netzbezug.")
+
+
+async def t22():
+    """Starthilfe abgeschaltet — Verhalten wie vor dem Feature."""
+    orig = c.state.boost_start_w
+    c.state.boost_start_w = 0
+    try:
+        sim = Sim(just_under, soc=70, mode="minpv")
+        await sim.run(180)
+        report("TEST 22 — wie Test 21, aber PVUEB_BOOST_START_W=0", sim,
+               "Erwartet: kein Start — ohne Starthilfe bleibt es beim alten Verhalten.")
+    finally:
+        c.state.boost_start_w = orig
+
+
 TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18,
-         t19, t20]
+         t19, t20, t21, t22]
 
 
 JSON_OUT = ""
@@ -488,6 +519,7 @@ async def main():
     c.log.disabled = True                              # Regler-Logs aus, Tabelle zählt
     c.state.avg_window_s = 600
     c.state.boost_w, c.state.boost_wh, c.state.boost_min_soc = 2500, 5000, 30.0
+    c.state.boost_start_w, c.state.boost_start_soc = 500, 50.0
     args = sys.argv[1:]
     if "--json" in args:
         i = args.index("--json")

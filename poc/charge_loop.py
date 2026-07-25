@@ -43,7 +43,11 @@ Batterie-Boost (PVUEB_BOOST_*): bricht die PV-Leistung
 kurz ein (Wolke), schiebt die Hausbatterie bis zu PVUEB_BOOST_W nach, statt die
 Ladung herunterzuregeln — Tagesbudget PVUEB_BOOST_W × PVUEB_BOOST_H, nur bei
 laufender Ladung und SOC über PVUEB_BOOST_MIN_SOC. Nachgeladen wird die
-Batterie danach aus PV oder nachts über die Netzladung.
+Batterie danach aus PV oder nachts über die Netzladung. Ist die Batterie voll
+genug (SOC über PVUEB_BOOST_START_SOC), steuert sie mit PVUEB_BOOST_START_W
+auch zur Startentscheidung bei — der Start scheitert sonst oft an wenigen
+hundert Watt, obwohl die Batterie sie mühelos deckt. Bewusst kleiner als der
+Wolkenloch-Boost: das Auto soll aus PV laden, nicht aus der Hausbatterie.
 
 Batterie-Netzladung (LUNA2000-Zwangsladung, Register verifiziert 2026-07-16):
 lädt mit PVUEB_BATT_CHARGE_W bis PVUEB_BATT_TARGET_SOC, der Wechselrichter
@@ -199,6 +203,8 @@ class State:
     boost_w = 2500               # Batterie darf so viel ins Auto nachschieben (aus .env)
     boost_wh = 5000              # Tagesbudget dafür, 0 = Boost aus (aus .env)
     boost_min_soc = 30.0         # darunter kein Boost mehr (aus .env)
+    boost_start_w = 500          # so viel steuert die Batterie zum Start bei, 0 = aus (aus .env)
+    boost_start_soc = 50.0       # Starthilfe erst ab diesem SOC (aus .env)
     boost_used_wh = 0.0          # heute schon verbrauchtes Boost-Budget
     boost_day: datetime.date | None = None  # Tag, für den boost_used_wh gilt
     boost_last_t: float | None = None       # Loop-Zeit des letzten Boost-Takts
@@ -1184,12 +1190,25 @@ async def control_step(now: float):
     # Batterie-Entladung täuscht Überschuss nur vor (Netzpunkt bleibt ~0)
     pv_surplus = surplus + (state.battery_w or 0)
     pv_avg = pv_average(now, pv_surplus)
-    # Boost erst ab laufender Ladung: die Batterie hält eine Ladung durch
-    # Wolken, startet sie aber nicht
-    boost = boost_allowance(now) if state.charging else 0.0
-    # Ziel ist der Mittelwert, gedeckelt auf das, was gerade wirklich da
-    # ist (PV + Batterie-Boost) — sonst zöge die Lücke Strom aus dem Netz
-    avail = min(pv_avg, pv_surplus + boost)
+    allowance = boost_allowance(now)   # bucht Verbrauch, darum immer aufrufen
+    # Wolkenloch-Boost: nur bei laufender Ladung. Er hebt das Ziel nicht an,
+    # sondern deckelt es weicher — die Batterie füllt Einbrüche unter dem
+    # Mittelwert auf, statt die Ladung herunterzuregeln.
+    bridge = allowance if state.charging else 0.0
+    # Starthilfe: ist die Batterie voll genug, steuert sie einen festen Betrag
+    # zum verfügbaren Überschuss bei — anders als der Boost hebt sie das Ziel
+    # wirklich an, sonst käme keine Ladung über die Startschwelle. Sie bleibt
+    # auch während der Ladung stehen; fiele sie beim Start weg, ruderte der
+    # Regler sofort in die Stopp-Schwelle zurück. Klein gehalten, damit das
+    # Auto aus PV lädt und nicht aus der Hausbatterie.
+    help_w = (state.boost_start_w if allowance and state.soc is not None
+              and state.soc >= state.boost_start_soc else 0.0)
+    # Ziel ist der Mittelwert (plus Starthilfe), gedeckelt auf das, was gerade
+    # wirklich da ist — sonst zöge die Lücke Strom aus dem Netz. Der Deckel
+    # nimmt den größeren der beiden Batterie-Beiträge, nicht ihre Summe: mehr
+    # als das Boost-Budget darf die Batterie nie liefern.
+    avail = min(pv_avg + help_w, pv_surplus + max(bridge, help_w))
+    boost = max(bridge, help_w)        # nur noch für Log und Anzeige
     amps = target_amps(avail)
     min_w = state.min_amps * VOLTAGE * PHASES
     if state.mode == "minpv":
@@ -1205,8 +1224,10 @@ async def control_step(now: float):
             state.surplus_since = state.surplus_since or now
             if now - state.surplus_since >= state.start_delay_s:
                 if state.start_retry_at is None:
-                    log.info("Überschuss %.0f W seit %ds — starte Ladung mit %.1f A",
-                             surplus, state.start_delay_s, amps)
+                    log.info("Überschuss %.0f W seit %ds%s — starte Ladung mit %.1f A",
+                             surplus, state.start_delay_s,
+                             " (davon %.0f W Starthilfe der Batterie)" % boost if boost else "",
+                             amps)
                 await try_start(now, amps)
         else:
             state.surplus_since = None
@@ -1459,7 +1480,13 @@ function minpvInfo() {
       + Math.round(s.minpv_resume_factor * minW) + " W";
   }
   if (s.charging) return "lädt – Timeout ab < " + Math.round(s.minpv_pause_factor * minW) + " W";
-  return "wartet – Start ab " + Math.round(s.minpv_start_factor * minW) + " W";
+  // Die Starthilfe der Batterie senkt den nötigen PV-Überschuss um ihren Betrag
+  const hilfe = (s.boost_start_w && s.boost_wh && s.soc !== null
+                 && s.soc >= s.boost_start_soc && s.soc >= s.boost_min_soc
+                 && s.boost_used_wh < s.boost_wh) ? s.boost_start_w : 0;
+  const schwelle = Math.round(s.minpv_start_factor * minW) - hilfe;
+  return "wartet – Start ab " + schwelle + " W"
+         + (hilfe ? " (inkl. " + hilfe + " W Starthilfe 🔋)" : "");
 }
 function boostInfo() {
   if (!s.boost_wh) return "aus";
@@ -1470,7 +1497,12 @@ function boostInfo() {
   if (rest <= 0) return "Budget heute aufgebraucht";
   if (s.charging && s.battery_w !== null && s.battery_w < 0)
     return "🔋→🚗 " + Math.round(Math.min(-s.battery_w, s.boost_w)) + " W – " + budget;
-  return "bereit, max " + s.boost_w + " W – " + budget;
+  if (s.charging) return "bereit, max " + s.boost_w + " W – " + budget;
+  // Vor dem Start zählt nur die kleinere Starthilfe
+  if (!s.boost_start_w) return "bereit, max " + s.boost_w + " W – " + budget;
+  if (s.soc === null || s.soc < s.boost_start_soc)
+    return "bereit, max " + s.boost_w + " W – Starthilfe ab " + s.boost_start_soc + " % SOC";
+  return "Starthilfe " + s.boost_start_w + " W bereit – " + budget;
 }
 function gridShare() {
   if (s.grid_w === null) return "–";
@@ -1716,6 +1748,8 @@ def status_dict() -> dict:
         "boost_wh": state.boost_wh,
         "boost_used_wh": round(state.boost_used_wh),
         "boost_min_soc": state.boost_min_soc,
+        "boost_start_w": state.boost_start_w,
+        "boost_start_soc": state.boost_start_soc,
         "minpv_timeout_s": state.minpv_timeout_s,
         "minpv_start_factor": state.minpv_start_factor,
         "minpv_pause_factor": state.minpv_pause_factor,
@@ -2027,11 +2061,15 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
             ("PVUEB_START_RETRY_S", state.start_retry_s,
              "Grundabstand zwischen Startversuchen, verdoppelt sich bei Ablehnung"),
         ]),
-        ("Batterie-Boost bei Wolkenlöchern", [
+        ("Batterie-Boost: Wolkenlöcher und Ladestart", [
             ("PVUEB_BOOST_W", state.boost_w, "Leistung, die die Hausbatterie nachschiebt"),
             ("PVUEB_BOOST_H", round(state.boost_wh / state.boost_w, 2) if state.boost_w else 0,
              "Tagesbudget in Stunden dieser Leistung, 0 = Boost aus"),
             ("PVUEB_BOOST_MIN_SOC", state.boost_min_soc, "Darunter kein Boost mehr"),
+            ("PVUEB_BOOST_START_W", state.boost_start_w,
+             "Beitrag der Batterie zur Startentscheidung, 0 = keine Starthilfe"),
+            ("PVUEB_BOOST_START_SOC", state.boost_start_soc,
+             "Starthilfe erst ab diesem SOC, muss >= PVUEB_BOOST_MIN_SOC sein"),
         ]),
         ("Batterie-Netzladung im Nachtfenster", [
             ("PVUEB_BATT_LOW_SOC", state.batt_low_soc, "Automatik startet unter diesem SOC"),
@@ -2176,6 +2214,14 @@ async def main():
     state.boost_min_soc = float(os.environ.get("PVUEB_BOOST_MIN_SOC", "30"))
     if state.boost_w < 0 or state.boost_wh < 0 or not 0 <= state.boost_min_soc <= 100:
         sys.exit("PVUEB_BOOST_W/_H müssen >= 0 sein, PVUEB_BOOST_MIN_SOC 0–100")
+    state.boost_start_w = int(os.environ.get("PVUEB_BOOST_START_W", "500"))
+    state.boost_start_soc = float(os.environ.get("PVUEB_BOOST_START_SOC", "50"))
+    if state.boost_start_w < 0 or not 0 <= state.boost_start_soc <= 100:
+        sys.exit("PVUEB_BOOST_START_W muss >= 0 sein, PVUEB_BOOST_START_SOC 0–100")
+    # Unter boost_min_soc endet der Boost: eine damit gestartete Ladung fiele
+    # sofort wieder auf den nackten PV-Überschuss zurück und stoppte.
+    if state.boost_start_w and state.boost_start_soc < state.boost_min_soc:
+        sys.exit("PVUEB_BOOST_START_SOC muss >= PVUEB_BOOST_MIN_SOC sein")
     state.poll_interval_s = int(os.environ.get("PVUEB_POLL_INTERVAL_S", "5"))
     state.adjust_min_interval_s = int(os.environ.get("PVUEB_ADJUST_MIN_INTERVAL_S", "25"))
     state.limit_refresh_s = int(os.environ.get("PVUEB_LIMIT_REFRESH_S", "300"))
