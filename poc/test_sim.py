@@ -117,6 +117,7 @@ class Sim:
         s.surplus_since = s.deficit_since = s.minpv_low_since = None
         s.last_adjust = 0.0
         s.boost_used_wh, s.boost_day, s.boost_last_t = 0.0, None, None
+        s.perma_boost_aktiv = False
         s.soc, s.battery_w, s.grid_w = soc, 0.0, 0.0
         s.poll_interval_s = DT
         s.start_retry_s, s.box_status = 30, "Preparing"
@@ -483,32 +484,60 @@ async def t21():
     """Starthilfe aus der Hausbatterie (PVUEB_BOOST_START_W).
 
     Dieselbe Kurve wie Test 10, nur mit voller Batterie: 6,3 A PV fehlen 0,3 A
-    (207 W) zur minpv-Startschwelle. Die Batterie legt sie drauf, danach trägt
-    der normale Boost (2500 W) die Ladung — die Stopp-Schwellen bleiben
-    unangetastet, weil das 10-min-Mittel weiter über der Resume-Schwelle liegt.
+    (207 W) zur minpv-Startschwelle. Die Batterie legt sie drauf. Danach liegt
+    die PV über der Mindestleistung, die Starthilfe wird also nicht mehr
+    gebraucht — die Ladung läuft aus PV weiter, ohne Budget zu verbrauchen.
     """
-    sim = Sim(just_under, soc=70, mode="minpv")
-    await sim.run(180)
-    report("TEST 21 — wie Test 10, aber SOC 70 % (Starthilfe 500 W)", sim,
+    # Dauer-Boost aus: er würde die Starthilfe überlagern, die hier geprüft wird
+    orig = c.state.perma_boost_w
+    c.state.perma_boost_w = 0
+    try:
+        sim = Sim(just_under, soc=70, mode="minpv")
+        await sim.run(180)
+    finally:
+        c.state.perma_boost_w = orig
+    report("TEST 21 — wie Test 10, aber SOC 70 % (Starthilfe 500 W, Dauer-Boost aus)", sim,
            "Erwartet: Start trotz 6,3 A, danach stabile Ladung ohne Stopp-Start-Kreisel "
            "und ohne nennenswerten Netzbezug.")
 
 
 async def t22():
     """Starthilfe abgeschaltet — Verhalten wie vor dem Feature."""
-    orig = c.state.boost_start_w
-    c.state.boost_start_w = 0
+    orig, orig_perma = c.state.boost_start_w, c.state.perma_boost_w
+    c.state.boost_start_w = c.state.perma_boost_w = 0
     try:
         sim = Sim(just_under, soc=70, mode="minpv")
         await sim.run(180)
         report("TEST 22 — wie Test 21, aber PVUEB_BOOST_START_W=0", sim,
                "Erwartet: kein Start — ohne Starthilfe bleibt es beim alten Verhalten.")
     finally:
-        c.state.boost_start_w = orig
+        c.state.boost_start_w, c.state.perma_boost_w = orig, orig_perma
+
+
+async def t23():
+    """Dauer-Boost bei voller Batterie (PVUEB_PERMA_BOOST_*).
+
+    Sonniger Tag, Batterie steht schon auf 95 % und kann nichts mehr aufnehmen.
+    Der Dauer-Boost schiebt 1000 W obendrauf, bis der SOC auf 50 % gefallen
+    ist; danach regelt der Rest wie gehabt weiter.
+    """
+    sim = Sim(sunny, soc=95, mode="minpv")
+    await sim.run(480)
+    report("TEST 23 — sonniger Tag, Batterie voll (SOC 95 %), Dauer-Boost 1000 W", sim,
+           "Erwartet: mehr im Auto als in Test 1, SOC fällt bis 50 % und bleibt dort — "
+           "unter der Abschaltschwelle kein weiterer Dauer-Boost.")
+
+
+async def t24():
+    """Hysterese: knapp unter der oberen Schwelle springt nichts an."""
+    sim = Sim(sunny, soc=85, mode="minpv", batt_charge_max=0)
+    await sim.run(480)
+    report("TEST 24 — wie Test 23, aber SOC 85 % und Batterie nimmt nichts auf", sim,
+           "Erwartet: kein Dauer-Boost — er startet erst ab 90 %, nicht schon knapp darunter.")
 
 
 TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18,
-         t19, t20, t21, t22]
+         t19, t20, t21, t22, t23, t24]
 
 
 JSON_OUT = ""
@@ -520,6 +549,9 @@ async def main():
     c.state.avg_window_s = 600
     c.state.boost_w, c.state.boost_wh, c.state.boost_min_soc = 2500, 5000, 30.0
     c.state.boost_start_w, c.state.boost_start_soc = 500, 50.0
+    c.state.batt_max_w = 2500
+    c.state.perma_boost_w = 1000
+    c.state.perma_boost_on_soc, c.state.perma_boost_off_soc = 90.0, 50.0
     args = sys.argv[1:]
     if "--json" in args:
         i = args.index("--json")

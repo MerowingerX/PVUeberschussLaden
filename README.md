@@ -48,7 +48,17 @@ aber trotzdem zügig.
   Ladung durch. So wird aus einer vorbeiziehenden Wolke kein Start-Stopp-Zyklus.
 - **Batterie-Boost**: Während einer laufenden Ladung schiebt die Hausbatterie bis zu
   einer einstellbaren Leistung nach, statt das Ladelimit herunterzuregeln — mit
-  Tagesbudget und SOC-Untergrenze. Startet nie eine Ladung, hält nur eine bestehende.
+  Tagesbudget und SOC-Untergrenze.
+- **Dauer-Boost aus voller Batterie**: Steht die Hausbatterie über 90 % (einstellbar),
+  schiebt sie dauerhaft 1000 W ins Auto, bis sie auf 50 % abgesunken ist — sonst ginge
+  der Überschuss eines sonnigen Tages für ein paar Cent ins Netz. Die beiden Schwellen
+  sind eine Hysterese und ersetzen ein Tagesbudget. Nachgeladen wird die Batterie im
+  normalen Ablauf wieder, spätestens abends unter der Mindestladeleistung. Details:
+  [features/feature_PermanentBoost.md](features/feature_PermanentBoost.md)
+- **Starthilfe aus der Batterie**: Fehlen zur Startschwelle nur ein paar hundert Watt,
+  füllt eine ausreichend volle Batterie sie auf (Standard 500 W ab 50 % SOC), statt die
+  Ladung ganz ausfallen zu lassen. Gefüllt wird nur die Lücke — reicht die PV, kostet
+  die Starthilfe nichts. Sie zählt auf dasselbe Tagesbudget wie der Boost.
 - **Nachttarif-Automatik** (abschaltbar): im Tariffenster (Standard 00:00–08:00)
   lädt ein freigegebenes Fahrzeug mit voller Leistung
 - **Hausbatterie aus dem Netz laden** (LUNA2000-Zwangsladung, Register verifiziert,
@@ -70,11 +80,23 @@ aber trotzdem zügig.
   `limit_effective` im Status auf `false`. Ohne das lud das Auto eine Nacht lang
   mit 6 A statt 16 A, während der Regler 16 A für gesetzt hielt
   ([docs/issue_limit_to_6A.md](docs/issue_limit_to_6A.md)).
+- **Neustart ohne Ladeunterbrechung**: Der Dienst sichert seinen Laufzeitzustand bei
+  jeder Änderung und zusätzlich jede Minute — mit SHA-256 in der Kopfzeile gegen
+  beschädigte Dateien und, weil der Pi keine gepufferte Uhr hat, mit Boot-Kennung,
+  Systemlaufzeit und dem NTP-Zustand des Kernels gegen eine springende Uhr.
+  Startet er binnen 10 Minuten neu,
+  übernimmt er Freigabe, Modus und vor allem die laufende OCPP-Transaktion und regelt
+  weiter — Wallbox, Wechselrichter und Auto merken nichts. Ältere Sicherungen gelten als
+  beendete Sitzung und werden verworfen. Details:
+  [features/feature_NeustartOhneUnterbrechung.md](features/feature_NeustartOhneUnterbrechung.md)
+- **Startverhalten ohne Sicherung**: freigegeben, Modus `minpv` mit 6 A. Die Anlage
+  arbeitet nach einem Strom- oder Softwareausfall von allein weiter.
 - **Web-UI** fürs Handy, fünf Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
   Ladeleistung, Freigabe, Modus, Nachtautomatik) · *Huawei-Batterie* (SOC, Leistung,
   Netzladung, Prognose) · *Wallbox* (gemessene Ladeleistung, Sitzungsenergie, Firmware) ·
-  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Schieberegler) ·
-  *Audi Q4* (Ladestand, Reichweite, Stecker)
+  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Schieberegler,
+  Version) · *Audi Q4* (Ladestand, Reichweite, Stecker). Dazu `/info`: Commit, Bauzeit,
+  Laufzeit und was der Start aus der Sitzungssicherung gemacht hat.
 - **Ladeleistung als Referenz** (optional, `PVUEB_WALLBOX_*`): Die Pulsar Plus meldet ihre
   Ladeleistung nicht über OCPP, liefert sie aber an die Hersteller-Cloud
   ([API-Doku](https://github.com/SKB-CGN/wallbox)). Von dort abgerufen dient sie nur der
@@ -209,7 +231,7 @@ Die vollständige Liste mit Defaults und Erklärungen steht in
 | minpv-Trigger | Start-, Pause- und Resume-Faktor, Timeout für Wolkenlöcher |
 | Mittelung | Fensterbreite beim Regeln und beim Starten |
 | Ladelimit | Raster und Totzone der Limit-Anpassung |
-| Batterie-Boost | Leistung, Tagesbudget, SOC-Untergrenze |
+| Batterie-Boost | Leistung, Tagesbudget, SOC-Untergrenze, Starthilfe (Leistung und SOC) |
 | Batterie-Netzladung | Start-SOC, Ziel-SOC, Ladeleistung, Prognoseschwelle |
 | Messwerte der Box | Höchstalter der gemeldeten Ladeleistung |
 | Startversuche | Grundabstand des Backoffs |

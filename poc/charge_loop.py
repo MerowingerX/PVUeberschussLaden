@@ -43,11 +43,18 @@ Batterie-Boost (PVUEB_BOOST_*): bricht die PV-Leistung
 kurz ein (Wolke), schiebt die Hausbatterie bis zu PVUEB_BOOST_W nach, statt die
 Ladung herunterzuregeln — Tagesbudget PVUEB_BOOST_W × PVUEB_BOOST_H, nur bei
 laufender Ladung und SOC über PVUEB_BOOST_MIN_SOC. Nachgeladen wird die
-Batterie danach aus PV oder nachts über die Netzladung. Ist die Batterie voll
-genug (SOC über PVUEB_BOOST_START_SOC), steuert sie mit PVUEB_BOOST_START_W
-auch zur Startentscheidung bei — der Start scheitert sonst oft an wenigen
-hundert Watt, obwohl die Batterie sie mühelos deckt. Bewusst kleiner als der
-Wolkenloch-Boost: das Auto soll aus PV laden, nicht aus der Hausbatterie.
+Batterie danach aus PV oder nachts über die Netzladung. Dauer-Boost
+(PVUEB_PERMA_BOOST_*): steht die Batterie über der oberen SOC-Schwelle, kann
+sie ohnehin nichts mehr aufnehmen — sie schiebt dann dauerhaft eine feste
+Leistung ins Auto, bis die untere Schwelle erreicht ist. Alle Boosts zusammen
+sind auf PVUEB_BATT_MAX_W gedeckelt, die Entladegrenze der Batterie; was der
+Wechselrichter nicht liefern kann, käme sonst aus dem Netz. Starthilfe: ist die
+Batterie voll genug (SOC über PVUEB_BOOST_START_SOC), füllt sie bis zu
+PVUEB_BOOST_START_W an der Startschwelle fehlende Leistung auf — sonst bliebe
+die Ladung wegen einer Handvoll Watt aus. Nur die Lücke, nicht pauschal: liegt
+die PV über der Schwelle, kostet die Starthilfe nichts. Bei laufender Ladung
+füllt sie bis zur Mindestleistung, damit der Start nicht direkt in die
+Stopp-Schwelle zurückfällt.
 
 Batterie-Netzladung (LUNA2000-Zwangsladung, Register verifiziert 2026-07-16):
 lädt mit PVUEB_BATT_CHARGE_W bis PVUEB_BATT_TARGET_SOC, der Wechselrichter
@@ -80,14 +87,17 @@ import argparse
 import asyncio
 import base64
 import collections
+import ctypes
 import datetime
 import enum
+import hashlib
 import json
 import logging
 import os
 import secrets
 import shutil
 import re
+import subprocess
 import sys
 
 import aiohttp
@@ -108,6 +118,37 @@ from pymodbus.client import AsyncModbusTcpClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("loop")
 logging.getLogger("ocpp").setLevel(logging.WARNING)
+
+
+def software_version() -> dict:
+    """Was hier gerade läuft: Commit, Beschreibung, Bauzeit.
+
+    Im Container gibt es kein Git-Verzeichnis, deshalb zählen zuerst die beim
+    Bauen gesetzten Variablen (Dockerfile-ARGs, siehe Makefile-Ziel `image`).
+    Läuft der Dienst direkt aus dem Arbeitsverzeichnis, fragt er Git selbst —
+    dann steht bei ungespeicherten Änderungen ein „-dirty" hinter dem Commit.
+    """
+    info = {"commit": os.environ.get("PVUEB_GIT_COMMIT", ""),
+            "beschreibung": os.environ.get("PVUEB_GIT_DESCRIBE", ""),
+            "gebaut": os.environ.get("PVUEB_BUILD_TIME", ""),
+            "quelle": "Build" if os.environ.get("PVUEB_GIT_COMMIT") else "Git"}
+    if not info["commit"]:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            ruf = ["git", "-C", repo, "describe", "--always", "--dirty", "--tags"]
+            info["beschreibung"] = subprocess.run(
+                ruf, capture_output=True, text=True, timeout=5).stdout.strip()
+            info["commit"] = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not info["commit"]:
+        info["commit"], info["quelle"] = "unbekannt", "unbekannt"
+    return info
+
+
+VERSION = software_version()
 
 # --- Anlagenkonstanten (bewusst fest verdrahtet, siehe PLAN.md Designprinzip) ---
 PHASES = 3
@@ -178,10 +219,31 @@ AUDI_MAX_ERROR_BACKOFF_S = 30 * 60   # Netz-/Cloud-Fehler: höchstens alle 30 mi
 AUDI_TOKENSTORE = os.path.join(os.path.dirname(__file__), ".audi-tokenstore.json")
 AUDI_CACHE = os.path.join(os.path.dirname(__file__), ".audi-cache.json")
 
+# Sitzung über einen Neustart retten (PVUEB_SESSION_FILE). Der Regler hält
+# Zustand, den ihm niemand zurückgeben kann — vor allem die ID der laufenden
+# OCPP-Transaktion. Ohne sie kann er eine Ladung, die er nicht selbst gestartet
+# hat, weder stoppen noch geordnet regeln: Wallbox, Wechselrichter und Auto
+# laden weiter, nur der Regler steht daneben. Mit Sicherung merkt keines der
+# drei Geräte etwas von einem Neustart.
+SESSION_MAX_AGE_S = 600          # ältere Sicherung: Sitzung gilt als beendet
+# Der Zeitstempel der Sicherung ist zugleich das Maß für die Ausfallzeit —
+# der Takt muss deutlich feiner sein als die Grenze, sonst gilt ein Ausfall
+# von sechs Minuten als elf und die Sitzung ginge verloren. Eine Datei von
+# ~400 Byte je Minute fällt neben dem Mitschnitt (alle 10 s) nicht auf.
+SESSION_SAVE_INTERVAL_S = 60     # zusätzlich zum Sichern bei jeder Änderung
+SESSION_CLOCK_TOLERANCE_S = 5    # so viel Zeitstempel-Vorlauf ist Uhrendrift, kein Sprung
+CLOCK_WAIT_MAX_S = 15            # so lange auf NTP warten, bevor die Sitzung bewertet wird
+TIME_ERROR = 5                   # adjtimex(2): Uhr nicht synchronisiert (STA_UNSYNC)
+
 
 class State:
-    mode = "pv"                  # pv | minpv | fast
-    released = False             # manuelle Freigabe (Knopfdruck)
+    # Startverhalten ohne gültige Sicherung: freigegeben, PV-Minimum mit 6 A.
+    # Das ist der Betriebsfall — die Anlage soll nach einem Strom- oder
+    # Softwareausfall von allein weiterarbeiten, nicht auf einen Knopfdruck
+    # warten. Wer das nicht will, nimmt die Freigabe im Web-UI zurück; sie
+    # überlebt dann über die Sicherung.
+    mode = "minpv"               # pv | minpv | fast
+    released = True              # Freigabe für den Regler (im Web-UI umschaltbar)
     min_amps = MIN_AMPS          # Untergrenze im Modus minpv (justierbar im UI)
     night_enabled = True         # Nachtladen-Automatik an/aus
     heartbeat_s = 10             # OCPP-Heartbeat der Box (justierbar im UI, Default aus .env)
@@ -203,8 +265,13 @@ class State:
     boost_w = 2500               # Batterie darf so viel ins Auto nachschieben (aus .env)
     boost_wh = 5000              # Tagesbudget dafür, 0 = Boost aus (aus .env)
     boost_min_soc = 30.0         # darunter kein Boost mehr (aus .env)
-    boost_start_w = 500          # so viel steuert die Batterie zum Start bei, 0 = aus (aus .env)
+    boost_start_w = 500          # so viel Lücke zur Startschwelle füllt die Batterie, 0 = aus (aus .env)
     boost_start_soc = 50.0       # Starthilfe erst ab diesem SOC (aus .env)
+    batt_max_w = 2500            # was die Hausbatterie höchstens abgeben kann (aus .env)
+    perma_boost_w = 1000         # Dauer-Boost aus voller Batterie, 0 = aus (aus .env)
+    perma_boost_on_soc = 90.0    # ab diesem SOC springt er an (aus .env)
+    perma_boost_off_soc = 50.0   # bis hierher darf er die Batterie leeren (aus .env)
+    perma_boost_aktiv = False    # Hysterese-Merker zwischen den beiden Schwellen
     boost_used_wh = 0.0          # heute schon verbrauchtes Boost-Budget
     boost_day: datetime.date | None = None  # Tag, für den boost_used_wh gilt
     boost_last_t: float | None = None       # Loop-Zeit des letzten Boost-Takts
@@ -232,6 +299,10 @@ class State:
     charge_energy_wh: float | None = None   # letzter Zählerstand der Box
     charge_energy_t: float | None = None    # Loop-Zeit dazu
     charging = False
+    # Die ID der laufenden OCPP-Transaktion. Sie steht bewusst hier und nicht
+    # am ChargePoint: ohne sie lässt sich eine Ladung nicht stoppen, und sie
+    # muss deshalb einen Neustart überleben (save_session).
+    transaction_id: int | None = None
     current_limit = 0.0          # zuletzt gesetztes Limit in A (Raster limit_step_a)
     limit_known = False          # gilt current_limit noch? (nach Box-Boot: nein)
     limit_set_t = 0.0            # Loop-Zeit des letzten gesendeten Limits
@@ -278,6 +349,313 @@ class State:
     wallbox_error: str | None = None       # letzter Fehler, für die UI
     last_wallbox_ok: float | None = None   # Unix-Zeit des letzten erfolgreichen Abrufs
     last_audi_ok: float | None = None      # Unix-Zeit: letzter erfolgreicher Abruf
+    session_file = ""            # Ablage der Sitzungssicherung, leer = Standardpfad (aus .env)
+    session_note = "frischer Start"        # was der Start aus der Sicherung machte, fürs UI
+    started_at: float = 0.0                # Unix-Zeit des Prozessstarts
+
+
+def session_path() -> str:
+    """Wo die Sitzungssicherung liegt.
+
+    Ohne PVUEB_SESSION_FILE bevorzugt der Mitschnitt-Ordner: der liegt im
+    Container auf einem Volume und überlebt damit auch ein `up --build`, das
+    den Container selbst wegwirft. Sonst neben dem Skript.
+    """
+    if state.session_file:
+        return state.session_file
+    if state.record_dir:
+        return os.path.join(state.record_dir, "session.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".session.json")
+
+
+def system_marken() -> tuple[str | None, float | None]:
+    """Boot-Kennung und Systemlaufzeit — Anker gegen eine springende Uhr.
+
+    Der Pi hat keine gepufferte Uhr. Nach einem Stromausfall startet er mit
+    der Zeit, die fake-hwclock zuletzt gemerkt hat, und springt erst mit dem
+    ersten NTP-Kontakt auf die Wirklichkeit. In diesem Fenster ist jede
+    Differenz zweier Wanduhr-Zeitstempel wertlos: Eine drei Stunden alte
+    Sicherung sähe taufrisch aus.
+
+    Die Boot-Kennung wechselt bei jedem Systemstart, die Laufzeit steigt
+    monoton. Zusammen sagen sie unabhängig von der Uhr, wieviel Zeit seit dem
+    Schreiben mindestens vergangen ist. Im Container kommen beide vom Host —
+    ein Container-Neustart zählt damit richtigerweise als derselbe Boot.
+    """
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as fh:
+            boot_id = fh.read().strip()
+    except OSError:
+        boot_id = None
+    try:
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        uptime = None
+    return boot_id, uptime
+
+
+def uhr_synchron() -> bool | None:
+    """Hält der Kernel seine Uhr für diszipliniert? True/False, None = keine Auskunft.
+
+    `adjtimex(2)` mit einem genullten Puffer ist ein reiner Lesezugriff (modes=0)
+    und antwortet mit dem Zeitzustand; TIME_ERROR (5) bedeutet STA_UNSYNC, die
+    Uhr läuft also frei. Der Weg funktioniert auch im Container: Die Systemzeit
+    gehört dem Kernel des Hosts, ein NTP-Client im Image wäre weder nötig noch
+    hilfreich. `timedatectl` scheidet gerade deshalb aus — es setzt systemd im
+    Container voraus.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        puffer = ctypes.create_string_buffer(512)   # großzügig; struct timex ist kleiner
+        zustand = libc.adjtimex(puffer)
+    except (OSError, AttributeError):
+        return None
+    if zustand < 0:
+        return None
+    return zustand != TIME_ERROR
+
+
+async def auf_uhr_warten(max_s: int = CLOCK_WAIT_MAX_S):
+    """Vor der Sitzungsbewertung kurz auf NTP warten.
+
+    Nach einem Stromausfall startet der Pi mit der Zeit von fake-hwclock. Ein
+    paar Sekunden später steht die echte — dann lässt sich das Alter der
+    Sicherung exakt bestimmen, statt es über die Systemlaufzeit nur nach unten
+    abzuschätzen. Gewartet wird nur, wenn es überhaupt etwas zu bewerten gibt.
+    """
+    if not os.path.exists(session_path()) or uhr_synchron() is not False:
+        return
+    log.info("Systemuhr läuft ohne NTP — warte bis zu %d s, bevor die Sitzung bewertet wird",
+             max_s)
+    for _ in range(max_s):
+        await asyncio.sleep(1)
+        if uhr_synchron():
+            log.info("Systemuhr synchronisiert")
+            return
+    log.warning("Systemuhr nach %d s ohne NTP — Sitzungsalter wird nur nach unten "
+                "abgeschätzt", max_s)
+
+
+def session_alter(daten: dict) -> tuple[float, str]:
+    """Wie alt die Sicherung wirklich ist, in Sekunden, plus Begründung.
+
+    Vier Fälle, vom verlässlichsten zum schwächsten:
+    1. Gleicher Boot: die Differenz der Systemlaufzeiten ist exakt und von
+       der Wanduhr unabhängig. Das ist der Normalfall (Dienst- oder
+       Container-Neustart ohne Reboot).
+    2. Reboot, aber die Uhr war beim Sichern von NTP diszipliniert und ist es
+       jetzt wieder: dann ist die Wanduhr-Differenz echt — auch über einen
+       Stromausfall hinweg. Nur so ist dessen Dauer überhaupt messbar.
+    3. Reboot mit unsicherer Uhr: seit dem Systemstart ist mindestens die
+       aktuelle Laufzeit vergangen, und der Ausfall begann davor. Es gilt der
+       größere der beiden Werte — so kann eine zurückgestellte Uhr nichts
+       verjüngen, auch wenn die echte Dauer unbekannt bleibt.
+    4. Ohne /proc: nur die Wanduhr.
+    """
+    wanduhr = datetime.datetime.now().timestamp() - float(daten.get("saved_at") or 0)
+    boot_id, uptime = system_marken()
+    gespeichert_boot = daten.get("boot_id")
+    gespeichert_uptime = daten.get("uptime_s")
+    if (boot_id and gespeichert_boot == boot_id
+            and uptime is not None and gespeichert_uptime is not None):
+        return uptime - float(gespeichert_uptime), "Systemlaufzeit"
+    if daten.get("clock_synced") and uhr_synchron():
+        return wanduhr, "NTP-Uhr"
+    if uptime is not None:
+        return max(wanduhr, uptime), "Uhr ohne NTP, Untergrenze Systemlaufzeit"
+    return wanduhr, "Wanduhr, ungeprüft"
+
+
+def session_pruefsumme(rumpf: str) -> str:
+    return hashlib.sha256(rumpf.encode()).hexdigest()
+
+
+def session_status() -> str:
+    """Die Sicherung jetzt prüfen: heil und wie alt? Für die Info-Seite.
+
+    Beantwortet im laufenden Betrieb dieselben zwei Fragen, die beim Start
+    über die Übernahme entscheiden — ohne dafür einen Neustart zu brauchen.
+    """
+    pfad = session_path()
+    try:
+        with open(pfad) as fh:
+            kopf, _, rumpf = fh.read().partition("\n")
+    except FileNotFoundError:
+        return "fehlt"
+    except OSError as exc:
+        return f"unlesbar: {exc}"
+    if not kopf.startswith("sha256:"):
+        return "⛔ ohne Prüfsumme"
+    rumpf = rumpf.strip()
+    if not secrets.compare_digest(kopf[len("sha256:"):].strip(), session_pruefsumme(rumpf)):
+        return "⛔ Prüfsumme falsch"
+    try:
+        daten = json.loads(rumpf)
+    except ValueError as exc:
+        return f"⛔ unlesbar: {exc}"
+    alter, quelle = session_alter(daten)
+    frisch = "✅" if -SESSION_CLOCK_TOLERANCE_S <= alter <= SESSION_MAX_AGE_S else "⛔"
+    return (f"{frisch} heil, {max(0, round(alter))} s alt ({quelle}), "
+            f"Grenze {SESSION_MAX_AGE_S} s")
+
+
+def save_session():
+    """Laufzeitzustand sichern. Fehler dürfen den Regler nie stoppen."""
+    boot_id, uptime = system_marken()
+    daten = {
+        "saved_at": datetime.datetime.now().timestamp(),
+        "boot_id": boot_id,
+        "uptime_s": uptime,
+        # Ohne diesen Vermerk ließe sich später nicht mehr sagen, ob der
+        # Zeitstempel daneben von einer disziplinierten Uhr stammt
+        "clock_synced": uhr_synchron(),
+        "commit": VERSION.get("commit"),
+        "mode": state.mode,
+        "released": state.released,
+        "min_amps": state.min_amps,
+        "night_enabled": state.night_enabled,
+        "heartbeat_s": state.heartbeat_s,
+        "charging": state.charging,
+        "transaction_id": state.transaction_id,
+        "box_status": state.box_status,
+        "current_limit": state.current_limit,
+        "boost_used_wh": state.boost_used_wh,
+        "boost_day": state.boost_day.isoformat() if state.boost_day else None,
+        # Der Hysterese-Merker: ohne ihn stünde der Dauer-Boost nach einem
+        # Neustart bei 70 % SOC still, bis die Batterie wieder 90 % erreicht
+        "perma_boost_aktiv": state.perma_boost_aktiv,
+        "battery_grid_charge": state.battery_grid_charge,
+        "battery_charge_auto": state.battery_charge_auto,
+        "battery_auto_started": state.battery_auto_started,
+    }
+    pfad = session_path()
+    rumpf = json.dumps(daten)
+    try:
+        os.makedirs(os.path.dirname(pfad) or ".", exist_ok=True)
+        # Erst daneben schreiben, dann umbenennen: ein Stromausfall mitten im
+        # Schreiben hinterlässt sonst eine halbe Datei, die beim nächsten Start
+        # nur Fragen aufwirft. Die Prüfsumme in Zeile 1 deckt den Rest ab —
+        # umgekippte Bits auf der SD-Karte oder einen Block, den der Controller
+        # aus seinem Cache nur halb zurückgeschrieben hat.
+        tmp = pfad + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(f"sha256:{session_pruefsumme(rumpf)}\n{rumpf}\n")
+            # Ohne fsync liegt der Inhalt nur im Seitencache: der Rename wäre
+            # nach einem Stromausfall sichtbar, die Daten dahinter nicht — und
+            # gelesen würde die vorige Fassung. Genau der Zombie, der hier
+            # nicht auferstehen soll.
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, pfad)
+        # Auch der Verzeichniseintrag selbst muss auf die Karte, sonst zeigt
+        # das Verzeichnis nach einem Stromausfall weiter auf die alte Datei.
+        ordner = os.open(os.path.dirname(pfad) or ".", os.O_RDONLY)
+        try:
+            os.fsync(ordner)
+        finally:
+            os.close(ordner)
+    except OSError as exc:
+        log.warning("Sitzung konnte nicht gesichert werden (%s): %s", pfad, exc)
+
+
+def load_session():
+    """Sicherung einlesen und übernehmen, falls sie frisch genug ist.
+
+    Frisch heißt: höchstens SESSION_MAX_AGE_S alt. Alles darüber ist keine
+    unterbrochene Sitzung mehr, sondern eine beendete — dann startet der Regler
+    mit den Vorgaben (freigegeben, minpv, 6 A) und fasst nichts an, was er
+    nicht kennt.
+    """
+    pfad = session_path()
+    try:
+        with open(pfad) as fh:
+            kopf, _, rumpf = fh.read().partition("\n")
+    except FileNotFoundError:
+        state.session_note = "keine Sicherung vorhanden — frischer Start"
+        log.info("Keine Sitzungssicherung (%s) — frischer Start", pfad)
+        return
+    except OSError as exc:
+        state.session_note = f"Sicherung unlesbar: {exc}"
+        log.warning("Sitzungssicherung unlesbar (%s): %s", pfad, exc)
+        return
+
+    # Prüfsumme vor dem Parsen: eine Datei, die zwar gültiges JSON ergibt, aber
+    # nicht die ist, die zuletzt geschrieben wurde, wäre sonst nicht zu erkennen.
+    rumpf = rumpf.strip()
+    if not kopf.startswith("sha256:"):
+        state.session_note = "Sicherung ohne Prüfsumme — verworfen"
+        log.warning("Sitzungssicherung ohne Prüfsumme (%s) — verworfen", pfad)
+        return
+    erwartet = kopf[len("sha256:"):].strip()
+    tatsaechlich = session_pruefsumme(rumpf)
+    if not secrets.compare_digest(erwartet, tatsaechlich):
+        state.session_note = "Prüfsumme falsch — Sicherung verworfen"
+        log.warning("Sitzungssicherung beschädigt (%s):\n  erwartet  %s\n  berechnet %s",
+                    pfad, erwartet, tatsaechlich)
+        return
+    try:
+        daten = json.loads(rumpf)
+    except ValueError as exc:
+        state.session_note = f"Sicherung unlesbar: {exc}"
+        log.warning("Sitzungssicherung unlesbar (%s): %s", pfad, exc)
+        return
+
+    ausfall, quelle = session_alter(daten)
+    if ausfall < -SESSION_CLOCK_TOLERANCE_S:
+        # Zeitstempel aus der Zukunft: die Uhr ist gesprungen, das Alter sagt
+        # nichts mehr. Lieber neu anfangen als eine alte Lage fortschreiben.
+        state.session_note = f"Sicherung liegt {-ausfall / 60:.0f} min in der Zukunft — verworfen"
+        log.warning("Sitzungssicherung datiert %.0f min in der Zukunft (%s) — verworfen",
+                    -ausfall / 60, quelle)
+        return
+    if ausfall > SESSION_MAX_AGE_S:
+        state.session_note = f"Sicherung verworfen ({ausfall / 60:.0f} min alt, {quelle})"
+        log.info("Sitzungssicherung ist %.0f min alt (Grenze %d min, gemessen über %s) — verworfen",
+                 ausfall / 60, SESSION_MAX_AGE_S // 60, quelle)
+        return
+    ausfall = max(0.0, ausfall)
+    if daten.get("commit") and daten["commit"] != VERSION.get("commit"):
+        log.info("Sicherung stammt aus Commit %s, hier läuft %s",
+                 daten["commit"], VERSION.get("commit"))
+
+    state.mode = daten.get("mode", state.mode)
+    state.released = bool(daten.get("released", state.released))
+    state.min_amps = int(daten.get("min_amps", state.min_amps))
+    state.night_enabled = bool(daten.get("night_enabled", state.night_enabled))
+    state.heartbeat_s = int(daten.get("heartbeat_s", state.heartbeat_s))
+    state.charging = bool(daten.get("charging", False))
+    state.transaction_id = daten.get("transaction_id")
+    state.box_status = daten.get("box_status", state.box_status)
+    state.current_limit = float(daten.get("current_limit", 0.0))
+    # Was in der Box steht, hat sich in der Zwischenzeit ändern können — das
+    # Limit gilt als unbekannt und wird im ersten Regeltakt neu gesetzt.
+    state.limit_known = False
+    state.boost_used_wh = float(daten.get("boost_used_wh", 0.0))
+    tag = daten.get("boost_day")
+    state.boost_day = datetime.date.fromisoformat(tag) if tag else None
+    state.perma_boost_aktiv = bool(daten.get("perma_boost_aktiv", False))
+    state.battery_grid_charge = bool(daten.get("battery_grid_charge", False))
+    state.battery_charge_auto = bool(daten.get("battery_charge_auto", False))
+    state.battery_auto_started = bool(daten.get("battery_auto_started", False))
+
+    if state.charging and state.transaction_id is not None:
+        state.session_note = (f"Ladung fortgesetzt (Transaktion {state.transaction_id}, "
+                              f"{ausfall:.0f} s Ausfall, {quelle})")
+        log.info("Sitzung übernommen: laufende Ladung, Transaktion %s, Ausfall %.0f s (%s) — "
+                 "die Box lädt durch, der Regler greift wieder",
+                 state.transaction_id, ausfall, quelle)
+    else:
+        state.session_note = f"Einstellungen übernommen ({ausfall:.0f} s Ausfall, {quelle})"
+        log.info("Sitzung übernommen: keine laufende Ladung, Ausfall %.0f s (%s)",
+                 ausfall, quelle)
+
+
+async def session_task():
+    """Regelmäßig sichern — die Änderungspunkte allein könnten etwas auslassen."""
+    while True:
+        await asyncio.sleep(SESSION_SAVE_INTERVAL_S)
+        save_session()
 
 
 def in_night_window(now: datetime.datetime | None = None) -> bool:
@@ -425,7 +803,6 @@ modbus_lock = asyncio.Lock()  # serialisiert Polling und Schreibzugriffe (SDongl
 
 
 class ChargePoint(OcppChargePoint):
-    transaction_id: int | None = None
 
     @on("BootNotification")
     def on_boot(self, charge_point_vendor, charge_point_model, **kwargs):
@@ -478,6 +855,7 @@ class ChargePoint(OcppChargePoint):
             # auch keiner, im Regeltakt neue Startversuche zu schicken.
             state.charging = False
             reset_charge_meter()
+        save_session()
         return call_result.StatusNotification()
 
     @on("Authorize")
@@ -486,25 +864,37 @@ class ChargePoint(OcppChargePoint):
 
     @on("StartTransaction")
     def on_start_transaction(self, connector_id, id_tag, meter_start, **kwargs):
-        self.transaction_id = 1
+        state.transaction_id = 1
         state.charging = True
         log.info("Transaktion gestartet (meter %s Wh)", meter_start)
+        save_session()
         return call_result.StartTransaction(
-            transaction_id=self.transaction_id,
+            transaction_id=state.transaction_id,
             id_tag_info={"status": AuthorizationStatus.accepted},
         )
 
     @on("StopTransaction")
     def on_stop_transaction(self, meter_stop, transaction_id, **kwargs):
-        self.transaction_id = None
+        state.transaction_id = None
         state.charging = False
         reset_charge_meter()
         log.info("Transaktion beendet (meter %s Wh)", meter_stop)
+        save_session()
         return call_result.StopTransaction()
 
     @on("MeterValues")
     def on_meter_values(self, connector_id, meter_value, **kwargs):
         state.last_box_seen = datetime.datetime.now().timestamp()
+        # Die Box schickt die Transaktions-ID in jedem Paket mit. Für den
+        # Normalfall belanglos, aber sie ist der zweite Weg zurück in eine
+        # laufende Ladung, wenn die Sicherung fehlt oder zu alt war — ohne
+        # sie bliebe der Regler bis zum Ladeende ohne Stopp-Möglichkeit.
+        laufend = kwargs.get("transaction_id")
+        if laufend is not None and state.transaction_id != laufend:
+            log.info("Laufende Transaktion %s aus MeterValues übernommen", laufend)
+            state.transaction_id = laufend
+            state.charging = True
+            save_session()
         now = asyncio.get_event_loop().time()
         power_wh = energy_wh = None
         for entry in meter_value:
@@ -548,11 +938,11 @@ class ChargePoint(OcppChargePoint):
         # sich daran unterschiedlich streng — manche übernehmen es erst zur
         # nächsten Transaktion. Genau so bliebe ein Nachtstart bei den 6 A des
         # PV-Betriebs hängen (docs/issue_limit_to_6A.md).
-        if self.transaction_id is not None:
+        if state.transaction_id is not None:
             profil = {
                 "charging_profile_id": 2,
                 "stack_level": 1,
-                "transaction_id": self.transaction_id,
+                "transaction_id": state.transaction_id,
                 "charging_profile_purpose": ChargingProfilePurposeType.tx_profile,
             }
         else:
@@ -609,10 +999,20 @@ class ChargePoint(OcppChargePoint):
             await asyncio.sleep(1)
 
     async def remote_stop(self):
-        if self.transaction_id is None:
+        if state.transaction_id is None:
             return
-        response = await self.call(call.RemoteStopTransaction(transaction_id=self.transaction_id))
+        response = await self.call(call.RemoteStopTransaction(transaction_id=state.transaction_id))
         log.info("RemoteStop: %s", response.status if response else "keine Antwort")
+        # Abgelehnt heißt hier: die Box kennt diese Transaktion nicht (mehr).
+        # Meist stammt sie aus einer Sicherung und die Ladung endete während
+        # des Ausfalls. Den Merker wegwerfen, sonst schickt der Regeltakt
+        # denselben Stopp bis in alle Ewigkeit.
+        if response is not None and response.status == "Rejected":
+            log.info("Transaktion %s ist der Box unbekannt — Merker verworfen",
+                     state.transaction_id)
+            state.transaction_id = None
+            state.charging = False
+            save_session()
 
 
 async def on_connect(websocket):
@@ -752,6 +1152,41 @@ def pv_average(now: float, pv_surplus: float) -> float:
     return state.pv_avg_w
 
 
+def perma_boost() -> float:
+    """Dauer-Boost aus einer vollen Hausbatterie (W), 0 wenn nicht aktiv.
+
+    An sonnigen Tagen steht die Batterie mittags auf 100 % und kann nichts mehr
+    aufnehmen — jede weitere Kilowattstunde ginge für ein paar Cent ins Netz.
+    Ab PVUEB_PERMA_BOOST_ON_SOC schiebt sie deshalb dauerhaft
+    PVUEB_PERMA_BOOST_W ins Auto, bis sie auf PVUEB_PERMA_BOOST_OFF_SOC
+    abgesunken ist. Die beiden Schwellen sind eine Hysterese: ohne sie würde
+    der Boost an der oberen Grenze im Sekundentakt an- und ausgehen.
+
+    Der Sonnen-Autodetect steckt im SOC selbst — eine volle Batterie am
+    Nachmittag ist der Beweis für den sonnigen Tag, den die Prognose morgens
+    nur behauptet. Nachgeladen wird sie im normalen Ablauf wieder: Auto und
+    Box ziehen selten alles, und abends unter der Mindestladeleistung geht der
+    Überschuss ohnehin wieder in die Batterie.
+
+    Bewusst ohne Tagesbudget — die Spanne zwischen den Schwellen ist das
+    Budget. Was hier fließt, wird beim Wolkenloch-Boost nicht angerechnet.
+    """
+    if state.perma_boost_w <= 0 or state.soc is None:
+        state.perma_boost_aktiv = False
+        return 0.0
+    if state.perma_boost_aktiv:
+        if state.soc <= state.perma_boost_off_soc:
+            log.info("Dauer-Boost aus: SOC %.0f %% erreicht die Untergrenze %.0f %%",
+                     state.soc, state.perma_boost_off_soc)
+            state.perma_boost_aktiv = False
+    elif state.soc >= state.perma_boost_on_soc:
+        log.info("Dauer-Boost an: Batterie bei %.0f %% (ab %.0f %%) — %d W zusätzlich "
+                 "ins Auto, bis %.0f %%", state.soc, state.perma_boost_on_soc,
+                 state.perma_boost_w, state.perma_boost_off_soc)
+        state.perma_boost_aktiv = True
+    return state.perma_boost_w if state.perma_boost_aktiv else 0.0
+
+
 def boost_allowance(now: float) -> float:
     """Wieviel Batterie-Entladung darf gerade ins Auto fließen (W).
 
@@ -774,7 +1209,11 @@ def boost_allowance(now: float) -> float:
         state.boost_last_t = None
         return 0.0
     if state.charging and state.battery_w is not None and state.battery_w < 0:
-        drawn = min(-state.battery_w, state.boost_w)
+        # Was der Dauer-Boost aus der Batterie zieht, gehört nicht in dieses
+        # Budget — sonst wäre es binnen Stunden leer und die Wolkenlöcher
+        # blieben ungefedert, obwohl der Dauer-Boost seine eigene Grenze hat.
+        entladung = -state.battery_w - (state.perma_boost_w if state.perma_boost_aktiv else 0)
+        drawn = min(max(0.0, entladung), state.boost_w)
         if state.boost_last_t is not None:
             state.boost_used_wh += drawn * (now - state.boost_last_t) / 3600
     state.boost_last_t = now if state.charging else None
@@ -828,6 +1267,7 @@ async def start_battery_grid_charge() -> str | None:
     state.battery_grid_charge = True
     log.info("Batterie-Netzladung gestartet: %d W bis %.0f %% (SOC jetzt %s %%)",
              charge_w, state.batt_target_soc, state.soc)
+    save_session()
     return None
 
 
@@ -848,6 +1288,7 @@ async def stop_battery_grid_charge() -> str | None:
     state.battery_grid_charge = False
     state.battery_charge_auto = False
     log.info("Batterie-Netzladung gestoppt (SOC %s %%)", state.soc)
+    save_session()
     return None
 
 
@@ -1056,16 +1497,23 @@ def sync_alter(text: str | None) -> int | None:
     munter antworten und trotzdem seit Stunden nichts an die Cloud gemeldet
     haben. Dann steht in der UI ein Standbild, das frisch aussieht.
 
-    Der Zeitstempel kommt ohne Zonenangabe. Ergibt die Rechnung etwas
-    Unplausibles, wird lieber nichts angezeigt als eine falsche Zahl.
+    Der Zeitstempel kommt ohne Zonenangabe, steht aber in UTC — gegen die
+    Ortszeit gerechnet ergab das im Sommer konstant 2 h Alter (im Winter 1 h)
+    und damit einen Dauer-Alarm, obwohl die Box im Sekundentakt meldete.
+    Ergibt die Rechnung etwas Unplausibles, wird lieber nichts angezeigt als
+    eine falsche Zahl.
     """
     if not text:
         return None
     try:
-        gesehen = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        gesehen = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc)
     except (ValueError, TypeError):
         return None
-    alter = (datetime.datetime.now() - gesehen).total_seconds()
+    alter = (datetime.datetime.now(datetime.timezone.utc) - gesehen).total_seconds()
+    # Ein paar Sekunden Vorlauf sind Uhrendrift zwischen Pi und Cloud, kein Fehler
+    if -120 <= alter < 0:
+        alter = 0.0
     return round(alter) if 0 <= alter <= 30 * 86400 else None
 
 
@@ -1144,6 +1592,7 @@ async def battery_night_check():
     if error is None:
         state.battery_auto_started = True
         state.battery_charge_auto = True
+        save_session()   # sonst startet die Automatik nach einem Neustart erneut
     else:
         log.warning("NACHT: Start fehlgeschlagen (%s) — neuer Versuch im nächsten Takt", error)
 
@@ -1190,27 +1639,43 @@ async def control_step(now: float):
     # Batterie-Entladung täuscht Überschuss nur vor (Netzpunkt bleibt ~0)
     pv_surplus = surplus + (state.battery_w or 0)
     pv_avg = pv_average(now, pv_surplus)
+    # Reihenfolge zählt: der Dauer-Boost muss stehen, bevor das Budget des
+    # Wolkenloch-Boosts gebucht wird — sonst zöge er es leer.
+    perma = perma_boost()
     allowance = boost_allowance(now)   # bucht Verbrauch, darum immer aufrufen
     # Wolkenloch-Boost: nur bei laufender Ladung. Er hebt das Ziel nicht an,
     # sondern deckelt es weicher — die Batterie füllt Einbrüche unter dem
     # Mittelwert auf, statt die Ladung herunterzuregeln.
     bridge = allowance if state.charging else 0.0
-    # Starthilfe: ist die Batterie voll genug, steuert sie einen festen Betrag
-    # zum verfügbaren Überschuss bei — anders als der Boost hebt sie das Ziel
-    # wirklich an, sonst käme keine Ladung über die Startschwelle. Sie bleibt
-    # auch während der Ladung stehen; fiele sie beim Start weg, ruderte der
-    # Regler sofort in die Stopp-Schwelle zurück. Klein gehalten, damit das
-    # Auto aus PV lädt und nicht aus der Hausbatterie.
-    help_w = (state.boost_start_w if allowance and state.soc is not None
-              and state.soc >= state.boost_start_soc else 0.0)
-    # Ziel ist der Mittelwert (plus Starthilfe), gedeckelt auf das, was gerade
-    # wirklich da ist — sonst zöge die Lücke Strom aus dem Netz. Der Deckel
-    # nimmt den größeren der beiden Batterie-Beiträge, nicht ihre Summe: mehr
-    # als das Boost-Budget darf die Batterie nie liefern.
-    avail = min(pv_avg + help_w, pv_surplus + max(bridge, help_w))
-    boost = max(bridge, help_w)        # nur noch für Log und Anzeige
-    amps = target_amps(avail)
     min_w = state.min_amps * VOLTAGE * PHASES
+    # Der Dauer-Boost kommt oben drauf: er hebt das Ziel wirklich an, ohne
+    # Rücksicht auf Schwellen. Er gilt auch vor dem Start — eine Batterie an
+    # der oberen Schwelle kann ohnehin nichts mehr aufnehmen, und die Ladung
+    # soll früher anlaufen, nicht der Überschuss ins Netz gehen.
+    avail = min(pv_avg, pv_surplus + bridge) + perma
+    # Starthilfe: fehlen zur Schwelle nur ein paar hundert Watt, legt eine
+    # ausreichend volle Batterie sie drauf — sonst bliebe die Ladung wegen
+    # einer Handvoll Watt aus. Anders als der Boost hebt sie das Ziel wirklich
+    # an, aber nur bis zur Schwelle: liegt die PV darüber, kostet sie nichts.
+    # Sie gilt auch bei laufender Ladung (dann bis zur Mindestleistung), sonst
+    # ruderte der Regler direkt nach dem Start in die Stopp-Schwelle zurück.
+    help_w = 0.0
+    if (state.boost_start_w and allowance and state.soc is not None
+            and state.soc >= state.boost_start_soc):
+        if state.mode == "minpv":
+            noetig = min_w if state.charging else state.minpv_start_factor * min_w
+        else:
+            noetig = MIN_AMPS * VOLTAGE * PHASES
+        help_w = min(max(0.0, noetig - avail), state.boost_start_w)
+        avail += help_w
+    # Alle drei Beiträge kommen aus derselben Batterie, und die hat eine
+    # Entladegrenze. Ohne diesen Deckel verspräche der Regler Leistung, die
+    # der Wechselrichter nicht liefern kann — die Differenz käme aus dem Netz.
+    # Betroffen ist vor allem der Dauer-Boost im Wolkenloch: dort schöpft der
+    # Wolkenloch-Boost die Grenze schon aus, „oben drauf" gibt es dann nichts.
+    avail = min(avail, pv_surplus + state.batt_max_w)
+    boost = max(bridge, help_w) + perma  # nur noch für Log und Anzeige
+    amps = target_amps(avail)
     if state.mode == "minpv":
         amps = max(state.min_amps, amps)
 
@@ -1369,6 +1834,8 @@ INDEX_HTML = """<!doctype html>
 <div class="pages" id="pages">
 <section class="page">
 <div id="stat"></div>
+<h2>Freigabe</h2>
+<button id="frei" onclick="toggleRelease()">…</button>
 <h2>Lademodus – genau eine Option</h2>
 <div class="modes">
 <button id="m_pv" class="mode" onclick="setMode('pv')">Reines PV-Überschussladen</button>
@@ -1390,7 +1857,6 @@ INDEX_HTML = """<!doctype html>
 </section>
 <section class="page">
 <h2>Debug</h2>
-<button id="frei" onclick="toggleRelease()">…</button>
 <div id="dbgstat"></div>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
@@ -1504,6 +1970,15 @@ function boostInfo() {
     return "bereit, max " + s.boost_w + " W – Starthilfe ab " + s.boost_start_soc + " % SOC";
   return "Starthilfe " + s.boost_start_w + " W bereit – " + budget;
 }
+function permaInfo() {
+  // Dauer-Boost: läuft zwischen zwei SOC-Schwellen, ohne Tagesbudget
+  if (!s.perma_boost_w) return "aus";
+  const spanne = s.perma_boost_on_soc + " → " + s.perma_boost_off_soc + " %";
+  if (s.perma_boost_aktiv)
+    return "🔋→🚗 " + s.perma_boost_w + " W – läuft bis " + s.perma_boost_off_soc + " % SOC";
+  if (s.soc === null) return "wartet – " + spanne;
+  return "wartet – ab " + s.perma_boost_on_soc + " % (jetzt " + s.soc.toFixed(0) + " %)";
+}
 function gridShare() {
   if (s.grid_w === null) return "–";
   const imp = Math.max(0, -s.grid_w);
@@ -1575,8 +2050,11 @@ async function refresh() {
       s.pv_avg_w === null ? "–"
       : Math.round(s.pv_avg_w) + " W ≈ " + (s.pv_avg_w / WPA).toFixed(1) + " A"],
     ["Batterie-Boost", boostInfo()],
+    ["Dauer-Boost", permaInfo()],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
+    ["Version", `<a href="/info">${(s.version||{}).commit || "?"}</a>`],
+    ["Sitzung beim Start", s.session_note || "–"],
   ];
   document.getElementById("dbgstat").innerHTML = drows.map(row).join("");
   document.getElementById("hheart").innerHTML = heart(s.huawei_seen_s, 90);
@@ -1750,6 +2228,10 @@ def status_dict() -> dict:
         "boost_min_soc": state.boost_min_soc,
         "boost_start_w": state.boost_start_w,
         "boost_start_soc": state.boost_start_soc,
+        "perma_boost_w": state.perma_boost_w,
+        "perma_boost_on_soc": state.perma_boost_on_soc,
+        "perma_boost_off_soc": state.perma_boost_off_soc,
+        "perma_boost_aktiv": state.perma_boost_aktiv,
         "minpv_timeout_s": state.minpv_timeout_s,
         "minpv_start_factor": state.minpv_start_factor,
         "minpv_pause_factor": state.minpv_pause_factor,
@@ -1785,11 +2267,69 @@ def status_dict() -> dict:
         "audi_poll_s": state.audi_poll_s,
         "audi_seen_s": None if state.last_audi_ok is None
                        else round(datetime.datetime.now().timestamp() - state.last_audi_ok),
+        "version": VERSION,
+        "session_note": state.session_note,
+        "uptime_s": round(datetime.datetime.now().timestamp() - state.started_at),
     }
 
 
 async def http_status(_request):
     return web.json_response(status_dict())
+
+
+def laufzeit(sekunden: float) -> str:
+    tage, rest = divmod(int(sekunden), 86400)
+    stunden, rest = divmod(rest, 3600)
+    minuten = rest // 60
+    if tage:
+        return f"{tage} d {stunden} h {minuten} min"
+    return f"{stunden} h {minuten} min" if stunden else f"{minuten} min"
+
+
+async def http_info(_request):
+    """Was läuft hier gerade — Version, Commit, Sitzung.
+
+    Eigene Seite statt einer Zeile im UI: Nach einem Update ist die erste
+    Frage, ob der neue Stand überhaupt drin ist, und die zweite, ob die
+    laufende Ladung den Neustart überstanden hat.
+    """
+    jetzt = datetime.datetime.now()
+    zeilen = [
+        ("Commit", VERSION.get("commit") or "unbekannt"),
+        ("Beschreibung", VERSION.get("beschreibung") or "–"),
+        ("Herkunft", VERSION.get("quelle")),
+        ("Gebaut", VERSION.get("gebaut") or "–"),
+        ("Gestartet", datetime.datetime.fromtimestamp(state.started_at).strftime("%d.%m.%Y %H:%M:%S")),
+        ("Läuft seit", laufzeit(jetzt.timestamp() - state.started_at)),
+        ("Sitzung beim Start", state.session_note),
+        ("Sicherung jetzt", session_status()),
+        ("Systemuhr", {True: "✅ NTP synchron", False: "⚠ frei laufend, kein NTP",
+                       None: "unbekannt"}[uhr_synchron()]),
+        ("Sicherungsdatei", session_path()),
+        ("Ladung", "läuft" if state.charging else "aus"),
+        ("Transaktion", state.transaction_id if state.transaction_id is not None else "–"),
+        ("Modus", state.mode),
+        ("Freigabe", "erteilt" if state.released else "gesperrt"),
+        ("Python", sys.version.split()[0]),
+    ]
+    tabelle = "".join(f"<tr><td>{name}</td><td>{wert}</td></tr>" for name, wert in zeilen)
+    return web.Response(content_type="text/html", text=f"""<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PVueb — Info</title>
+<style>
+ body {{ font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }}
+ h1 {{ font-size:1.3rem; margin:0 0 12px; }}
+ table {{ border-collapse:collapse; width:100%; max-width:640px; }}
+ td {{ padding:7px 10px; border-bottom:1px solid #333; vertical-align:top; }}
+ td:first-child {{ color:#9ab; white-space:nowrap; width:1%; }}
+ td:last-child {{ font-family:ui-monospace, monospace; word-break:break-all; }}
+ a {{ color:#7cf; display:inline-block; margin-top:16px; }}
+</style></head><body>
+<h1>PVueb — was hier läuft</h1>
+<table>{tabelle}</table>
+<a href="/">&larr; zurück zur Übersicht</a>
+</body></html>""")
 
 
 # Was je Abtastung mitgeschrieben wird. Die Schwellen und Faktoren stehen
@@ -1873,12 +2413,14 @@ async def http_mode(request):
     state.mode = mode
     state.surplus_since = state.deficit_since = state.minpv_low_since = None
     log.info("Modus (Web): %s", mode)
+    save_session()
     return web.json_response({"ok": True})
 
 
 async def http_release(request):
     state.released = request.match_info["onoff"] == "on"
     log.info("Freigabe (Web): %s", "erteilt" if state.released else "zurückgenommen")
+    save_session()
     return web.json_response({"ok": True})
 
 
@@ -1913,6 +2455,7 @@ async def http_config(request):
             await charge_point.change_configuration("HeartbeatInterval", str(hb))
     # Im Web-UI geänderte Werte überleben so den nächsten Neustart
     write_dotenv("Änderung im Web-UI")
+    save_session()
     return web.json_response({"ok": True})
 
 
@@ -1954,6 +2497,7 @@ async def auth_middleware(request, handler):
 async def web_task(port: int):
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", http_index)
+    app.router.add_get("/info", http_info)
     app.router.add_get("/api/status", http_status)
     app.router.add_post("/api/mode/{mode}", http_mode)
     app.router.add_post("/api/release/{onoff}", http_release)
@@ -2067,9 +2611,17 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
              "Tagesbudget in Stunden dieser Leistung, 0 = Boost aus"),
             ("PVUEB_BOOST_MIN_SOC", state.boost_min_soc, "Darunter kein Boost mehr"),
             ("PVUEB_BOOST_START_W", state.boost_start_w,
-             "Beitrag der Batterie zur Startentscheidung, 0 = keine Starthilfe"),
+             "So viel an der Startschwelle fehlende Leistung füllt die Batterie auf, 0 = aus"),
             ("PVUEB_BOOST_START_SOC", state.boost_start_soc,
              "Starthilfe erst ab diesem SOC, muss >= PVUEB_BOOST_MIN_SOC sein"),
+            ("PVUEB_BATT_MAX_W", state.batt_max_w,
+             "Entladegrenze der Hausbatterie — deckelt alle Boosts zusammen"),
+            ("PVUEB_PERMA_BOOST_W", state.perma_boost_w,
+             "Dauer-Boost aus voller Batterie, 0 = aus"),
+            ("PVUEB_PERMA_BOOST_ON_SOC", state.perma_boost_on_soc,
+             "Ab diesem SOC springt der Dauer-Boost an"),
+            ("PVUEB_PERMA_BOOST_OFF_SOC", state.perma_boost_off_soc,
+             "Bis hierher darf er die Batterie leeren, muss unter ON_SOC liegen"),
         ]),
         ("Batterie-Netzladung im Nachtfenster", [
             ("PVUEB_BATT_LOW_SOC", state.batt_low_soc, "Automatik startet unter diesem SOC"),
@@ -2079,6 +2631,8 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
              "Nur laden, wenn die Prognose für morgen darunter liegt"),
         ]),
         ("Mitschnitt für Testfälle", [
+            ("PVUEB_SESSION_FILE", state.session_file,
+             "Ablage der Sitzungssicherung, leer = Mitschnitt-Ordner bzw. neben dem Skript"),
             ("PVUEB_RECORD_DIR", state.record_dir, "Zielordner, leer = kein Mitschnitt"),
             ("PVUEB_RECORD_INTERVAL_S", state.record_interval_s, "Abstand der Zeilen"),
             ("PVUEB_RECORD_KEEP_DAYS", state.record_keep_days,
@@ -2214,6 +2768,18 @@ async def main():
     state.boost_min_soc = float(os.environ.get("PVUEB_BOOST_MIN_SOC", "30"))
     if state.boost_w < 0 or state.boost_wh < 0 or not 0 <= state.boost_min_soc <= 100:
         sys.exit("PVUEB_BOOST_W/_H müssen >= 0 sein, PVUEB_BOOST_MIN_SOC 0–100")
+    state.batt_max_w = int(os.environ.get("PVUEB_BATT_MAX_W", "2500"))
+    if state.batt_max_w < 0:
+        sys.exit("PVUEB_BATT_MAX_W muss >= 0 sein")
+    state.perma_boost_w = int(os.environ.get("PVUEB_PERMA_BOOST_W", "1000"))
+    state.perma_boost_on_soc = float(os.environ.get("PVUEB_PERMA_BOOST_ON_SOC", "90"))
+    state.perma_boost_off_soc = float(os.environ.get("PVUEB_PERMA_BOOST_OFF_SOC", "50"))
+    if state.perma_boost_w < 0 or not 0 <= state.perma_boost_off_soc <= 100 \
+            or not 0 <= state.perma_boost_on_soc <= 100:
+        sys.exit("PVUEB_PERMA_BOOST_W muss >= 0 sein, die SOC-Schwellen 0–100")
+    # Ohne Abstand wäre es keine Hysterese, sondern ein Flattern im Regeltakt
+    if state.perma_boost_w and state.perma_boost_off_soc >= state.perma_boost_on_soc:
+        sys.exit("PVUEB_PERMA_BOOST_OFF_SOC muss unter PVUEB_PERMA_BOOST_ON_SOC liegen")
     state.boost_start_w = int(os.environ.get("PVUEB_BOOST_START_W", "500"))
     state.boost_start_soc = float(os.environ.get("PVUEB_BOOST_START_SOC", "50"))
     if state.boost_start_w < 0 or not 0 <= state.boost_start_soc <= 100:
@@ -2250,6 +2816,7 @@ async def main():
         if user:
             log.info("%s: Anmeldung erforderlich (Benutzer %r)", name, user)
     state.record_dir = os.environ.get("PVUEB_RECORD_DIR", "")
+    state.session_file = os.environ.get("PVUEB_SESSION_FILE", "")
     state.record_interval_s = int(os.environ.get("PVUEB_RECORD_INTERVAL_S", "10"))
     state.record_keep_days = int(os.environ.get("PVUEB_RECORD_KEEP_DAYS", "14"))
     if state.record_interval_s < 1 or state.record_keep_days < 1:
@@ -2290,10 +2857,23 @@ async def main():
     # jeden wirksamen Wert enthält statt nur die abweichenden
     write_dotenv()
 
+    # Erst danach die Sitzung: sie darf Modus, Freigabe und die laufende
+    # Transaktion überschreiben, aber keine .env-Werte.
+    state.started_at = datetime.datetime.now().timestamp()
+    await auf_uhr_warten()
+    load_session()
+    # Sofort zurückschreiben: sonst stünde bis zur ersten Änderung oder zum
+    # ersten Takt gar keine oder eine veraltete Sicherung bereit — ausgerechnet
+    # in den Minuten nach einem Update, in denen ein zweiter Neustart am
+    # wahrscheinlichsten ist.
+    save_session()
+    log.info("PVueb %s (%s), Sitzung: %s", VERSION.get("beschreibung") or VERSION.get("commit"),
+             VERSION.get("quelle"), state.session_note)
+
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
     tasks = [server.wait_closed(), modbus_task(args.inverter), control_task(),
-             command_loop(), web_task(args.web_port), forecast_task()]
+             command_loop(), web_task(args.web_port), forecast_task(), session_task()]
     if state.record_dir:
         tasks.append(record_task())
     if state.audi_user:

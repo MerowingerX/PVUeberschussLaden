@@ -1,6 +1,14 @@
 services:
   pvueb:
-    build: .
+    build:
+      context: .
+      # Werte kommen aus der Umgebung — `make up` füllt sie aus Git. Ein
+      # blankes `docker compose up --build` läuft weiter, dann steht auf der
+      # Info-Seite eben „unbekannt".
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        GIT_DESCRIBE: ${GIT_DESCRIBE:-}
+        BUILD_TIME: ${BUILD_TIME:-}
     container_name: pvueb
     env_file: .env            # PVUEB_INVERTER_IP=<ip-des-sdongle>
     volumes:

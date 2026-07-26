@@ -8,6 +8,9 @@ LOCAL.md
 poc/.audi-tokenstore.json
 poc/.audi-cache.json
 
+# Sitzungssicherung für den Neustart (Laufzeitzustand, kein Konfigurationswert)
+poc/.session.json
+
 # Python
 .venv/
 __pycache__/
