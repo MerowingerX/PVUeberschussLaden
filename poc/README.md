@@ -1,3 +1,13 @@
+> **Dies ist das Protokoll der Inbetriebnahme (Juli 2026), kein Handbuch.** Die
+> Meilensteine M1–M3 dokumentieren, wie die drei Geräte zum ersten Mal
+> angesprochen wurden und woran sich das belegen ließ. Der Dienst läuft seit
+> Juli 2026 im Regelbetrieb; wie man ihn benutzt, steht im
+> [README im Wurzelverzeichnis](../README.md).
+>
+> Die Haken unten stehen so, wie sie damals gesetzt wurden. Offene Kästchen
+> heißen nicht, dass die Sache fehlt, sondern dass sie nicht in dieser Form
+> abgehakt wurde — der Regelbetrieb hat sie längst überholt.
+
 # M1 – Mess-PoC
 
 Liest Netzleistung, PV-Leistung, Batterieleistung und SOC vom Sun2000 per Modbus TCP.

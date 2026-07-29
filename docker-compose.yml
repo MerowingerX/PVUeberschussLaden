@@ -20,9 +20,14 @@ services:
       # wäre er nach dem nächsten "docker compose up --build" verloren.
       - ./recordings:/data/recordings
     ports:
-      # Nur im LAN erreichbar machen: beide Dienste kennen ohne
-      # PVUEB_WEB_USER / PVUEB_OCPP_USER keine Anmeldung. Docker umgeht
-      # ufw-Regeln, deshalb hier an die LAN-Adresse binden statt an 0.0.0.0.
+      # ACHTUNG: beides bindet auf 0.0.0.0, also auf jede Schnittstelle des
+      # Hosts. Ohne PVUEB_WEB_USER / PVUEB_OCPP_USER kennen beide Dienste keine
+      # Anmeldung — wer sie erreicht, steuert die Wallbox und lädt die
+      # Hausbatterie aus dem Netz.
+      #
+      # In einem Netz, dem du nicht vollständig traust, die LAN-Adresse
+      # voranstellen ("192.168.x.y:8080:8080"). Eine ufw-Regel genügt dafür
+      # nicht: Docker legt eigene iptables-Ketten an und umgeht sie.
       - "9000:9000"           # OCPP (Wallbox -> Server)
       - "8080:8080"           # Web-UI
     networks:

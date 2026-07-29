@@ -112,6 +112,15 @@ aber trotzdem zügig.
   in der UI und im Docker-Healthcheck — ohne diese Zahl sieht ein Dienst, der nur noch
   Messwerte anzeigt, genauso gesund aus wie einer, der regelt
   ([docs/issue_nightly_load_did_not_work.md](docs/issue_nightly_load_did_not_work.md))
+- **Meldungen aufs Telefon** (optional, `PVUEB_NOTIFY_URL`): Der Wächter macht aus
+  einem stehenden Regeltakt zwei Minuten statt siebzehn Stunden — sagen musste er es
+  aber erst lernen. PVueb schickt ein JSON an eine konfigurierbare Adresse und
+  vergisst es; wer daraus eine Nachricht macht, ist nicht seine Sache.
+  **Alarm** bei Neustart, weggefallenem Wechselrichter und weggefallener Wallbox,
+  **Info** bei Rückkehr, angestecktem Fahrzeug, Start und Ende von Nacht- und
+  PV-Laden sowie der Netzladung des Hausakkus. Kein `await` im Regelpfad, eigene
+  überwachte Aufgabe, nie ein Fehler nach oben. Details:
+  [features/feature_Benachrichtigung.md](features/feature_Benachrichtigung.md)
 - **Mitschnitt** (optional): Der Regelbetrieb wird als JSON-Zeilen mitgeschrieben, eine
   Datei pro Tag, ältere Tage fallen automatisch heraus. Daraus baut
   [poc/curve_from_recording.py](poc/curve_from_recording.py) echte Kurven für die
@@ -138,9 +147,16 @@ werden.
 git clone git@github.com:MerowingerX/PVUeberschussLaden.git pvueb
 cd pvueb
 cp .env.example .env          # PVUEB_INVERTER_IP eintragen (IP des SDongle)
+docker network create myhome  # einmalig, siehe unten
 docker compose up -d --build
 docker compose logs -f        # Box-Boot und Modbus-Werte beobachten
 ```
+
+> **Das Netz muss vor dem ersten Start existieren.** Die
+> [docker-compose.yml](docker-compose.yml) verweist auf das externe Netz `myhome`
+> — darüber ist die Meldestelle erreichbar. Fehlt es, verweigert
+> `docker compose up` den Dienst, und dann regelt nichts mehr. Wer keine
+> Meldungen will, kann den `networks:`-Block stattdessen entfernen.
 
 Startet automatisch neu (`restart: unless-stopped`), auch nach Pi-Reboot.
 Zeitzone im Container: `Europe/Berlin` (Dockerfile) — wichtig fürs Nachttarif-Fenster.
@@ -254,15 +270,21 @@ Bewusst fest im Code (`poc/charge_loop.py`, siehe Designprinzip):
 ## Simulation und Tests
 
 [poc/test_sim.py](poc/test_sim.py) fährt den echten Regelcode gegen ein Anlagenmodell —
-ohne Wechselrichter, ohne Wallbox, ohne Auto. 18 Szenarien: sonniger Tag, Wolkenfelder,
+ohne Wechselrichter, ohne Wallbox, ohne Auto. 24 Szenarien: sonniger Tag, Wolkenfelder,
 Dauerflackern, Nachtfenster, leere und volle Hausbatterie, Wallbox ohne Leistungsmeldung,
 Fahrzeug das nichts annimmt, Box die den Start ablehnt.
 
 ```bash
+make test                             # alle drei Testskripte
 cd poc
 python test_sim.py                    # alle Szenarien mit Kurven und Ereignissen
 python test_sim.py --json daten.json  # Rohdaten für eigene Auswertung
 ```
+
+Daneben zwei Skripte, die nicht regeln, sondern prüfen, ob der Regler überhaupt noch
+regelt und ob er es sagt: [poc/test_robust.py](poc/test_robust.py) (16 Testfälle gegen
+den Ausfall vom 28.07.2026) und [poc/test_melden.py](poc/test_melden.py) (37 Prüfungen
+der Meldungen, ohne Wallbox, Wechselrichter und Uhr).
 
 Die Ergebnisse aller Szenarien mit Kurven und Ereignissen liegen als
 **[Prüfbericht](docs/pruefbericht.md)** bei.
@@ -333,7 +355,9 @@ Häufige Befunde:
 |---|---|
 | [poc/charge_loop.py](poc/charge_loop.py) | ✅ Regel-Loop, OCPP-Server, Web-UI, Mitschnitt — der eigentliche Dienst |
 | [poc/test_sim.py](poc/test_sim.py) | ✅ 24 Simulationsszenarien gegen den echten Regelcode |
-| [poc/test_robust.py](poc/test_robust.py) | ✅ Regressionstests gegen den Ausfall vom 28.07.2026 |
+| [poc/test_robust.py](poc/test_robust.py) | ✅ 16 Regressionstests gegen den Ausfall vom 28.07.2026 |
+| [poc/test_melden.py](poc/test_melden.py) | ✅ 37 Prüfungen der Meldungen nach draußen |
+| [app/](app/) | ✅ Android-Hülle: Regler-UI und Meldungen als zwei Reiter |
 | [poc/curve_from_recording.py](poc/curve_from_recording.py) | ✅ macht aus Mitschnitten PV-Kurven für die Simulation |
 | [poc/record_status.py](poc/record_status.py) | Mitschnitt von außen über HTTP (der Dienst kann es selbst) |
 | [poc/read_wallbox_cloud.py](poc/read_wallbox_cloud.py) | ✅ myWallbox-Zugang prüfen, Charger-ID ermitteln |
@@ -343,8 +367,13 @@ Häufige Befunde:
 | [poc/README.md](poc/README.md) | Testprotokolle und Erfolgskriterien je Meilenstein |
 
 Live im Einsatz seit Juli 2026: Regelung, Wolkenüberbrückung, Boost und Nachtladen
-laufen an einer 7-kWp-Anlage. Offen: Historie und Auswertung über längere Zeiträume,
-ein Dashboard jenseits der Handy-UI, Authentifizierung für die Web-Oberfläche.
+laufen an einer 7-kWp-Anlage.
+
+Offen: der **Totmannschalter** — solange er fehlt, bleibt „Pi tot, Strom weg" der eine
+Fall, den niemand meldet ([features/feature_Benachrichtigung.md](features/feature_Benachrichtigung.md)).
+Dazu die **Wallbox-Rückfallebene**
+([features/feature_WallboxRueckfallebene.md](features/feature_WallboxRueckfallebene.md)),
+Historie und Auswertung über längere Zeiträume und ein Dashboard jenseits der Handy-UI.
 
 ## Lizenz
 

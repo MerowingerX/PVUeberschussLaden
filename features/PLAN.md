@@ -1,5 +1,20 @@
 # Plan: PV-Überschussladen auf dem Raspberry Pi
 
+> **Historisches Dokument (Juli 2026), vor der Umsetzung geschrieben.** Es wird
+> nicht nachgeführt — der aktuelle Stand steht im
+> [README](../README.md) und in den übrigen Dateien in diesem Verzeichnis.
+>
+> Wo die Umsetzung bewusst abgewichen ist:
+>
+> | Plan | Wirklichkeit | warum |
+> |---|---|---|
+> | FastAPI + Vue 3 | aiohttp, HTML als String im Regler | zwei Build-Ketten für fünf Seiten, die ein Handy zeigt |
+> | SQLite | JSON-Zeilen je Tag (`PVUEB_RECORD_DIR`) | für Kurven aus Mitschnitten reicht eine Datei; eine Datenbank will gepflegt werden |
+> | REST-API als eigene Schicht | `/api/*` im selben Prozess | der Dienst ist ein Prozess, keine Architektur |
+>
+> Das Designprinzip unten gilt unverändert und hat genau diese Abweichungen
+> erzeugt.
+
 Ziel: Eigene App auf dem Raspberry Pi, die den PV-Überschuss der HUAWEI-Sun2000-Anlage misst und die Wallbox Pulsar Plus so regelt, dass das Auto möglichst nur mit Überschussstrom lädt.
 
 ---

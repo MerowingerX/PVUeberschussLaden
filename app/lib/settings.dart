@@ -43,7 +43,7 @@ class Settings {
   final String messengerUser;
   final String messengerPassword;
 
-  /// Standard-Port des Web-UI, siehe PVUEB_WEB_PORT im Regler.
+  /// Vorgabe des Regler-Web-UI (charge_loop.py, --web-port).
   static const defaultPort = 8080;
 
   /// Standard-Port der Meldestelle, siehe MYHOME_PORT im Messenger.
