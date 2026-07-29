@@ -25,4 +25,20 @@ services:
       # ufw-Regeln, deshalb hier an die LAN-Adresse binden statt an 0.0.0.0.
       - "9000:9000"           # OCPP (Wallbox -> Server)
       - "8080:8080"           # Web-UI
+    networks:
+      - default
+      # Meldeweg nach draußen: myhome-messenger hängt im selben Netz und ist
+      # darüber als http://myhome-messenger:8090/notify erreichbar. Der
+      # Umweg über ein gemeinsames Netz statt über 127.0.0.1 ist keine
+      # Bequemlichkeit — der Host-Loopback ist aus einem Container heraus
+      # nicht erreichbar, und den Messenger stattdessen ins LAN zu hängen
+      # verbietet sich: er kennt keine Anmeldung.
+      # Anlegen mit: docker network create myhome
+      - myhome
     restart: unless-stopped
+
+networks:
+  default:
+  myhome:
+    external: true
+    name: myhome
