@@ -3014,10 +3014,14 @@ class Melder:
 
         if self._flanke("angesteckt", neu["angesteckt"], jetzt):
             an = bool(self.stand["angesteckt"])
+            # Der OCPP-Status gehört in den Text. Ohne ihn ist von außen nicht
+            # zu sehen, warum eine Box zwischen „steckt" und „steckt nicht"
+            # pendelt — und genau das tat sie am 29.07.2026, im 5,5-Minuten-Takt.
             raus.append({
                 "thema": "fahrzeug", "stufe": "info", "sperre_s": 0,
                 "schluessel": f"fahrzeug-{'an' if an else 'ab'}",
-                "text": "Fahrzeug angesteckt." if an else "Fahrzeug abgesteckt."})
+                "text": ("Fahrzeug angesteckt" if an else "Fahrzeug abgesteckt")
+                        + f" ({lage['box_status']})."})
 
         if self._flanke("laedt", neu["laedt"], jetzt):
             laedt = bool(self.stand["laedt"])

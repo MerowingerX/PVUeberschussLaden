@@ -156,6 +156,10 @@ def test_fahrzeug():
     raus = m.pruefen(lage(box_status="Preparing"), 400.0)
     pruefe(len(raus) == 1 and raus[0]["stufe"] == "info"
            and "angesteckt" in raus[0]["text"], "Anstecken wird gemeldet")
+    # Ohne den OCPP-Status im Text ist von aussen nicht zu sehen, warum eine
+    # Box pendelt.
+    pruefe("Preparing" in raus[0]["text"],
+           "und der Text nennt den OCPP-Status")
 
     pruefe(m.pruefen(lage(box_status="Charging"), 410.0) == [],
            "Preparing -> Charging ist kein zweites Anstecken")
@@ -163,8 +167,8 @@ def test_fahrzeug():
            "SuspendedEV auch nicht — das Kabel steckt weiter")
 
     raus = m.pruefen(lage(box_status="Available"), 430.0)
-    pruefe(len(raus) == 1 and "abgesteckt" in raus[0]["text"],
-           "Abstecken wird gemeldet")
+    pruefe(len(raus) == 1 and "abgesteckt" in raus[0]["text"]
+           and "Available" in raus[0]["text"], "Abstecken wird gemeldet")
 
 
 def test_laden():
