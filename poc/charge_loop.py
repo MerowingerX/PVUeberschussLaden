@@ -75,12 +75,18 @@ zurückgeschrieben — jede Einstellung mit dem wirksamen Wert und einer Erklär
 Sicherung in .env.bak. Damit überleben auch Schieberegler-Werte den Neustart.
 Liegt keine .env vor (Docker mit env_file), passiert nichts.
 
-Fahrzeugdaten (PVUEB_AUDI_*, optional): Ladestand, Reichweite und Ladestatus
-des Q4 kommen über carconnectivity aus der MyAudi-Cloud auf ein eigenes
-Slide. Reine Anzeige — geregelt wird weiter nach Netzleistung und
-Wallbox-Meldung, weil das Auto oft offline hängt und die Cloud dann alte
-Werte liefert, ohne das dazuzusagen. Deshalb zeigt die UI zu jedem Wert das
-Alter im Fahrzeug, nicht nur das des Abrufs.
+Ausfallsicherheit (docs/issue_nightly_load_did_not_work.md): Der Regeltakt ist
+die einzige Stelle, die die Wallbox anfasst, und er darf nie aufhören. Drei
+Ebenen sichern das ab — ein fehlgeschlagener Takt kostet einen Takt
+(control_task), eine abgestürzte Daueraufgabe läuft neu an (bewacht), und
+bleibt der Takt trotzdem aus, beendet ein Wächter-Thread den Prozess, damit
+Docker neu startet (watchdog). Das Alter des letzten Takts steht in der UI und
+im Healthcheck; ohne diese Zahl sieht ein scheintoter Dienst gesund aus.
+
+Cloud-Daten sind strikt nachrangig: die myWallbox-Cloud liefert nur eine
+Referenzmessung fürs Protokoll, die Sonnenprognose entscheidet allein über die
+Batterie-Netzladung und fällt ohne Antwort auf „nicht laden" zurück. PV-Regelung
+und Nachtfenster laufen ohne jede Internetverbindung.
 """
 
 import argparse
@@ -89,7 +95,6 @@ import base64
 import collections
 import ctypes
 import datetime
-import enum
 import hashlib
 import json
 import logging
@@ -99,6 +104,8 @@ import shutil
 import re
 import subprocess
 import sys
+import threading
+import time
 
 import aiohttp
 import websockets
@@ -187,7 +194,6 @@ FORECAST_URL = "https://api.forecast.solar/estimate/{lat}/{lon}/{tilt}/{azimut}/
 FORECAST_REFRESH_S = 6 * 3600    # Abruf-Rhythmus (Limit wäre 12/h — wir sind weit drunter)
 FORECAST_RETRY_S = 15 * 60       # Wartezeit nach Fehlversuch
 
-# Audi connect (MyAudi-Cloud über carconnectivity; Zugang aus .env, PVUEB_AUDI_*)
 # myWallbox-Cloud (api.wall-box.com; Zugang aus .env, PVUEB_WALLBOX_*).
 # Nur Referenzmessung — die Regelung rührt diese Werte nicht an.
 WALLBOX_TOKEN_TTL_S = 45         # JWT hält rund 60 s, vorher erneuern
@@ -207,17 +213,13 @@ WALLBOX_STATUS = {               # nur die Zustände, die im Betrieb vorkommen
     196: "entlädt", 209: "gesperrt, kein Auto",
     210: "gesperrt, Auto verbunden",
 }
-AUDI_MIN_INTERVAL_S = 180        # Untergrenze des Connectors, kürzer lehnt er ab
-# Nach Anmeldefehlern wird der Abstand verdoppelt. Hintergrund: Scheitert die
-# Anmeldung dauerhaft (Cariad ändert die Schnittstelle, der Connector hinkt
-# nach), liefe der Task sonst 144-mal am Tag ins Leere — genau so handelt man
-# sich eine temporäre Kontosperre ein, die dann auch die echte App trifft.
-AUDI_MAX_AUTH_BACKOFF_S = 6 * 3600   # Anmeldung abgelehnt: höchstens alle 6 h
-AUDI_MAX_ERROR_BACKOFF_S = 30 * 60   # Netz-/Cloud-Fehler: höchstens alle 30 min
-# Token und Antwort-Cache neben dem Skript ablegen, damit nicht jeder Abruf
-# einen neuen Login auslöst — beide enthalten Zugangsdaten, also gitignored.
-AUDI_TOKENSTORE = os.path.join(os.path.dirname(__file__), ".audi-tokenstore.json")
-AUDI_CACHE = os.path.join(os.path.dirname(__file__), ".audi-cache.json")
+# Aufgabenschirm: eine gestorbene Nebenaufgabe darf nie die anderen mitreißen
+TASK_RESTART_S = 5               # Wartezeit, bevor eine abgestürzte Aufgabe neu anläuft
+
+# Watchdog: siehe watchdog(). Der Regeltakt setzt in jeder Runde seinen
+# Herzschlag; bleibt er aus, endet der Prozess und Docker startet neu.
+WATCHDOG_TIMEOUT_S = 120         # ~24 ausgefallene Takte, bevor abgebrochen wird
+WATCHDOG_CHECK_S = 15            # Abstand der Prüfung im Wächter-Thread
 
 # Sitzung über einen Neustart retten (PVUEB_SESSION_FILE). Der Regler hält
 # Zustand, den ihm niemand zurückgeben kann — vor allem die ID der laufenden
@@ -333,14 +335,11 @@ class State:
     last_box_seen: float | None = None     # Unix-Zeit: letzter OCPP-Heartbeat
     last_huawei_seen: float | None = None  # Unix-Zeit: letzter erfolgreicher Modbus-Poll
     box_status = "unbekannt"               # letzter StatusNotification-Status der Box
-    audi_user = ""               # MyAudi-Konto, leer = Abfrage aus (aus .env)
-    audi_password = ""
-    audi_spin = ""               # S-PIN, nur für Steuerbefehle nötig (aus .env)
-    audi_vin = ""                # gewünschtes Fahrzeug, leer = das erste (aus .env)
-    audi_poll_s = 600            # Abstand der Cloud-Abrufe (aus .env)
-    audi: dict = {}              # letzter Fahrzeug-Snapshot, siehe audi_snapshot()
-    audi_error: str | None = None          # letzter Fehler, für die UI
-    audi_retry_s = 600           # aktueller Abstand, wächst nach Fehlern
+    # Herzschlag des Regeltakts, monotone Uhr. Nur diese eine Zahl entscheidet,
+    # ob der Regler lebt — der Wächter-Thread liest sie, sonst niemand.
+    last_tick: float = 0.0
+    tick_error: str | None = None          # letzter Fehler aus einem Regeltakt, für die UI
+    watchdog_s = WATCHDOG_TIMEOUT_S        # Geduld des Wächters in Sekunden (aus .env)
     wallbox_user = ""            # myWallbox-Konto, leer = Abfrage aus (aus .env)
     wallbox_password = ""
     wallbox_id = ""              # Charger-ID aus der App bzw. my.wall-box.com (aus .env)
@@ -348,7 +347,6 @@ class State:
     wallbox: dict = {}           # letzter Snapshot, siehe wallbox_snapshot()
     wallbox_error: str | None = None       # letzter Fehler, für die UI
     last_wallbox_ok: float | None = None   # Unix-Zeit des letzten erfolgreichen Abrufs
-    last_audi_ok: float | None = None      # Unix-Zeit: letzter erfolgreicher Abruf
     session_file = ""            # Ablage der Sitzungssicherung, leer = Standardpfad (aus .env)
     session_note = "frischer Start"        # was der Start aus der Sicherung machte, fürs UI
     started_at: float = 0.0                # Unix-Zeit des Prozessstarts
@@ -1028,13 +1026,22 @@ async def on_connect(websocket):
         await websocket.close(code=1008, reason="unauthorized")
         return
     log.info("Wallbox verbunden: %r", charge_point_id)
-    charge_point = ChargePoint(charge_point_id, websocket)
+    cp = ChargePoint(charge_point_id, websocket)
+    charge_point = cp
     try:
-        await charge_point.start()
+        await cp.start()
     except websockets.exceptions.ConnectionClosed:
         log.warning("Wallbox-Verbindung getrennt")
+    except Exception as exc:  # noqa: BLE001 — eine kaputte Verbindung ist kein Prozessende
+        log.warning("Wallbox-Verbindung beendet: %s", exc)
     finally:
-        charge_point = None
+        # Nur aufräumen, wenn wir noch der aktive Zugang sind. Die Pulsar öffnet
+        # die neue Verbindung, bevor die alte zumacht (28.07.2026: fünf Wechsel
+        # in zwei Minuten). Ein pauschales charge_point = None löschte dann die
+        # *neue* Verbindung, und der Regeltakt lief mit `charge_point is None`
+        # blind weiter, während StatusNotifications weiter hereinkamen.
+        if charge_point is cp:
+            charge_point = None
 
 
 def decode_i32(words: list[int]) -> float:
@@ -1329,143 +1336,6 @@ async def forecast_task():
         await asyncio.sleep(FORECAST_REFRESH_S)
 
 
-def attr_value(attr):
-    """Wert eines carconnectivity-Attributs, Enums als Klartext."""
-    value = getattr(attr, "value", None)
-    return value.value if isinstance(value, enum.Enum) else value
-
-
-def attr_age_s(attr) -> int | None:
-    """Alter des Werts *im Fahrzeug* in Sekunden — nicht des Abrufs.
-
-    Der Q4 ist oft offline, die Cloud liefert dann bereitwillig alte Zahlen.
-    Ohne dieses Alter sähe ein Ladestand von gestern aus wie der von jetzt.
-    """
-    ts = getattr(attr, "last_updated", None)
-    if ts is None:
-        return None
-    now = datetime.datetime.now(ts.tzinfo) if ts.tzinfo else datetime.datetime.now()
-    return round((now - ts).total_seconds())
-
-
-def audi_snapshot(vehicle) -> dict:
-    """Fahrzeugobjekt auf das flache dict eindampfen, das die UI anzeigt.
-
-    Fehlende Werte bleiben None: welche Felder ein Auto meldet, hängt an
-    Modell und Ausstattung, und im Zweifel meldet es gerade gar nichts.
-    """
-    # Elektro-Antrieb heraussuchen (der Q4 hat genau einen, ein PHEV hätte zwei)
-    drive = next((d for d in vehicle.drives.drives.values() if hasattr(d, "battery")), None)
-    charging = getattr(vehicle, "charging", None)
-    snap = {
-        "vin": attr_value(vehicle.vin),
-        "name": attr_value(vehicle.name) or attr_value(vehicle.model),
-        "state": attr_value(vehicle.state),                    # parked | driving | …
-        "connection": attr_value(vehicle.connection_state),    # online | offline | …
-        "odometer_km": attr_value(vehicle.odometer),
-        "outside_c": attr_value(vehicle.outside_temperature),
-        "climate": attr_value(vehicle.climatization.state),
-        "soc": None, "soc_age_s": None, "range_km": None,
-        "capacity_kwh": None, "battery_c": None,
-        "charge_state": None, "charge_kw": None, "charge_type": None,
-        "charge_rate_kmh": None, "target_soc": None, "max_current_a": None,
-        "plug": None, "plug_lock": None, "ready_at": None,
-    }
-    if drive is not None:
-        snap["soc"] = attr_value(drive.level)
-        snap["soc_age_s"] = attr_age_s(drive.level)
-        snap["range_km"] = attr_value(drive.range)
-        snap["capacity_kwh"] = attr_value(drive.battery.total_capacity)
-        snap["battery_c"] = attr_value(drive.battery.temperature)
-    if charging is not None:
-        snap["charge_state"] = attr_value(charging.state)
-        snap["charge_kw"] = attr_value(charging.power)
-        snap["charge_type"] = attr_value(charging.type)
-        snap["charge_rate_kmh"] = attr_value(charging.rate)
-        snap["target_soc"] = attr_value(charging.settings.target_level)
-        snap["max_current_a"] = attr_value(charging.settings.maximum_current)
-        snap["plug"] = attr_value(charging.connector.connection_state)
-        snap["plug_lock"] = attr_value(charging.connector.lock_state)
-        ready = attr_value(charging.estimated_date_reached)
-        snap["ready_at"] = ready.isoformat(timespec="minutes") if ready else None
-    return snap
-
-
-async def audi_task():
-    """Fragt den Ladestand des Q4 aus der MyAudi-Cloud ab (carconnectivity).
-
-    Reine Anzeige — der Regler entscheidet weiter allein über Netzleistung
-    und die Meldungen der Wallbox. Das ist Absicht: das Auto hängt oft
-    offline (LTE-Antenne), und ein Regelkreis, der auf Werte wartet, die
-    stunden- oder tagelang nicht kommen, wäre schlechter als keiner.
-
-    Die Bibliothek ist synchron (requests), läuft also im Executor, damit
-    der Regel-Loop nicht auf der Cloud-Antwort steht. Fehler sind hier der
-    Normalfall, nicht die Ausnahme: sie landen in state.audi_error und in
-    der UI, aber sie stoppen weder diesen Task noch den Regler.
-    """
-    try:
-        from carconnectivity.carconnectivity import CarConnectivity
-    except ImportError:
-        state.audi_error = ("carconnectivity fehlt — "
-                            "pip install carconnectivity-connector-audi")
-        log.error("Audi-Abfrage aus: %s", state.audi_error)
-        return
-
-    config = {"carConnectivity": {"connectors": [{"type": "audi", "config": {
-        "username": state.audi_user,
-        "password": state.audi_password,
-        "spin": state.audi_spin or None,
-        # Der Connector cacht selbst und lehnt kürzere Intervalle ab
-        "interval": max(AUDI_MIN_INTERVAL_S, state.audi_poll_s),
-    }}]}}
-    try:
-        from carconnectivity.errors import AuthenticationError
-    except ImportError:                      # ältere Fassungen kennen die Klasse nicht
-        AuthenticationError = ()
-
-    loop = asyncio.get_running_loop()
-    car = None
-    fehler_folge = 0
-    while True:
-        try:
-            if car is None:
-                car = await loop.run_in_executor(
-                    None, CarConnectivity, config, AUDI_TOKENSTORE, AUDI_CACHE)
-                await loop.run_in_executor(None, car.startup)
-            await loop.run_in_executor(None, car.fetch_all)
-            vehicles = car.get_garage().list_vehicles()
-            if state.audi_vin:
-                vehicles = [v for v in vehicles if attr_value(v.vin) == state.audi_vin]
-            if not vehicles:
-                raise RuntimeError(f"kein Fahrzeug gefunden (VIN-Filter {state.audi_vin!r})")
-            state.audi = audi_snapshot(vehicles[0])
-            state.audi_error = None
-            state.last_audi_ok = datetime.datetime.now().timestamp()
-            fehler_folge = 0
-            state.audi_retry_s = state.audi_poll_s
-            log.info("Audi: SOC %s %% (%s), %s, Reichweite %s km",
-                     state.audi["soc"], state.audi["connection"],
-                     state.audi["charge_state"], state.audi["range_km"])
-        except Exception as exc:  # noqa: BLE001 — Cloud-Fehler dürfen den Regler nie stoppen
-            state.audi_error = str(exc) or exc.__class__.__name__
-            fehler_folge += 1
-            # Abgelehnte Anmeldungen sind teurer als Netzfehler: dort droht die
-            # Kontosperre, hier hilft schlichtes Abwarten
-            abgelehnt = isinstance(exc, AuthenticationError) if AuthenticationError else False
-            grenze = AUDI_MAX_AUTH_BACKOFF_S if abgelehnt else AUDI_MAX_ERROR_BACKOFF_S
-            state.audi_retry_s = min(state.audi_poll_s * 2 ** (fehler_folge - 1), grenze)
-            log.warning("Audi-Abruf fehlgeschlagen (%d. Mal): %s — nächster Versuch in %d min",
-                        fehler_folge, state.audi_error, round(state.audi_retry_s / 60))
-            # Sitzung verwerfen: nach Login-/Token-Fehlern hilft nur neu anmelden
-            if car is not None:
-                try:
-                    await loop.run_in_executor(None, car.shutdown)
-                except Exception:  # noqa: BLE001
-                    pass
-                car = None
-        await asyncio.sleep(state.audi_retry_s)
-
 
 def wallbox_snapshot(daten: dict) -> dict:
     """Die paar Felder aus ~200 Zeilen Cloud-Antwort, die uns angehen."""
@@ -1598,13 +1468,38 @@ async def battery_night_check():
 
 
 async def control_task():
+    """Der Regeltakt. Er darf unter keinen Umständen aufhören.
+
+    Alles, was aus diesem Takt heraus die Wallbox anspricht, kann scheitern:
+    eine abgerissene Verbindung wirft ConnectionClosed, eine stumme Box nach
+    30 s TimeoutError. Vor dem 29.07.2026 flog beides ungebremst bis in das
+    asyncio.gather in main() — der Regler war dann weg, während Web-UI,
+    Modbus und OCPP-Server weiterliefen und alles gesund aussehen ließen
+    (docs/issue_nightly_load_did_not_work.md). Deshalb: ein einzelner Takt
+    darf fehlschlagen, die Schleife nicht.
+
+    Der Herzschlag steht bewusst vor allen Abbruchbedingungen. Eine getrennte
+    Wallbox oder ein toter Modbus sind Betriebszustände, keine Regler-Fehler —
+    der Wächter soll dabei nicht neu starten, sondern nur, wenn dieser Takt
+    selbst nicht mehr läuft.
+    """
     loop = asyncio.get_event_loop()
     while True:
         await asyncio.sleep(state.poll_interval_s)
-        await battery_night_check()
-        if charge_point is None or state.grid_w is None:
-            continue
-        await control_step(loop.time())
+        state.last_tick = time.monotonic()
+        try:
+            await battery_night_check()
+            if charge_point is None or state.grid_w is None:
+                state.tick_error = None
+                continue
+            await control_step(loop.time())
+            state.tick_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — ein Takt darf scheitern, der Regler nicht
+            state.tick_error = f"{exc.__class__.__name__}: {exc}"
+            log.exception("Regeltakt fehlgeschlagen (%s) — weiter im nächsten Takt",
+                          state.tick_error)
 
 
 async def control_step(now: float):
@@ -1865,11 +1760,6 @@ INDEX_HTML = """<!doctype html>
          onchange="setConfig({heartbeat_s: +this.value})">
 </div>
 </section>
-<section class="page">
-<h2>Audi Q4 <span id="aheart"></span></h2>
-<div id="audibar"></div>
-<div id="audistat"></div>
-</section>
 </div>
 <script>
 let s = {};
@@ -1987,34 +1877,16 @@ function gridShare() {
   if (s.charge_w < 1) return txt + " (Haus)";
   return txt + " – " + Math.round(100 * Math.min(imp, s.charge_w) / s.charge_w) + " % der Ladung";
 }
-// Enum-Werte der carconnectivity-Bibliothek auf Klartext. Unbekanntes fällt
-// durch (der Rohwert ist immer noch nützlicher als ein leeres Feld).
-const A_CONN = {online:"🛜 online", reachable:"🛜 erreichbar (schläft)", offline:"📵 offline"};
-const A_STATE = {parked:"geparkt", driving:"fährt", ignition_on:"Zündung an", offline:"offline"};
-const A_CHG = {off:"aus", ready_for_charging:"bereit", charging:"⚡ lädt",
-               conservation:"Erhaltungsladung", discharging:"entlädt", error:"⛔ Fehler"};
-const A_PLUG = {connected:"🔌 gesteckt", disconnected:"gezogen"};
-const A_LOCK = {locked:"🔒 verriegelt", unlocked:"🔓 entriegelt"};
-const A_CLIMA = {off:"aus", heating:"heizt", cooling:"kühlt", ventilation:"lüftet"};
-function amap(table, key) {
-  if (key === null || key === undefined) return "–";
-  return table[key] || key;
-}
-function anum(v, unit, digits) {
-  return (v === null || v === undefined) ? "–" : v.toFixed(digits === undefined ? 0 : digits) + unit;
-}
-// Alter des Werts im Fahrzeug — der Q4 hängt oft offline und die Cloud
-// liefert dann alte Zahlen, ohne das von sich aus dazuzusagen.
-function aage(sec) {
-  if (sec === null || sec === undefined) return "";
-  if (sec < 600) return "";
-  if (sec < 5400) return " (vor " + Math.round(sec/60) + " min)";
-  if (sec < 172800) return " (vor " + Math.round(sec/3600) + " h ⚠)";
-  return " (vor " + Math.round(sec/86400) + " Tagen ⚠)";
-}
 function heart(seen_s, limit) {
   const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
   return ok ? '<span class="heart">❤️</span>' : '<span class="heart dead">💔</span>';
+}
+// Der einzige Wert, an dem hängt, ob überhaupt noch geregelt wird. Alles
+// andere auf dieser Seite kann frisch aussehen, während der Regler steht.
+function tickInfo() {
+  if (s.tick_age_s === null || s.tick_age_s === undefined) return "💔 läuft nicht";
+  const txt = heart(s.tick_age_s, s.tick_timeout_s) + " vor " + s.tick_age_s + " s";
+  return s.tick_error ? txt + ' <span class="err">⚠ ' + s.tick_error + "</span>" : txt;
 }
 async function refresh() {
   s = await (await fetch("/api/status")).json();
@@ -2053,6 +1925,7 @@ async function refresh() {
     ["Dauer-Boost", permaInfo()],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
+    ["Regeltakt", tickInfo()],
     ["Version", `<a href="/info">${(s.version||{}).commit || "?"}</a>`],
     ["Sitzung beim Start", s.session_note || "–"],
   ];
@@ -2071,7 +1944,6 @@ async function refresh() {
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
   renderWallbox();
-  renderAudi(row);
   for (const m of ["pv","minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
   document.getElementById("minlabel").textContent = s.min_amps;
@@ -2089,49 +1961,6 @@ async function refresh() {
   bb.textContent = s.battery_grid_charge
     ? "Batterie-Netzladung stoppen (lädt mit " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)"
     : "Batterie-Netzladung starten (Test: " + s.batt_charge_w + " W bis " + s.batt_target_soc + " %)";
-}
-function renderAudi(row) {
-  const bar = document.getElementById("audibar");
-  const out = document.getElementById("audistat");
-  document.getElementById("aheart").innerHTML =
-    s.audi_enabled ? heart(s.audi_seen_s, 3 * s.audi_poll_s) : "";
-  if (!s.audi_enabled) {
-    bar.innerHTML = "";
-    out.innerHTML = '<div class="note">Abfrage aus – PVUEB_AUDI_USER und '
-      + 'PVUEB_AUDI_PASSWORD in der .env setzen.</div>';
-    return;
-  }
-  const a = s.audi || {};
-  // Alte Werte sichtbar entwerten, statt sie wie frische Messwerte zu zeigen
-  const stale = a.soc_age_s !== null && a.soc_age_s !== undefined && a.soc_age_s > 5400;
-  bar.innerHTML = a.soc === null || a.soc === undefined ? ""
-    : '<div class="bar' + (stale ? ' stale' : '') + '"><i style="width:'
-      + Math.max(0, Math.min(100, a.soc)) + '%"></i><b>' + a.soc.toFixed(0) + ' %'
-      + (a.target_soc ? ' / Ziel ' + a.target_soc.toFixed(0) + ' %' : '') + '</b></div>';
-  const arows = [
-    ["Verbindung", amap(A_CONN, a.connection)],
-    ["Fahrzeug", amap(A_STATE, a.state)],
-    ["Ladestand", anum(a.soc, " %") + aage(a.soc_age_s)],
-    ["Reichweite", anum(a.range_km, " km")],
-    ["Ladevorgang", amap(A_CHG, a.charge_state)],
-    ["Ladeleistung (Auto)", anum(a.charge_kw, " kW", 1)],
-    ["Ladeart", a.charge_type === null || a.charge_type === undefined
-      ? "–" : String(a.charge_type).toUpperCase()],
-    ["Ladetempo", anum(a.charge_rate_kmh, " km/h")],
-    ["voll um", a.ready_at ? a.ready_at.replace("T", " ") : "–"],
-    ["Ladestrom-Limit (Auto)", anum(a.max_current_a, " A")],
-    ["Stecker", amap(A_PLUG, a.plug) + " / " + amap(A_LOCK, a.plug_lock)],
-    ["Batterie", anum(a.capacity_kwh, " kWh", 1)
-      + (a.battery_c === null || a.battery_c === undefined ? "" : ", " + a.battery_c.toFixed(0) + " °C")],
-    ["Klimatisierung", amap(A_CLIMA, a.climate)],
-    ["Außentemperatur", anum(a.outside_c, " °C", 1)],
-    ["Kilometerstand", anum(a.odometer_km, " km")],
-    ["Cloud-Abruf", ago(s.audi_seen_s) + " (alle " + Math.round(s.audi_poll_s/60) + " min)"],
-  ];
-  out.innerHTML = arows.map(row).join("")
-    + (s.audi_error ? '<div class="note err">⚠ ' + s.audi_error + "</div>" : "")
-    + '<div class="note">Nur Anzeige – geregelt wird weiter nach Netzleistung '
-    + 'und Wallbox-Meldung.</div>';
 }
 async function toggleBatt() {
   const r = await fetch("/api/battery/"+(s.battery_grid_charge?"off":"on"), {method:"POST"});
@@ -2260,13 +2089,13 @@ def status_dict() -> dict:
         "charge_w_abweichung": None if state.wallbox.get("power_w") is None
                                        or not state.charging
                                else round(state.charge_w - state.wallbox["power_w"]),
-        "audi_enabled": bool(state.audi_user),
-        "audi": state.audi,
-        "audi_retry_s": state.audi_retry_s,
-        "audi_error": state.audi_error,
-        "audi_poll_s": state.audi_poll_s,
-        "audi_seen_s": None if state.last_audi_ok is None
-                       else round(datetime.datetime.now().timestamp() - state.last_audi_ok),
+        # Alter des letzten Regeltakts. Die eine Zahl, an der ablesbar ist, ob
+        # der Regler noch lebt — alles andere hier (Netz, SOC, Box-Status) kann
+        # frisch aussehen, während niemand mehr regelt (docs/issue_nightly_load_did_not_work.md).
+        "tick_age_s": None if not state.last_tick
+                      else round(time.monotonic() - state.last_tick),
+        "tick_timeout_s": state.watchdog_s,
+        "tick_error": state.tick_error,
         "version": VERSION,
         "session_note": state.session_note,
         "uptime_s": round(datetime.datetime.now().timestamp() - state.started_at),
@@ -2653,12 +2482,9 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
             ("PVUEB_WALLBOX_POLL_S", state.wallbox_poll_s,
              "Abrufabstand; die Cloud aktualisiert alle 30 s"),
         ]),
-        ("Fahrzeugdaten aus der MyAudi-Cloud (reine Anzeige)", [
-            ("PVUEB_AUDI_USER", state.audi_user, "MyAudi-Konto, leer = Abfrage aus"),
-            ("PVUEB_AUDI_PASSWORD", state.audi_password, ""),
-            ("PVUEB_AUDI_SPIN", state.audi_spin, "S-PIN, nur für Steuerbefehle nötig"),
-            ("PVUEB_AUDI_VIN", state.audi_vin, "Nur nötig, wenn mehrere Autos im Konto hängen"),
-            ("PVUEB_AUDI_POLL_S", state.audi_poll_s, "Abrufabstand, Untergrenze 180 s"),
+        ("Betriebssicherheit", [
+            ("PVUEB_WATCHDOG_S", state.watchdog_s,
+             "Bleibt der Regeltakt so lange aus, endet der Prozess und Docker startet neu"),
         ]),
     ]
 
@@ -2733,6 +2559,64 @@ def write_dotenv(grund: str = "Start"):
                 os.unlink(temp)
             except OSError:
                 pass
+
+
+async def bewacht(name: str, factory):
+    """Eine Daueraufgabe so führen, dass ihr Tod niemanden mitreißt.
+
+    Vorher hingen alle Aufgaben nackt in einem asyncio.gather: die erste, die
+    eine Ausnahme warf, beendete main() und riss die übrigen mit. Ein Fehler
+    im Mitschnitt hätte so den Regler gestoppt — und ein Fehler im Regler hat
+    genau das getan (docs/issue_nightly_load_did_not_work.md).
+
+    factory ist bewusst eine Funktion, kein fertiger Coroutine: ein Coroutine
+    lässt sich nur einmal starten, für den Neuanlauf brauchen wir einen neuen.
+    """
+    while True:
+        try:
+            await factory()
+            log.warning("Aufgabe %s ist beendet — Neustart in %d s", name, TASK_RESTART_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — eine Aufgabe darf sterben, der Dienst nicht
+            log.exception("Aufgabe %s abgestürzt — Neustart in %d s", name, TASK_RESTART_S)
+        await asyncio.sleep(TASK_RESTART_S)
+
+
+def takt_tot(jetzt: float) -> bool:
+    """Ist der Herzschlag des Regeltakts überfällig?
+
+    Getrennt von watchdog(), weil sich die Bedingung so prüfen lässt, ohne
+    einen Testlauf abzuschießen (poc/test_robust.py). Vor dem ersten Takt
+    (last_tick == 0) gilt nichts als tot — sonst schlüge der Wächter im
+    Anlauf zu, bevor überhaupt etwas laufen konnte.
+    """
+    return bool(state.last_tick) and (jetzt - state.last_tick) > state.watchdog_s
+
+
+def watchdog():
+    """Letzte Rückfallebene: schweigt der Regeltakt, endet der Prozess.
+
+    Bewusst ein Thread und kein asyncio-Task. Bricht main() ab, cancelt
+    asyncio.run alle Aufgaben — ein Wächter im selben gather stürbe genau in
+    dem Moment mit, in dem er gebraucht wird. Ein Thread läuft weiter, auch
+    wenn der Event-Loop steht.
+
+    Und os._exit statt sys.exit: am 28.07.2026 hing der Interpreter-Shutdown
+    selbst fest, weil ein blockierender Fremd-Thread im Default-Executor auf
+    eine Cloud-Antwort wartete, die nie kam. Der Prozess lief danach 17 Stunden
+    scheintot weiter — Web-UI bedienbar, Messwerte frisch, kein Regeln.
+    os._exit umgeht jeden Aufräumpfad, der ebenfalls hängen könnte; alles, was
+    einen Neustart überleben muss, steht ohnehin schon in der Sitzungsdatei.
+    """
+    while True:
+        time.sleep(WATCHDOG_CHECK_S)
+        if takt_tot(time.monotonic()):
+            log.critical("Wächter: kein Regeltakt seit %.0f s (Grenze %d s) — "
+                         "Prozess wird beendet, damit er neu starten kann",
+                         time.monotonic() - state.last_tick, state.watchdog_s)
+            logging.shutdown()                   # Meldung noch herausschreiben
+            os._exit(1)
 
 
 async def main():
@@ -2842,17 +2726,12 @@ async def main():
     if state.wallbox_user and not (state.wallbox_password and state.wallbox_id):
         sys.exit("PVUEB_WALLBOX_USER gesetzt, aber PVUEB_WALLBOX_PASSWORD "
                  "oder PVUEB_WALLBOX_ID fehlt")
-    state.audi_user = os.environ.get("PVUEB_AUDI_USER", "")
-    state.audi_password = os.environ.get("PVUEB_AUDI_PASSWORD", "")
-    state.audi_spin = os.environ.get("PVUEB_AUDI_SPIN", "")
-    state.audi_vin = os.environ.get("PVUEB_AUDI_VIN", "")
-    state.audi_poll_s = int(os.environ.get("PVUEB_AUDI_POLL_S", "600"))
-    if state.audi_user and not state.audi_password:
-        sys.exit("PVUEB_AUDI_USER gesetzt, aber PVUEB_AUDI_PASSWORD fehlt")
-    if state.audi_poll_s < AUDI_MIN_INTERVAL_S:
-        sys.exit(f"PVUEB_AUDI_POLL_S muss >= {AUDI_MIN_INTERVAL_S} sein "
-                 "(kürzere Intervalle lehnt der Connector ab)")
-
+    state.watchdog_s = int(os.environ.get("PVUEB_WATCHDOG_S", WATCHDOG_TIMEOUT_S))
+    # Untergrenze: der Wächter prüft alle WATCHDOG_CHECK_S, und ein Takt darf
+    # auch mal auf einen zähen Modbus-Zugriff warten, ohne als tot zu gelten
+    if state.watchdog_s < max(30, 4 * state.poll_interval_s):
+        sys.exit(f"PVUEB_WATCHDOG_S muss >= {max(30, 4 * state.poll_interval_s)} sein "
+                 "(mindestens ein paar Regeltakte Geduld)")
     # Konfiguration steht vollständig fest: zurückschreiben, damit die .env
     # jeden wirksamen Wert enthält statt nur die abweichenden
     write_dotenv()
@@ -2872,14 +2751,28 @@ async def main():
 
     server = await websockets.serve(on_connect, "0.0.0.0", args.port, subprotocols=["ocpp1.6"])
     log.info("Regel-Loop läuft. OCPP auf ws://0.0.0.0:%s/, Wechselrichter %s", args.port, args.inverter)
-    tasks = [server.wait_closed(), modbus_task(args.inverter), control_task(),
-             command_loop(), web_task(args.web_port), forecast_task(), session_task()]
+    # Wächter zuerst: ab hier ist ein stehender Regeltakt eine Frage von
+    # Minuten, nicht von Stunden. Daemon-Thread, damit er kein Ende blockiert.
+    state.last_tick = time.monotonic()
+    threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
+    log.info("Wächter aktiv: Neustart, wenn der Regeltakt %d s ausbleibt", state.watchdog_s)
+
+    # Jede Daueraufgabe unter den Schirm. Der OCPP-Server steht daneben: er
+    # läuft schon und hat mit wait_closed() nichts, was neu zu starten wäre.
+    aufgaben = {
+        "Regeltakt": control_task,
+        "Modbus": lambda: modbus_task(args.inverter),
+        "Web-UI": lambda: web_task(args.web_port),
+        "Kommandozeile": command_loop,
+        "Prognose": forecast_task,
+        "Sitzungssicherung": session_task,
+    }
     if state.record_dir:
-        tasks.append(record_task())
-    if state.audi_user:
-        tasks.append(audi_task())
+        aufgaben["Mitschnitt"] = record_task
     if state.wallbox_user:
-        tasks.append(wallbox_cloud_task())
+        aufgaben["Wallbox-Cloud"] = wallbox_cloud_task
+    tasks = [server.wait_closed()]
+    tasks += [bewacht(name, factory) for name, factory in aufgaben.items()]
     await asyncio.gather(*tasks)
 
 

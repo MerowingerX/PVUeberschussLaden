@@ -91,11 +91,11 @@ aber trotzdem zügig.
   [features/feature_NeustartOhneUnterbrechung.md](features/feature_NeustartOhneUnterbrechung.md)
 - **Startverhalten ohne Sicherung**: freigegeben, Modus `minpv` mit 6 A. Die Anlage
   arbeitet nach einem Strom- oder Softwareausfall von allein weiter.
-- **Web-UI** fürs Handy, fünf Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
+- **Web-UI** fürs Handy, vier Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
   Ladeleistung, Freigabe, Modus, Nachtautomatik) · *Huawei-Batterie* (SOC, Leistung,
   Netzladung, Prognose) · *Wallbox* (gemessene Ladeleistung, Sitzungsenergie, Firmware) ·
-  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Schieberegler,
-  Version) · *Audi Q4* (Ladestand, Reichweite, Stecker). Dazu `/info`: Commit, Bauzeit,
+  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Alter des
+  letzten Regeltakts, Schieberegler, Version). Dazu `/info`: Commit, Bauzeit,
   Laufzeit und was der Start aus der Sitzungssicherung gemacht hat.
 - **Ladeleistung als Referenz** (optional, `PVUEB_WALLBOX_*`): Die Pulsar Plus meldet ihre
   Ladeleistung nicht über OCPP, liefert sie aber an die Hersteller-Cloud
@@ -103,11 +103,12 @@ aber trotzdem zügig.
   Kontrolle — die Regelung nutzt den Wert nicht, weil die Cloud alle 30 s aktualisiert
   und ein Internetausfall keine Ladung beeinflussen darf. Status und Mitschnitt führen
   die Differenz zur Schätzung als `charge_w_abweichung` mit.
-- **Fahrzeugdaten aus der MyAudi-Cloud** (optional, `PVUEB_AUDI_*`): eigenes Slide mit
-  Ladestand, Reichweite, Ladestatus, Zielladestand und Stecker-Zustand. Reine Anzeige —
-  geregelt wird weiter nach Netzleistung und Wallbox-Meldung, weil das Auto oft offline
-  hängt. Die UI zeigt deshalb zu jedem Wert das Alter *im Fahrzeug*, nicht nur das des
-  Cloud-Abrufs
+- **Wächter über dem Regeltakt**: Ein fehlgeschlagener Takt kostet einen Takt, eine
+  abgestürzte Nebenaufgabe läuft neu an, und bleibt der Takt trotzdem aus, beendet ein
+  eigener Thread den Prozess, damit Docker neu startet. Das Alter des letzten Takts steht
+  in der UI und im Docker-Healthcheck — ohne diese Zahl sieht ein Dienst, der nur noch
+  Messwerte anzeigt, genauso gesund aus wie einer, der regelt
+  ([docs/issue_nightly_load_did_not_work.md](docs/issue_nightly_load_did_not_work.md))
 - **Mitschnitt** (optional): Der Regelbetrieb wird als JSON-Zeilen mitgeschrieben, eine
   Datei pro Tag, ältere Tage fallen automatisch heraus. Daraus baut
   [poc/curve_from_recording.py](poc/curve_from_recording.py) echte Kurven für die
@@ -191,7 +192,7 @@ Beim OCPP-Zugang die Reihenfolge beachten: **erst** Benutzer und Passwort in der
 Wallbox-App eintragen, **dann** die `.env` setzen und neu starten — sonst kommt die
 Box nicht mehr herein.
 
-Zugangsdaten (Wechselrichter-IP, MyAudi-Konto) stehen in `.env`, Notizen zur eigenen
+Zugangsdaten (Wechselrichter-IP, myWallbox-Konto) stehen in `.env`, Notizen zur eigenen
 Anlage in `LOCAL.md` — beide sind gitignored und gehören nicht ins Repository.
 
 ## Konfiguration
@@ -238,7 +239,7 @@ Die vollständige Liste mit Defaults und Erklärungen steht in
 | Mitschnitt | Zielordner, Abtastung, Aufbewahrungsdauer |
 | Anmeldung | Basic Auth für Web-UI und OCPP (leer = offen) |
 | Wallbox-Cloud | Konto, Charger-ID, Abrufintervall (Referenzmessung) |
-| Fahrzeugdaten | MyAudi-Zugang, Abrufintervall |
+| Betriebssicherheit | Geduld des Wächters, bis der Prozess neu startet |
 
 Bewusst fest im Code (`poc/charge_loop.py`, siehe Designprinzip):
 
@@ -302,17 +303,16 @@ Versuchsabstand, `Wallbox meldet keine Ladeleistung`, und beim Start einmalig
 `Blockread 37001+114 nicht möglich`, falls der SDongle keine Sammelabfrage beherrscht
 (dann werden die Register einzeln gelesen — funktioniert, zappelt aber mehr).
 
-### Cloud-Zugänge einzeln prüfen
+### Cloud-Zugang einzeln prüfen
 
-Beide Anbindungen lassen sich testen, ohne den Regler zu starten:
+Die Anbindung lässt sich testen, ohne den Regler zu starten:
 
 ```bash
 python poc/read_wallbox_cloud.py          # Login, Charger-ID, Ladeleistung
 python poc/read_wallbox_cloud.py --watch  # alle 30 s, bis Strg-C
-python poc/read_audi.py                   # Login, Fahrzeug-Snapshot
 ```
 
-Beide lesen die Zugangsdaten aus der `.env` und geben nie ein Passwort aus.
+Es liest die Zugangsdaten aus der `.env` und geben nie ein Passwort aus.
 `read_wallbox_cloud.py` ermittelt die Charger-ID selbst — sie muss also nicht
 vorab bekannt sein.
 
@@ -323,18 +323,17 @@ Häufige Befunde:
 | `charging_power` 0 bei Status 181 | Box gibt frei, Fahrzeug nimmt nichts — meist voll |
 | `state_of_charge: None` | Normal bei AC ohne ISO 15118; die Box kennt den Ladestand nicht |
 | `max_charging_current` < 16 | Der Schieberegler in der Wallbox-App begrenzt; im OCPP-Betrieb überschreibt unser Limit ihn, sonst nicht |
-| MyAudi: `invalid assertion headers` | Cariad hat die Schnittstelle geändert, der Connector hinkt nach. Kein Passwortproblem, nicht selbst behebbar — der Abstand zwischen Versuchen verdoppelt sich dann bis auf sechs Stunden, damit das Konto nicht gesperrt wird |
 
 ## Projektstand & Struktur
 
 | Datei | Zweck |
 |---|---|
 | [poc/charge_loop.py](poc/charge_loop.py) | ✅ Regel-Loop, OCPP-Server, Web-UI, Mitschnitt — der eigentliche Dienst |
-| [poc/test_sim.py](poc/test_sim.py) | ✅ 18 Simulationsszenarien gegen den echten Regelcode |
+| [poc/test_sim.py](poc/test_sim.py) | ✅ 24 Simulationsszenarien gegen den echten Regelcode |
+| [poc/test_robust.py](poc/test_robust.py) | ✅ Regressionstests gegen den Ausfall vom 28.07.2026 |
 | [poc/curve_from_recording.py](poc/curve_from_recording.py) | ✅ macht aus Mitschnitten PV-Kurven für die Simulation |
 | [poc/record_status.py](poc/record_status.py) | Mitschnitt von außen über HTTP (der Dienst kann es selbst) |
 | [poc/read_wallbox_cloud.py](poc/read_wallbox_cloud.py) | ✅ myWallbox-Zugang prüfen, Charger-ID ermitteln |
-| [poc/read_audi.py](poc/read_audi.py) | MyAudi-Zugang prüfen (derzeit blockiert durch Cariad) |
 | [poc/read_sun2000.py](poc/read_sun2000.py) | ✅ Modbus-Registertest (Register verifiziert) |
 | [poc/ocpp_server.py](poc/ocpp_server.py) | ✅ OCPP-Server, Vorstufe des Regel-Loops |
 | [poc/read_battery_registers.py](poc/read_battery_registers.py) | ✅ LUNA2000-Steuerregister verifiziert (nur lesend) |

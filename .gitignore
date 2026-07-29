@@ -4,7 +4,9 @@
 .env.tmp
 LOCAL.md
 
-# MyAudi-Sitzung: Token und Antwort-Cache, enthalten Zugangsdaten
+# Reste der entfernten MyAudi-Anbindung: Token und Antwort-Cache enthalten
+# Zugangsdaten. Die Dateien können gelöscht werden; bis dahin bleiben sie
+# gesperrt, damit sie nicht versehentlich doch im Repository landen.
 poc/.audi-tokenstore.json
 poc/.audi-cache.json
 
