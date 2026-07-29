@@ -243,6 +243,22 @@ SESSION_CLOCK_TOLERANCE_S = 5    # so viel Zeitstempel-Vorlauf ist Uhrendrift, k
 CLOCK_WAIT_MAX_S = 15            # so lange auf NTP warten, bevor die Sitzung bewertet wird
 TIME_ERROR = 5                   # adjtimex(2): Uhr nicht synchronisiert (STA_UNSYNC)
 
+# Meldestelle (PVUEB_NOTIFY_URL). PVueb kennt keinen Messenger: es legt ein
+# JSON in eine Warteschlange und läuft weiter. Am 28.07.2026 regelte der Dienst
+# 17 Stunden nicht mehr, und niemand erfuhr es — das ist der ganze Zweck.
+#
+# Die Warteschlange ist begrenzt und wirft Ältestes weg. Unbegrenzt wäre sie
+# ein Speicherleck mit Anlauf: eine flatternde Quelle bei totem Empfänger füllt
+# sie in Minuten. Der Empfänger hat einen Spool auf Platte — hier drin muss
+# nur der Weg über einen Neustart des Messengers reichen.
+NOTIFY_QUEUE_MAX = 200           # mehr Meldungen als das sind ohnehin ein Fehler
+NOTIFY_SEND_CHECK_S = 5          # Takt der Zustellaufgabe
+NOTIFY_MAX_AGE_S = 900           # danach ist eine Meldung wertlos und fliegt raus
+NOTIFY_RETRY_MIN_S = 20          # erster Abstand nach einem Fehlversuch
+NOTIFY_RETRY_MAX_S = 300         # Obergrenze des wachsenden Abstands
+MELDE_CHECK_S = 10               # Takt der Regelprüfung (Flanken, Offline-Fristen)
+MELDE_SPERRE_S = 3600            # Wiederholsperre für dieselbe Lage beim Empfänger
+
 
 class State:
     # Startverhalten ohne gültige Sicherung: freigegeben, PV-Minimum mit 6 A.
@@ -356,6 +372,12 @@ class State:
     session_file = ""            # Ablage der Sitzungssicherung, leer = Standardpfad (aus .env)
     session_note = "frischer Start"        # was der Start aus der Sicherung machte, fürs UI
     started_at: float = 0.0                # Unix-Zeit des Prozessstarts
+    notify_url = ""              # Meldestelle, leer = aus (aus .env)
+    notify_timeout_s = 5         # Zeitgrenze je Zustellversuch (aus .env)
+    melde_offline_s = 300        # so lange darf ein Gerät weg sein, bevor Alarm (aus .env)
+    notify_error: str | None = None        # letzter Zustellfehler, nur fürs UI
+    notify_sent = 0                        # zugestellte Meldungen
+    notify_dropped = 0                     # verworfene (zu alt oder Warteschlange voll)
 
 
 def session_path() -> str:
@@ -2237,6 +2259,13 @@ def status_dict() -> dict:
         "version": VERSION,
         "session_note": state.session_note,
         "uptime_s": round(datetime.datetime.now().timestamp() - state.started_at),
+        # Meldeweg: dass er steht, sieht man sonst erst daran, dass eine
+        # erwartete Nachricht ausbleibt — und das ist zu spät.
+        "notify_enabled": bool(state.notify_url),
+        "notify_queue": len(meldungen),
+        "notify_sent": state.notify_sent,
+        "notify_dropped": state.notify_dropped,
+        "notify_error": state.notify_error,
     }
 
 
@@ -2624,6 +2653,17 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
             ("PVUEB_WATCHDOG_S", state.watchdog_s,
              "Bleibt der Regeltakt so lange aus, endet der Prozess und Docker startet neu"),
         ]),
+        ("Benachrichtigung", [
+            ("PVUEB_NOTIFY_URL", state.notify_url,
+             "Meldestelle, leer = aus. PVueb kennt keinen Messenger — es schickt "
+             "ein JSON dorthin und vergisst es. Ziel ist myhome-messenger "
+             "(http://myhome-messenger:8090/notify), ntfy tut es genauso"),
+            ("PVUEB_NOTIFY_TIMEOUT_S", state.notify_timeout_s,
+             "Zeitgrenze je Zustellversuch. Der Regeltakt wartet nie darauf"),
+            ("PVUEB_MELDE_OFFLINE_S", state.melde_offline_s,
+             "So lange dürfen Wechselrichter oder Wallbox weg sein, bevor ein "
+             "Alarm rausgeht. Gilt auch als Schonzeit nach dem Start"),
+        ]),
     ]
 
 
@@ -2757,6 +2797,234 @@ def watchdog():
             os._exit(1)
 
 
+# ----------------------------------------------------------------- Meldestelle
+
+# Die Warteschlange. Der Regeltakt legt hinein und läuft weiter — kein await
+# auf den Versand, keine Wiederholung im Regelpfad. Ein toter Messenger darf
+# niemals eine Ladung beeinflussen, dieselbe Regel wie für die myWallbox-Cloud.
+meldungen: collections.deque = collections.deque(maxlen=NOTIFY_QUEUE_MAX)
+
+# OCPP-Zustände, in denen ein Fahrzeug steckt. „Available" heißt frei, alles
+# andere heißt: da hängt ein Kabel dran.
+ANGESTECKT = ("Preparing", "Charging", "SuspendedEV", "SuspendedEVSE", "Finishing")
+
+
+def melden(thema: str, text: str, stufe: str = "info",
+           schluessel: str = "", sperre_s: float = MELDE_SPERRE_S):
+    """Eine Meldung einreihen. Kehrt sofort zurück und wirft nie.
+
+    Entprellt wird beim Empfänger — deshalb reisen schluessel und
+    wiederholsperre_s nur mit. Sonst müsste jedes meldende Projekt dieselbe
+    Logik nachbauen.
+    """
+    try:
+        if len(meldungen) == NOTIFY_QUEUE_MAX:
+            state.notify_dropped += 1      # deque wirft gleich das Älteste weg
+        meldungen.append({
+            "nachricht": {
+                "quelle": "pvueb", "thema": thema, "text": text, "stufe": stufe,
+                "schluessel": schluessel or f"{thema}-{stufe}",
+                "wiederholsperre_s": sperre_s,
+            },
+            "erzeugt": datetime.datetime.now().timestamp(),
+            "naechster": 0.0, "versuche": 0,
+        })
+    except Exception:  # noqa: BLE001 — eine Meldung darf nichts kaputt machen
+        log.exception("Meldung ließ sich nicht einreihen")
+
+
+def melde_lage(jetzt: float) -> dict:
+    """Die Tatsachen, aus denen die Regeln ihre Schlüsse ziehen.
+
+    Getrennt von den Regeln, damit test_melden.py sie erfinden kann, ohne
+    Wallbox, Wechselrichter und Uhr.
+    """
+    return {
+        "box_verbunden": charge_point is not None,
+        "box_status": state.box_status,
+        "laedt": state.charging,
+        "nacht": in_night_window(),
+        "akku_netzladung": state.battery_grid_charge,
+        "wr_alter_s": None if state.last_huawei_seen is None
+                      else jetzt - state.last_huawei_seen,
+    }
+
+
+class Melder:
+    """Flanken erkennen und daraus Meldungen machen.
+
+    Bewusst ein Beobachter neben dem Regler und kein Aufruf im Regelpfad: die
+    Regeln lesen nur, können also nichts stoppen, verzögern oder abbrechen.
+    Und sie stehen an einer Stelle, statt über zehn Handler verstreut.
+    """
+
+    def __init__(self, grenze_s: float, start: float):
+        self.grenze_s = grenze_s
+        self.start = start
+        self.erste = True
+        self.box_offline_seit: float | None = None
+        self.box_gemeldet = False
+        self.wr_offline_seit: float | None = None
+        self.wr_gemeldet = False
+        self.angesteckt = False
+        self.laedt = False
+        self.lud_nachts = False
+        self.akku_lud = False
+
+    def _uebernehmen(self, lage: dict):
+        self.angesteckt = lage["box_status"] in ANGESTECKT
+        self.laedt = lage["laedt"]
+        self.lud_nachts = lage["nacht"]
+        self.akku_lud = lage["akku_netzladung"]
+
+    def pruefen(self, lage: dict, jetzt: float) -> list[dict]:
+        # Erster Durchgang: nur merken. Sonst meldete jeder Neustart „Auto
+        # angesteckt" und „lädt" für einen Zustand, der schon vorher galt.
+        if self.erste:
+            self.erste = False
+            self._uebernehmen(lage)
+            return []
+        return self._offline(lage, jetzt) + self._flanken(lage)
+
+    # -- Alarme: etwas ist weg ------------------------------------------
+
+    def _offline(self, lage: dict, jetzt: float) -> list[dict]:
+        # Anlaufschonzeit: unmittelbar nach dem Start ist noch nichts
+        # verbunden. Ohne diese Zeile meldete jeder Neustart beide Geräte als
+        # ausgefallen, und zwar bevor sie überhaupt eine Chance hatten.
+        if jetzt - self.start < self.grenze_s:
+            return []
+
+        raus = []
+        wr_weg = lage["wr_alter_s"] is None or lage["wr_alter_s"] > self.grenze_s
+        raus += self._geraet(
+            "wechselrichter", wr_weg, jetzt, "wr",
+            "Wechselrichter antwortet nicht mehr (Modbus). Ohne ihn ist der "
+            "PV-Überschuss unbekannt — Nachtladen und Akkusteuerung laufen "
+            "weiter, Überschussladen nicht.")
+        raus += self._geraet(
+            "wallbox", not lage["box_verbunden"], jetzt, "box",
+            "Wallbox ist nicht mehr verbunden (OCPP). Es kann nicht geladen "
+            "werden, auch nicht im Nachtfenster.")
+        return raus
+
+    def _geraet(self, thema: str, weg: bool, jetzt: float,
+                merker: str, was: str) -> list[dict]:
+        seit = getattr(self, f"{merker}_offline_seit")
+        gemeldet = getattr(self, f"{merker}_gemeldet")
+
+        if weg:
+            if seit is None:
+                setattr(self, f"{merker}_offline_seit", jetzt)
+                return []
+            if not gemeldet and jetzt - seit >= self.grenze_s:
+                setattr(self, f"{merker}_gemeldet", True)
+                return [{"thema": thema, "stufe": "alarm",
+                         "text": f"{was} Seit {(jetzt - seit) / 60:.0f} min."}]
+            return []
+
+        setattr(self, f"{merker}_offline_seit", None)
+        if gemeldet:
+            setattr(self, f"{merker}_gemeldet", False)
+            # Die Entwarnung ist kein Beiwerk: ohne sie steht ein Alarm im
+            # Chat, und man weiß bis zum nächsten Blick ins UI nicht, ob er
+            # noch gilt.
+            return [{"thema": thema, "stufe": "info",
+                     "text": f"{thema.capitalize()} ist wieder da.",
+                     "schluessel": f"{thema}-zurueck", "sperre_s": 0}]
+        return []
+
+    # -- Info: etwas hat sich geändert -----------------------------------
+
+    def _flanken(self, lage: dict) -> list[dict]:
+        raus = []
+
+        angesteckt = lage["box_status"] in ANGESTECKT
+        if angesteckt != self.angesteckt:
+            self.angesteckt = angesteckt
+            raus.append({
+                "thema": "fahrzeug", "stufe": "info", "sperre_s": 0,
+                "schluessel": f"fahrzeug-{'an' if angesteckt else 'ab'}",
+                "text": ("Fahrzeug angesteckt." if angesteckt
+                         else "Fahrzeug abgesteckt.")})
+
+        if lage["laedt"] != self.laedt:
+            if lage["laedt"]:
+                # Die Art der Ladung merken: eine Nachtladung, die um 08:05
+                # endet, ist immer noch eine Nachtladung. Würde beim Stopp das
+                # aktuelle Fenster gelesen, hieße sie dort „PV-Laden beendet".
+                self.lud_nachts = lage["nacht"]
+            art = "Nachtladen" if self.lud_nachts else "PV-Laden"
+            thema = "nachtladung" if self.lud_nachts else "pvladung"
+            zustand = "gestartet" if lage["laedt"] else "beendet"
+            self.laedt = lage["laedt"]
+            raus.append({"thema": thema, "stufe": "info", "sperre_s": 0,
+                         "schluessel": f"{thema}-{zustand}",
+                         "text": f"{art} {zustand}."})
+
+        if lage["akku_netzladung"] != self.akku_lud:
+            self.akku_lud = lage["akku_netzladung"]
+            raus.append({
+                "thema": "hausakku", "stufe": "info", "sperre_s": 0,
+                "schluessel": f"hausakku-{'an' if self.akku_lud else 'aus'}",
+                "text": ("Hausakku wird aus dem Netz geladen."
+                         if self.akku_lud
+                         else "Netzladung des Hausakkus beendet.")})
+
+        return raus
+
+
+async def melde_task():
+    """Die Regeln im eigenen Takt prüfen, getrennt vom Regeltakt."""
+    melder = Melder(state.melde_offline_s, datetime.datetime.now().timestamp())
+    while True:
+        jetzt = datetime.datetime.now().timestamp()
+        for meldung in melder.pruefen(melde_lage(jetzt), jetzt):
+            melden(**meldung)
+        await asyncio.sleep(MELDE_CHECK_S)
+
+
+async def notify_zustellen(sitzung, jetzt: float):
+    """Die Warteschlange leeren. Wirft nie — Fehler landen im Log und im UI.
+
+    Der Kopf blockiert bewusst den Rest: die Reihenfolge der Meldungen ist Teil
+    ihrer Aussage („weg" vor „wieder da").
+    """
+    while meldungen:
+        eintrag = meldungen[0]
+        if jetzt - eintrag["erzeugt"] > NOTIFY_MAX_AGE_S:
+            meldungen.popleft()
+            state.notify_dropped += 1
+            continue
+        if eintrag["naechster"] > jetzt:
+            return
+        try:
+            async with sitzung.post(
+                    state.notify_url, json=eintrag["nachricht"],
+                    timeout=aiohttp.ClientTimeout(total=state.notify_timeout_s)) as antwort:
+                if antwort.status >= 400:
+                    raise RuntimeError(f"HTTP {antwort.status}")
+        except Exception as fehler:  # noqa: BLE001 — nie ein Fehler nach oben
+            eintrag["versuche"] += 1
+            abstand = min(NOTIFY_RETRY_MAX_S,
+                          NOTIFY_RETRY_MIN_S * 2 ** (eintrag["versuche"] - 1))
+            eintrag["naechster"] = jetzt + abstand
+            state.notify_error = str(fehler)[:200]
+            log.warning("Meldung nicht zugestellt (%s) — nächster Versuch in %d s",
+                        fehler, abstand)
+            return
+        meldungen.popleft()
+        state.notify_sent += 1
+        state.notify_error = None
+
+
+async def notify_task():
+    async with aiohttp.ClientSession() as sitzung:
+        while True:
+            await notify_zustellen(sitzung, datetime.datetime.now().timestamp())
+            await asyncio.sleep(NOTIFY_SEND_CHECK_S)
+
+
 async def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2864,6 +3132,11 @@ async def main():
     if state.wallbox_user and not (state.wallbox_password and state.wallbox_id):
         sys.exit("PVUEB_WALLBOX_USER gesetzt, aber PVUEB_WALLBOX_PASSWORD "
                  "oder PVUEB_WALLBOX_ID fehlt")
+    state.notify_url = os.environ.get("PVUEB_NOTIFY_URL", "")
+    state.notify_timeout_s = int(os.environ.get("PVUEB_NOTIFY_TIMEOUT_S", "5"))
+    state.melde_offline_s = int(os.environ.get("PVUEB_MELDE_OFFLINE_S", "300"))
+    if state.notify_timeout_s < 1 or state.melde_offline_s < 60:
+        sys.exit("PVUEB_NOTIFY_TIMEOUT_S muss >= 1 s, PVUEB_MELDE_OFFLINE_S >= 60 s sein")
     state.watchdog_s = int(os.environ.get("PVUEB_WATCHDOG_S", WATCHDOG_TIMEOUT_S))
     # Untergrenze: der Wächter prüft alle WATCHDOG_CHECK_S, und ein Takt darf
     # auch mal auf einen zähen Modbus-Zugriff warten, ohne als tot zu gelten
@@ -2910,6 +3183,18 @@ async def main():
         aufgaben["Mitschnitt"] = record_task
     if state.wallbox_user:
         aufgaben["Wallbox-Cloud"] = wallbox_cloud_task
+    if state.notify_url:
+        aufgaben["Meldestelle"] = notify_task
+        aufgaben["Meldungen"] = melde_task
+        # Der Prozess kann seinen eigenen Tod nicht melden — er stirbt mit.
+        # Was er kann, ist sagen, dass er wieder da ist, und wie lange er weg
+        # war. Das ist die einzige Spur, die ein Absturz hinterlässt.
+        melden("neustart",
+               f"PVueb wurde neu gestartet. {state.session_note}",
+               stufe="alarm", schluessel=f"neustart-{state.started_at:.0f}",
+               sperre_s=0)
+        log.info("Meldestelle aktiv (Ziel steht in der .env, Fristen %d s)",
+                 state.melde_offline_s)
     tasks = [server.wait_closed()]
     tasks += [bewacht(name, factory) for name, factory in aufgaben.items()]
     await asyncio.gather(*tasks)

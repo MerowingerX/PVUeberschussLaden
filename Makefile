@@ -27,6 +27,7 @@ logs:
 test:
 	cd poc && .venv/bin/python test_sim.py
 	cd poc && .venv/bin/python test_robust.py
+	cd poc && .venv/bin/python test_melden.py
 
 app-release:
 	cd app && flutter build apk --release \
