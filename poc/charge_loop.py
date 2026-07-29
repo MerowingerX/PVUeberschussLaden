@@ -1495,12 +1495,13 @@ def betriebsstufe() -> tuple[str, str]:
     vollständigen nicht zu unterscheiden — man sieht nur, dass nichts lädt,
     und rät.
     """
+    # Kurz halten: die Zeile steht auf der Statusseite und muss dort in eine
+    # Zeile passen. Was im Einzelnen fehlt, steht auf der Diagnoseseite.
     if charge_point is None:
-        return "kein Laden", "Wallbox nicht verbunden — Laden nicht möglich"
+        return "kein Laden", "Wallbox getrennt"
     if state.grid_w is None:
-        return "eingeschränkt", ("Wechselrichter nicht erreichbar — Nachtfenster lädt, "
-                                 "PV-Überschussladen ruht")
-    return "voll", "Wallbox und Wechselrichter erreichbar"
+        return "eingeschränkt", "PV-Messung weg, Nacht lädt"
+    return "voll", "Box und PV ok"
 
 
 def leitung_tot(jetzt: float) -> bool:
@@ -1844,18 +1845,22 @@ INDEX_HTML = """<!doctype html>
 <button id="batt" onclick="toggleBatt()">…</button>
 </section>
 <section class="page">
-<h2>Wallbox <span id="wheart"></span></h2>
-<div id="wbstat"></div>
+<h2>Steuerung</h2>
+<div id="dbgstat"></div>
 </section>
 <section class="page">
-<h2>Debug</h2>
-<div id="dbgstat"></div>
+<h2>Diagnose</h2>
+<div id="diagstat"></div>
 <h2>Box-Heartbeat: <span id="hblabel">10</span> s</h2>
 <div class="slider-row">
   <input type="range" id="heartbeat" min="5" max="120" step="5"
          oninput="document.getElementById('hblabel').textContent=this.value"
          onchange="setConfig({heartbeat_s: +this.value})">
 </div>
+</section>
+<section class="page">
+<h2>Wallbox-Cloud <span id="wheart"></span></h2>
+<div id="wbstat"></div>
 </section>
 </div>
 <script>
@@ -1865,6 +1870,16 @@ function ago(sec) {
   if (sec === null || sec === undefined) return "noch nie";
   if (sec < 90) return "vor " + sec + " s";
   return "vor " + Math.round(sec/60) + " min ⚠";
+}
+// Wie ago(), aber ohne Warnzeichen. Für Werte, die von Natur aus selten
+// frisch sind — die Box spricht im OCPP-Betrieb nur bei Verbindungsereignissen
+// mit ihrer Hersteller-Cloud, ein Alter von Minuten ist dort der Normalfall
+// und kein Fehler.
+function agoRuhig(sec) {
+  if (sec === null || sec === undefined) return "noch nie";
+  if (sec < 90) return "vor " + sec + " s";
+  if (sec < 5400) return "vor " + Math.round(sec/60) + " min";
+  return "vor " + Math.round(sec/3600) + " h";
 }
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
@@ -1897,49 +1912,59 @@ function renderWallbox() {
       : w.app_max_a + " A von " + (w.hw_max_a ?? "?") + " A"
         + (w.hw_max_a && w.app_max_a < w.hw_max_a ? " ⚠ deckelt die Ladung" : "")],
     ["Firmware", w.firmware || "–"],
-    ["Box meldete sich zuletzt", ago(w.last_sync_s)],
-    ["Cloud abgefragt", ago(s.wallbox_seen_s)],
+    // Zwei verschiedene Wege, die gern verwechselt werden: die Box meldet an
+    // ihren Hersteller, wir fragen dort ab. Nur das zweite liegt bei uns.
+    ["Box → Hersteller-Cloud", agoRuhig(w.last_sync_s)],
+    ["PVueb → Cloud abgefragt", ago(s.wallbox_seen_s)],
   ];
   // Die Box kann per OCPP antworten und trotzdem seit Stunden nichts an ihre
   // Cloud gemeldet haben. Ohne diesen Hinweis sieht ein Standbild frisch aus.
   const alt = w.last_sync_s !== null && w.last_sync_s !== undefined && w.last_sync_s > 600;
   out.innerHTML = rows.map(row).join("")
     + (s.wallbox_error ? `<div class="note err">${s.wallbox_error}</div>` : "")
-    + (alt ? `<div class="note err">Die Box hat seit ${ago(w.last_sync_s)} nichts
-        an ihre Cloud gemeldet – die Werte oben sind ein Standbild von damals.
-        Was PVueb direkt über OCPP sieht, steht auf der Debug-Seite.</div>` : "")
+    + (alt ? `<div class="note">Die Box hat seit ${agoRuhig(w.last_sync_s)} nichts
+        an ihren Hersteller gemeldet – die Werte oben sind ein Standbild von
+        damals. Im OCPP-Betrieb ist das normal: die Box meldet dorthin
+        offenbar nur bei Verbindungs- und Ladeereignissen. Was PVueb direkt
+        über OCPP sieht, steht auf der Steuerungsseite.</div>` : "")
     + `<div class="note">Referenzmessung – der Regler nutzt diese Werte nicht.
-       Die Cloud aktualisiert alle 30 s.</div>`;
+       Er misst selbst über die MeterValues der Box.</div>`;
 }
 
-function wallboxCloud() {
-  // Referenzmessung aus der Hersteller-Cloud; die Regelung nutzt sie nicht
+// Referenzmessung aus der Hersteller-Cloud; die Regelung nutzt sie nicht.
+// Auf drei kurze Zeilen verteilt, damit keine über den Rand läuft.
+function cloudLeistung() {
   if (s.wallbox_error) return "⚠ " + s.wallbox_error;
   const w = s.wallbox_cloud || {};
   if (w.power_w === null || w.power_w === undefined) return "–";
-  const alter = s.wallbox_seen_s === null ? "" : " · vor " + s.wallbox_seen_s + " s";
   const diff = s.charge_w_abweichung;
-  const abw = diff === null ? ""
-    : " · Schätzung " + (diff >= 0 ? "+" : "") + diff + " W";
-  return Math.round(w.power_w) + " W (" + (w.status || "?") + ")" + abw + alter;
+  return Math.round(w.power_w) + " W"
+    + (diff === null ? "" : " (Regler " + (diff >= 0 ? "+" : "") + diff + " W)");
 }
 
-function minpvInfo() {
+// Die Starthilfe der Batterie senkt den nötigen PV-Überschuss um ihren Betrag
+function minpvHilfe() {
+  return (s.boost_start_w && s.boost_wh && s.soc !== null
+          && s.soc >= s.boost_start_soc && s.soc >= s.boost_min_soc
+          && s.boost_used_wh < s.boost_wh) ? s.boost_start_w : 0;
+}
+// Zwei kurze Zeilen statt einer langen: was der Regler gerade tut und ab
+// welchem Wert er umschaltet — der Beitrag der Batterie steht daneben.
+function minpvSchwelle() {
   if (s.mode !== "minpv") return "–";
   const minW = s.min_amps * WPA;
-  if (s.minpv_low_s !== null) {
-    const rest = Math.max(0, s.minpv_timeout_s - s.minpv_low_s);
-    return "⛅ Wolkenloch – Stopp in " + rest + " s, Erholung ab "
-      + Math.round(s.minpv_resume_factor * minW) + " W";
-  }
-  if (s.charging) return "lädt – Timeout ab < " + Math.round(s.minpv_pause_factor * minW) + " W";
-  // Die Starthilfe der Batterie senkt den nötigen PV-Überschuss um ihren Betrag
-  const hilfe = (s.boost_start_w && s.boost_wh && s.soc !== null
-                 && s.soc >= s.boost_start_soc && s.soc >= s.boost_min_soc
-                 && s.boost_used_wh < s.boost_wh) ? s.boost_start_w : 0;
-  const schwelle = Math.round(s.minpv_start_factor * minW) - hilfe;
-  return "wartet – Start ab " + schwelle + " W"
-         + (hilfe ? " (inkl. " + hilfe + " W Starthilfe 🔋)" : "");
+  if (s.minpv_low_s !== null)
+    return "⛅ Stopp in " + Math.max(0, s.minpv_timeout_s - s.minpv_low_s) + " s";
+  if (s.charging) return "lädt (Stopp < " + Math.round(s.minpv_pause_factor * minW) + " W)";
+  return "wartet (" + (Math.round(s.minpv_start_factor * minW) - minpvHilfe()) + " W)";
+}
+function minpvBoost() {
+  if (s.mode !== "minpv") return "–";
+  const minW = s.min_amps * WPA;
+  if (s.minpv_low_s !== null)
+    return "Erholung ab " + Math.round(s.minpv_resume_factor * minW) + " W";
+  const hilfe = minpvHilfe();
+  return hilfe ? "Starthilfe 🔋 (" + hilfe + " W)" : "keine Starthilfe";
 }
 function boostInfo() {
   if (!s.boost_wh) return "aus";
@@ -1969,7 +1994,7 @@ function permaInfo() {
 function gridShare() {
   if (s.grid_w === null) return "–";
   const imp = Math.max(0, -s.grid_w);
-  if (imp < 1) return "0 W – alles aus PV/Batterie";
+  if (imp < 1) return "0 W";
   const txt = Math.round(imp) + " W ≈ " + (imp / WPA).toFixed(1) + " A";
   if (s.charge_w < 1) return txt + " (Haus)";
   return txt + " – " + Math.round(100 * Math.min(imp, s.charge_w) / s.charge_w) + " % der Ladung";
@@ -2004,6 +2029,8 @@ async function refresh() {
       + s.betrieb_text],
   ];
   document.getElementById("stat").innerHTML = rows.map(row).join("");
+  // Steuerungsseite: nur, was die Regelentscheidung erklärt — von der Messung
+  // oben bis zu den Beiträgen, die den Start ermöglichen.
   const drows = [
     ["Box-Status (OCPP)", s.box_status],
     ["Limit", s.current_limit.toFixed(1) + " A"],
@@ -2011,24 +2038,34 @@ async function refresh() {
       : Math.round(s.pv_dc_w) + " W"],
     ["Wechselrichter raus (AC)", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
     ["Hausverbrauch", s.house_w === null ? "–" : Math.round(s.house_w) + " W"],
-    ...(s.wallbox_enabled ? [["Wallbox-Cloud", wallboxCloud()]] : []),
     ["Fürs Auto frei", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
-    ["minpv-Hysterese", minpvInfo()],
-    ["Netzanteil", gridShare()],
     ["PV-Mittel " + (s.avg_active_s ? Math.round(s.avg_active_s/60) + " min" : "aus")
       + (s.charging ? "" : " (Start)"),
       s.pv_avg_w === null ? "–"
       : Math.round(s.pv_avg_w) + " W ≈ " + (s.pv_avg_w / WPA).toFixed(1) + " A"],
+    ["minpv-Schwelle", minpvSchwelle()],
+    ["minpv-Boost", minpvBoost()],
+    ["Netzanteil", gridShare()],
     ["Batterie-Boost", boostInfo()],
     ["Dauer-Boost", permaInfo()],
+    ...(s.wallbox_enabled ? [
+      ["Wallbox Cloud: Leistung", cloudLeistung()],
+      ["Wallbox Cloud: Status", (s.wallbox_cloud || {}).status || "–"],
+      ["Wallbox Cloud: Update", agoRuhig(s.wallbox_seen_s)],
+    ] : []),
+  ];
+  document.getElementById("dbgstat").innerHTML = drows.map(row).join("");
+  // Diagnoseseite: lebt der Dienst noch, und welcher Stand läuft überhaupt
+  const diagrows = [
+    ["Regeltakt", tickInfo()],
     ["Heartbeat Box", ago(s.box_seen_s)],
     ["Heartbeat Huawei", ago(s.huawei_seen_s)],
-    ["Regeltakt", tickInfo()],
+    ["Betrieb", s.betrieb + " – " + s.betrieb_text],
     ["Version", `<a href="/info">${(s.version||{}).commit || "?"}</a>`],
     ["Sitzung beim Start", s.session_note || "–"],
   ];
-  document.getElementById("dbgstat").innerHTML = drows.map(row).join("");
+  document.getElementById("diagstat").innerHTML = diagrows.map(row).join("");
   document.getElementById("hheart").innerHTML = heart(s.huawei_seen_s, 90);
   const brows = [
     ["Batterie-SOC", s.soc === null ? "–" : s.soc.toFixed(0) + " %"],

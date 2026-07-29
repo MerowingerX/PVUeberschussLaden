@@ -91,12 +91,15 @@ aber trotzdem zügig.
   [features/feature_NeustartOhneUnterbrechung.md](features/feature_NeustartOhneUnterbrechung.md)
 - **Startverhalten ohne Sicherung**: freigegeben, Modus `minpv` mit 6 A. Die Anlage
   arbeitet nach einem Strom- oder Softwareausfall von allein weiter.
-- **Web-UI** fürs Handy, vier Seiten zum Wischen: *Status & Lademodus* (Netz, Überschuss,
-  Ladeleistung, Freigabe, Modus, Nachtautomatik) · *Huawei-Batterie* (SOC, Leistung,
-  Netzladung, Prognose) · *Wallbox* (gemessene Ladeleistung, Sitzungsenergie, Firmware) ·
-  *Debug* (PV-Erzeugung, Hausverbrauch, minpv-Hysterese, Boost, Heartbeats, Alter des
-  letzten Regeltakts, Schieberegler, Version). Dazu `/info`: Commit, Bauzeit,
-  Laufzeit und was der Start aus der Sitzungssicherung gemacht hat.
+- **Web-UI** fürs Handy, fünf Seiten zum Wischen — nach Frage sortiert, nicht nach
+  Datenquelle: *Status & Lademodus* (Netz, Überschuss, Ladeleistung, Freigabe, Modus,
+  Nachtautomatik, Betriebsstufe in einer Zeile) · *Huawei-Batterie* (SOC, Leistung,
+  Netzladung, Prognose) · *Steuerung* — warum lädt es gerade so (PV-Erzeugung,
+  Hausverbrauch, was fürs Auto frei ist, PV-Mittel, minpv-Schwellen, Boosts,
+  Netzanteil) · *Diagnose* — lebt der Dienst noch (Alter des letzten Regeltakts,
+  Heartbeats, Version, Sitzung, Heartbeat-Schieberegler) · *Wallbox-Cloud* als
+  Referenzmessung ganz hinten. Dazu `/info`: Commit, Bauzeit, Laufzeit und was der
+  Start aus der Sitzungssicherung gemacht hat.
 - **Ladeleistung als Referenz** (optional, `PVUEB_WALLBOX_*`): Die Pulsar Plus meldet ihre
   Ladeleistung nicht über OCPP, liefert sie aber an die Hersteller-Cloud
   ([API-Doku](https://github.com/SKB-CGN/wallbox)). Von dort abgerufen dient sie nur der
