@@ -221,6 +221,12 @@ TASK_RESTART_S = 5               # Wartezeit, bevor eine abgestürzte Aufgabe ne
 WATCHDOG_TIMEOUT_S = 120         # ~24 ausgefallene Takte, bevor abgebrochen wird
 WATCHDOG_CHECK_S = 15            # Abstand der Prüfung im Wächter-Thread
 
+# Verbindungswache zur Wallbox: siehe leitung_tot(). Eine stehende, aber
+# stumme Leitung ist schlimmer als eine abgerissene — der Regeltakt läuft
+# dann in jeden OCPP-Timeout hinein, statt die Box neu aufbauen zu lassen.
+BOX_LINK_CHECK_S = 10            # Abstand der Prüfung
+BOX_SILENCE_MIN_S = 45           # Untergrenze, auch bei sehr kurzem Heartbeat
+
 # Sitzung über einen Neustart retten (PVUEB_SESSION_FILE). Der Regler hält
 # Zustand, den ihm niemand zurückgeben kann — vor allem die ID der laufenden
 # OCPP-Transaktion. Ohne sie kann er eine Ladung, die er nicht selbst gestartet
@@ -1027,7 +1033,9 @@ async def on_connect(websocket):
         return
     log.info("Wallbox verbunden: %r", charge_point_id)
     cp = ChargePoint(charge_point_id, websocket)
+    cp.ws = websocket            # für box_link_task, das die Leitung notfalls kappt
     charge_point = cp
+    state.last_box_seen = datetime.datetime.now().timestamp()
     try:
         await cp.start()
     except websockets.exceptions.ConnectionClosed:
@@ -1467,6 +1475,74 @@ async def battery_night_check():
         log.warning("NACHT: Start fehlgeschlagen (%s) — neuer Versuch im nächsten Takt", error)
 
 
+def betriebsstufe() -> tuple[str, str]:
+    """Was der Regler gerade noch kann — als Aussage, nicht als Nebenwirkung.
+
+    Die Rangfolge der Funktionen und ihre Abhängigkeiten:
+
+        Nachtfenster laden      braucht Wallbox
+        PV-Überschussladen      braucht Wallbox + Wechselrichter
+        Akku aus dem Netz       braucht Wechselrichter (+ Prognose)
+
+    Ohne diese Zeile in der UI ist ein eingeschränkter Betrieb von einem
+    vollständigen nicht zu unterscheiden — man sieht nur, dass nichts lädt,
+    und rät.
+    """
+    if charge_point is None:
+        return "kein Laden", "Wallbox nicht verbunden — Laden nicht möglich"
+    if state.grid_w is None:
+        return "eingeschränkt", ("Wechselrichter nicht erreichbar — Nachtfenster lädt, "
+                                 "PV-Überschussladen ruht")
+    return "voll", "Wallbox und Wechselrichter erreichbar"
+
+
+def leitung_tot(jetzt: float) -> bool:
+    """Steht die OCPP-Verbindung noch, schweigt die Box aber?
+
+    Der harmlose Fall ist der Abriss — den meldet der Handler und
+    `charge_point` wird frei. Der gefährliche ist die halbtote Leitung: TCP
+    steht, die Box antwortet nicht mehr. Dann bleibt `charge_point` gesetzt,
+    der Regeltakt schickt hinein, und jeder Aufruf läuft 30 s in den
+    OCPP-Timeout. Mit dem Wächter über dem Regeltakt hieße das: alle zwei
+    Minuten ein Prozessneustart, im Kreis.
+
+    Getrennt von box_link_task, damit die Bedingung prüfbar ist.
+    """
+    if charge_point is None or state.last_box_seen is None:
+        return False
+    # Die Box meldet sich per Heartbeat, MeterValues und StatusNotification.
+    # Dreifaches Heartbeat-Intervall lässt Raum für einen verlorenen Takt,
+    # die Untergrenze für sehr kurze Intervalle.
+    grenze = max(BOX_SILENCE_MIN_S, 3 * state.heartbeat_s)
+    return (jetzt - state.last_box_seen) > grenze
+
+
+async def box_link_task():
+    """Eine schweigende Wallbox-Verbindung fallen lassen, statt hineinzureden.
+
+    Wir schließen nur; den Neuaufbau macht die Box von selbst. Dass sie das
+    kann, ist belegt — am 28.07.2026 hat sie es fünfmal in zwei Minuten getan.
+    """
+    global charge_point
+    while True:
+        await asyncio.sleep(BOX_LINK_CHECK_S)
+        jetzt = datetime.datetime.now().timestamp()
+        if not leitung_tot(jetzt):
+            continue
+        cp = charge_point
+        log.warning("Wallbox schweigt seit %.0f s bei stehender Verbindung — "
+                    "Leitung wird gekappt, damit die Box neu aufbaut",
+                    jetzt - state.last_box_seen)
+        # Zuerst freigeben, dann schließen: bis der Handler in on_connect
+        # aufräumt, schickte der Regeltakt sonst weiter in die tote Leitung.
+        if charge_point is cp:
+            charge_point = None
+        try:
+            await cp.ws.close()
+        except Exception as exc:  # noqa: BLE001 — das Kappen darf nie den Dienst stoppen
+            log.warning("Schließen der Wallbox-Verbindung fehlgeschlagen: %s", exc)
+
+
 async def control_task():
     """Der Regeltakt. Er darf unter keinen Umständen aufhören.
 
@@ -1489,7 +1565,13 @@ async def control_task():
         state.last_tick = time.monotonic()
         try:
             await battery_night_check()
-            if charge_point is None or state.grid_w is None:
+            # Ohne Wallbox lässt sich nichts steuern — das ist die einzige
+            # Bedingung, die den ganzen Takt aussetzen darf. Der Wechselrichter
+            # gehört ausdrücklich *nicht* hierher: das Nachtfenster braucht ihn
+            # nicht, und bis 29.07.2026 stand er trotzdem hier. Ein
+            # Modbus-Abbruch (der `state.grid_w = None` setzt) legte damit auch
+            # das Nachtladen still, obwohl beides nichts miteinander zu tun hat.
+            if charge_point is None:
                 state.tick_error = None
                 continue
             await control_step(loop.time())
@@ -1527,6 +1609,14 @@ async def control_step(now: float):
             warn_limit_ineffective(now)
         else:
             await try_start(now, MAX_AMPS)
+        return
+
+    # Ab hier wird geregelt, und dafür braucht es die Messung. Ohne
+    # Wechselrichter ist der Überschuss unbekannt: nicht null, sondern
+    # unbekannt. Eine laufende Ladung deshalb abzubrechen wäre falsch — der
+    # Modbus-Reconnect dauert 10 s —, also bleibt das zuletzt gesetzte Limit
+    # stehen, bis wieder Zahlen kommen. Sichtbar wird das über betriebsstufe().
+    if state.grid_w is None:
         return
 
     surplus = state.grid_w + charge_power(now)
@@ -1903,6 +1993,8 @@ async function refresh() {
       + (s.charge_w_src === "gemessen" || !s.charging ? "" : " (" + s.charge_w_src + ")")],
     ["Wallbox", heart(s.box_seen_s, boxLimit) + " "
       + (s.box_connected ? (s.charging ? "⚡ lädt" : "🔌 verbunden") : "⛔ getrennt")],
+    ["Betrieb", ({"voll":"✅ ","eingeschränkt":"⚠ ","kein Laden":"⛔ "}[s.betrieb] || "")
+      + s.betrieb_text],
   ];
   document.getElementById("stat").innerHTML = rows.map(row).join("");
   const drows = [
@@ -2096,6 +2188,8 @@ def status_dict() -> dict:
                       else round(time.monotonic() - state.last_tick),
         "tick_timeout_s": state.watchdog_s,
         "tick_error": state.tick_error,
+        "betrieb": betriebsstufe()[0],
+        "betrieb_text": betriebsstufe()[1],
         "version": VERSION,
         "session_note": state.session_note,
         "uptime_s": round(datetime.datetime.now().timestamp() - state.started_at),
@@ -2761,6 +2855,7 @@ async def main():
     # läuft schon und hat mit wait_closed() nichts, was neu zu starten wäre.
     aufgaben = {
         "Regeltakt": control_task,
+        "Wallbox-Verbindung": box_link_task,
         "Modbus": lambda: modbus_task(args.inverter),
         "Web-UI": lambda: web_task(args.web_port),
         "Kommandozeile": command_loop,

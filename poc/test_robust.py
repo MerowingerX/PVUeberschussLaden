@@ -211,10 +211,137 @@ async def test_reconnect_raeumt_nicht_die_neue_verbindung_weg():
         c.ChargePoint, c.charge_point = orig_klasse, orig_cp
 
 
+async def test_nachtladen_ohne_wechselrichter():
+    """Rangfolge: Nachtladen braucht die Wallbox, nicht den Wechselrichter.
+
+    Bis 29.07.2026 stand `state.grid_w is None` als Abbruchbedingung vor dem
+    ganzen Regeltakt. Ein Modbus-Abbruch legte damit auch das Nachtladen still,
+    obwohl der Nachtzweig die Netzleistung gar nicht anfasst.
+    """
+    grundzustand()
+    c.state.mode = "minpv"           # ausdrücklich nicht "fast"
+    c.state.night_enabled = True
+    c.state.grid_w = None            # Modbus weg
+    gestartet = []
+
+    class Box:
+        async def set_limit(self, amps):
+            c.state.current_limit, c.state.limit_known = amps, True
+
+        async def remote_start(self):
+            gestartet.append(c.state.current_limit)
+            c.state.charging = True
+            return "Accepted"
+
+    c.charge_point = Box()
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        await takt_laufen_lassen(4)
+    finally:
+        c.in_night_window = orig
+    pruefe(gestartet and gestartet[0] == c.MAX_AMPS,
+           f"Nachtladung startet ohne Modbus mit {c.MAX_AMPS} A: {gestartet[:1]}")
+    pruefe(c.state.tick_error is None, "und das ganz ohne Fehler")
+
+
+async def test_pv_regelung_ohne_wechselrichter():
+    """Umgekehrt: PV-Überschussladen darf ohne Messung nichts anfangen.
+
+    Ohne Netzleistung ist der Überschuss nicht null, sondern unbekannt. Ein
+    Start auf Verdacht wäre Netzbezug.
+    """
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "minpv", False
+    c.state.grid_w = None
+    gestartet = []
+
+    class Box:
+        async def set_limit(self, amps):
+            c.state.current_limit, c.state.limit_known = amps, True
+
+        async def remote_start(self):
+            gestartet.append(amps := c.state.current_limit)
+            return "Accepted"
+
+    c.charge_point = Box()
+    await takt_laufen_lassen(4)
+    pruefe(not gestartet, "kein Start ohne Messung")
+    pruefe(c.state.tick_error is None, "und trotzdem kein Fehler im Takt")
+
+
+async def test_betriebsstufe():
+    """Die Rangfolge muss ablesbar sein, nicht nur wirksam."""
+    grundzustand()
+    c.charge_point = None
+    pruefe(c.betriebsstufe()[0] == "kein Laden",
+           f"ohne Wallbox: {c.betriebsstufe()}")
+    c.charge_point = TotBox()
+    c.state.grid_w = None
+    pruefe(c.betriebsstufe()[0] == "eingeschränkt",
+           f"ohne Wechselrichter: {c.betriebsstufe()}")
+    c.state.grid_w = 0.0
+    pruefe(c.betriebsstufe()[0] == "voll", f"mit beidem: {c.betriebsstufe()}")
+
+
+async def test_stumme_leitung_wird_gekappt():
+    """Halbtote OCPP-Verbindung: TCP steht, die Box schweigt.
+
+    Ohne diese Wache bleibt `charge_point` gesetzt, jeder Aufruf läuft 30 s in
+    den OCPP-Timeout, und der Wächter über dem Regeltakt startet den Prozess
+    im Zweiminutentakt neu.
+    """
+    grundzustand()
+    c.state.heartbeat_s = 10
+    geschlossen = []
+
+    class StummeBox:
+        def __init__(self):
+            self.ws = types.SimpleNamespace(close=self._close)
+
+        async def _close(self):
+            geschlossen.append(True)
+
+    c.charge_point = StummeBox()
+    jetzt = 1_000_000.0
+
+    c.state.last_box_seen = jetzt                      # gerade erst gemeldet
+    pruefe(not c.leitung_tot(jetzt), "frische Meldung: Leitung bleibt")
+    c.state.last_box_seen = jetzt - 3 * c.state.heartbeat_s - 1
+    pruefe(not c.leitung_tot(jetzt),
+           f"knapp über 3× Heartbeat, aber unter der Untergrenze "
+           f"({c.BOX_SILENCE_MIN_S} s): Leitung bleibt")
+    c.state.last_box_seen = jetzt - c.BOX_SILENCE_MIN_S - 1
+    pruefe(c.leitung_tot(jetzt), "länger stumm als die Untergrenze: Leitung ist tot")
+
+    orig = c.BOX_LINK_CHECK_S
+    c.BOX_LINK_CHECK_S = 0.01
+    try:
+        c.state.last_box_seen = datetime_jetzt() - 600
+        task = asyncio.create_task(c.box_link_task())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    finally:
+        c.BOX_LINK_CHECK_S = orig
+    pruefe(geschlossen, "stumme Verbindung wurde geschlossen")
+    pruefe(c.charge_point is None, "und freigegeben, damit der Takt nicht hineinredet")
+
+
+def datetime_jetzt() -> float:
+    import datetime
+    return datetime.datetime.now().timestamp()
+
+
 TESTS = [test_takt_ueberlebt_wallbox_fehler, test_takt_erholt_sich,
          test_herzschlag_ohne_wallbox, test_watchdog_entscheidung,
          test_bewacht_startet_neu,
-         test_reconnect_raeumt_nicht_die_neue_verbindung_weg]
+         test_reconnect_raeumt_nicht_die_neue_verbindung_weg,
+         test_nachtladen_ohne_wechselrichter, test_pv_regelung_ohne_wechselrichter,
+         test_betriebsstufe, test_stumme_leitung_wird_gekappt]
 
 
 async def main():

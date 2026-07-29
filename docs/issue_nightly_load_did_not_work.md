@@ -203,6 +203,38 @@ Verbindung.
 | `test_bewacht_startet_neu` | Eine abgestürzte Nebenaufgabe läuft neu an |
 | `test_reconnect_raeumt_nicht_die_neue_verbindung_weg` | Die alte Verbindung löscht die neue nicht |
 
+## Nachgezogen: die Rangfolge in den Code
+
+Beim Durchgehen der Funktionen nach Wichtigkeit fiel eine zweite Kopplung auf,
+die nichts mit dem Absturz zu tun hatte, aber denselben Effekt haben konnte.
+
+| Funktion | braucht Wallbox | braucht Wechselrichter |
+|---|---|---|
+| Nachtfenster laden | ja | **nein** |
+| PV-Überschussladen | ja | ja |
+| Huawei-Akku aus dem Netz | **nein** | ja |
+
+`control_task` setzte den ganzen Takt aus, sobald `state.grid_w` fehlte — und
+`modbus_task` setzt genau das beim Verbindungsabbruch. **Ein Modbus-Ausfall
+legte damit auch das Nachtladen still**, obwohl der Nachtzweig die Netzleistung
+gar nicht anfasst; seine erste Verwendung steht hinter dessen `return`. Die
+Wache steht jetzt dort, wo sie hingehört: `charge_point` vor dem gesamten Takt,
+`grid_w` vor dem PV-Zweig.
+
+Eine laufende PV-Ladung wird bei Modbus-Ausfall nicht abgebrochen — der
+Reconnect dauert 10 s, und ein Stopp wegen eines toten Sensors wäre schlimmer
+als ein stehengelassenes Limit. Sichtbar wird der Zustand über `betriebsstufe()`
+(`kein Laden` / `eingeschränkt` / `voll`), im Status als `betrieb` und in der UI
+als eigene Zeile.
+
+Dazu eine Wache über die OCPP-Leitung selbst (`box_link_task`). Der harmlose
+Fall ist der Abriss — den meldet der Handler. Der gefährliche ist die halbtote
+Leitung: TCP steht, die Box schweigt. Dann bleibt `charge_point` gesetzt, jeder
+Aufruf läuft 30 s in den OCPP-Timeout, und der Wächter über dem Regeltakt würde
+den Prozess im Zweiminutentakt neu starten. Schweigt die Box länger als das
+Dreifache des Heartbeat-Intervalls (mindestens 45 s), wird die Verbindung
+freigegeben und geschlossen; den Neuaufbau macht die Box selbst.
+
 ## Lehre
 
 Der Ausfall war nicht, dass etwas kaputtging — das passiert. Der Ausfall war,
