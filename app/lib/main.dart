@@ -3,13 +3,17 @@
 // Die Oberfläche lebt im Regler (poc/charge_loop.py, INDEX_HTML) und wird hier
 // nur angezeigt. Nachgebaut wird sie bewusst nicht: sie ändert sich mit dem
 // Regler, und zwei Stellen für dieselben Knöpfe laufen sicher auseinander.
+//
+// Dasselbe gilt für den zweiten Reiter: die Meldungen kommen als Seite aus
+// myhome-messenger (eigenes Projekt, /). Der Reiter erscheint nur, wenn dort
+// ein Port eingetragen ist — ohne Meldestelle sieht die App aus wie zuvor.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:webview_flutter/webview_flutter.dart';
 
 import 'settings.dart';
 import 'settings_page.dart';
+import 'web_seite.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -44,10 +48,12 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  WebViewController? _controller;
+  final _regler = GlobalKey<WebSeiteState>();
+  final _meldungen = GlobalKey<WebSeiteState>();
+
   Settings _settings = Settings.empty;
-  String? _error;
-  bool _loading = true;
+  int _reiter = 0;
+  String? _hinweis;
 
   @override
   void initState() {
@@ -57,84 +63,39 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _start() async {
     final settings = await Settings.load();
-    if (settings.isComplete) return _applySettings(settings);
+    if (!mounted) return;
+    setState(() => _settings = settings);
 
     // Erster Start: ohne Host gibt es nichts zu laden.
-    if (!mounted) return;
-    setState(() {
-      _settings = settings;
-      _loading = false;
-      _error = 'Kein Regler eingetragen — Zahnrad oben rechts.';
-    });
-    await _openSettings(settings);
-  }
-
-  Future<void> _applySettings(Settings settings) async {
-    final controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0xFF111111))
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onHttpAuthRequest: (request) {
-            // Der Regler schützt sein UI per Basic Auth, sobald PVUEB_WEB_USER
-            // gesetzt ist. Ohne diesen Zweig bliebe die WebView leer.
-            if (settings.user.isEmpty) {
-              request.onCancel();
-              return;
-            }
-            request.onProceed(WebViewCredential(
-              user: settings.user,
-              password: settings.password,
-            ));
-          },
-          onPageFinished: (_) {
-            if (mounted) setState(() => _loading = false);
-          },
-          onWebResourceError: (error) {
-            // Unterressourcen (Favicon o. ä.) dürfen keine Fehlerseite auslösen.
-            if (error.isForMainFrame == false) return;
-            if (mounted) {
-              setState(() {
-                _loading = false;
-                _error = '${settings.baseUrl} nicht erreichbar\n'
-                    '(${error.description})';
-              });
-            }
-          },
-        ),
-      );
-    await controller.loadRequest(Uri.parse(settings.baseUrl));
-    if (!mounted) return;
-    setState(() {
-      _settings = settings;
-      _controller = controller;
-      _loading = true;
-      _error = null;
-    });
+    if (!settings.isComplete) {
+      setState(() => _hinweis = 'Kein Regler eingetragen — Zahnrad oben rechts.');
+      await _openSettings(settings);
+    }
   }
 
   Future<Settings?> _openSettings(Settings current) async {
     final saved = await Navigator.of(context).push<Settings>(
       MaterialPageRoute(builder: (_) => SettingsPage(initial: current)),
     );
-    if (saved != null) await _applySettings(saved);
+    if (saved != null && mounted) {
+      setState(() {
+        _settings = saved;
+        _hinweis = null;
+        // Ist die Meldestelle wieder abgemeldet worden, während ihr Reiter
+        // offen war, gäbe es sonst einen Reiter ohne Seite.
+        if (!saved.hasMessenger) _reiter = 0;
+      });
+    }
     return saved;
   }
 
-  Future<void> _reload() async {
-    final settings = _settings;
-    if (!settings.isComplete) return;
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    // Nach einem Fehler ist die History leer — reload() liefe ins Nichts.
-    await _controller?.loadRequest(Uri.parse(settings.baseUrl));
-  }
+  WebSeiteState? get _aktuelle =>
+      _reiter == 0 ? _regler.currentState : _meldungen.currentState;
 
   @override
   Widget build(BuildContext context) {
-    final controller = _controller;
+    final settings = _settings;
+    final zeigeLeiste = settings.hasMessenger;
 
     return PopScope(
       // Zurück blättert im UI; ist nichts mehr zu blättern, endet die App —
@@ -142,8 +103,10 @@ class _HomePageState extends State<HomePage> {
       canPop: false,
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop) return;
-        if (controller != null && await controller.canGoBack()) {
-          await controller.goBack();
+        if (await _aktuelle?.zurueck() ?? false) return;
+        // Aus den Meldungen führt der Weg zurück zum Regler, nicht aus der App.
+        if (_reiter != 0) {
+          setState(() => _reiter = 0);
           return;
         }
         // Navigator.pop() verpufft auf der Wurzelroute; die App soll aber
@@ -153,13 +116,13 @@ class _HomePageState extends State<HomePage> {
       child: Scaffold(
         backgroundColor: const Color(0xFF111111),
         appBar: AppBar(
-          title: const Text('PVueb'),
+          title: Text(_reiter == 0 ? 'PVueb' : 'Meldungen'),
           backgroundColor: const Color(0xFF1B1B1B),
           actions: [
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Neu laden',
-              onPressed: _reload,
+              onPressed: () => _aktuelle?.neuLaden(),
             ),
             IconButton(
               icon: const Icon(Icons.settings),
@@ -168,44 +131,68 @@ class _HomePageState extends State<HomePage> {
             ),
           ],
         ),
-        body: Stack(
-          children: [
-            if (controller != null && _error == null)
-              WebViewWidget(controller: controller),
-            if (_error != null) _ErrorView(message: _error!, onRetry: _reload),
-            if (_loading && _error == null)
-              const Center(child: CircularProgressIndicator()),
-          ],
-        ),
+        body: _hinweis != null
+            ? _Hinweis(text: _hinweis!)
+            : !settings.isComplete
+                ? const SizedBox.shrink()
+                : IndexedStack(
+                    index: _reiter,
+                    children: [
+                      WebSeite(
+                        key: _regler,
+                        url: settings.baseUrl,
+                        user: settings.user,
+                        password: settings.password,
+                        fehlertext: '${settings.baseUrl} nicht erreichbar',
+                      ),
+                      if (zeigeLeiste)
+                        WebSeite(
+                          key: _meldungen,
+                          url: settings.messengerUrl,
+                          user: settings.messengerUser,
+                          password: settings.messengerPassword,
+                          fehlertext:
+                              'Meldestelle ${settings.messengerUrl} nicht erreichbar',
+                        )
+                      else
+                        const SizedBox.shrink(),
+                    ],
+                  ),
+        bottomNavigationBar: zeigeLeiste
+            ? NavigationBar(
+                backgroundColor: const Color(0xFF1B1B1B),
+                selectedIndex: _reiter,
+                onDestinationSelected: (i) => setState(() => _reiter = i),
+                destinations: const [
+                  NavigationDestination(
+                      icon: Icon(Icons.bolt_outlined),
+                      selectedIcon: Icon(Icons.bolt),
+                      label: 'Regler'),
+                  NavigationDestination(
+                      icon: Icon(Icons.mail_outline),
+                      selectedIcon: Icon(Icons.mail),
+                      label: 'Meldungen'),
+                ],
+              )
+            : null,
       ),
     );
   }
 }
 
-class _ErrorView extends StatelessWidget {
-  const _ErrorView({required this.message, required this.onRetry});
+class _Hinweis extends StatelessWidget {
+  const _Hinweis({required this.text});
 
-  final String message;
-  final VoidCallback onRetry;
+  final String text;
 
   @override
   Widget build(BuildContext context) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.cloud_off, size: 48, color: Colors.white54),
-            const SizedBox(height: 16),
-            Text(message,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white70)),
-            const SizedBox(height: 24),
-            FilledButton(
-                onPressed: onRetry, child: const Text('Erneut versuchen')),
-          ],
-        ),
+        child: Text(text,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70)),
       ),
     );
   }

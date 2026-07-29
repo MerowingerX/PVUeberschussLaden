@@ -21,6 +21,14 @@ class _SettingsPageState extends State<SettingsPage> {
       TextEditingController(text: widget.initial.user);
   late final TextEditingController _password =
       TextEditingController(text: widget.initial.password);
+  late final TextEditingController _messengerPort = TextEditingController(
+      text: widget.initial.messengerPort == 0
+          ? ''
+          : widget.initial.messengerPort.toString());
+  late final TextEditingController _messengerUser =
+      TextEditingController(text: widget.initial.messengerUser);
+  late final TextEditingController _messengerPassword =
+      TextEditingController(text: widget.initial.messengerPassword);
   late bool _https = widget.initial.https;
   bool _showPassword = false;
 
@@ -30,6 +38,9 @@ class _SettingsPageState extends State<SettingsPage> {
     _port.dispose();
     _user.dispose();
     _password.dispose();
+    _messengerPort.dispose();
+    _messengerUser.dispose();
+    _messengerPassword.dispose();
     super.dispose();
   }
 
@@ -41,6 +52,11 @@ class _SettingsPageState extends State<SettingsPage> {
       user: _user.text.trim(),
       password: _password.text,
       https: _https,
+      // Leeres Feld heißt: keine Meldestelle. Dann bleibt die Leiste unten
+      // weg und die App sieht aus wie vorher.
+      messengerPort: int.tryParse(_messengerPort.text.trim()) ?? 0,
+      messengerUser: _messengerUser.text.trim(),
+      messengerPassword: _messengerPassword.text,
     );
     await settings.save();
     if (mounted) Navigator.of(context).pop(settings);
@@ -104,6 +120,42 @@ class _SettingsPageState extends State<SettingsPage> {
                       setState(() => _showPassword = !_showPassword),
                 ),
               ),
+            ),
+            const Divider(height: 32),
+            Text('Meldestelle', style: Theme.of(context).textTheme.titleSmall),
+            const Text(
+                'myhome-messenger auf demselben Host. Leerer Port = kein '
+                'zweiter Reiter.',
+                style: TextStyle(color: Colors.white54, fontSize: 12)),
+            TextFormField(
+              controller: _messengerPort,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Port',
+                hintText: '${Settings.defaultMessengerPort}',
+              ),
+              validator: (v) {
+                final text = v?.trim() ?? '';
+                if (text.isEmpty) return null;
+                final n = int.tryParse(text);
+                return (n == null || n < 1 || n > 65535)
+                    ? 'Port 1–65535 oder leer'
+                    : null;
+              },
+            ),
+            TextFormField(
+              controller: _messengerUser,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Benutzer',
+                hintText: 'MYHOME_WEB_USER',
+              ),
+            ),
+            TextFormField(
+              controller: _messengerPassword,
+              obscureText: !_showPassword,
+              autocorrect: false,
+              decoration: const InputDecoration(labelText: 'Passwort'),
             ),
             const SizedBox(height: 24),
             FilledButton(onPressed: _save, child: const Text('Speichern')),
