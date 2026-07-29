@@ -257,6 +257,11 @@ NOTIFY_MAX_AGE_S = 900           # danach ist eine Meldung wertlos und fliegt ra
 NOTIFY_RETRY_MIN_S = 20          # erster Abstand nach einem Fehlversuch
 NOTIFY_RETRY_MAX_S = 300         # Obergrenze des wachsenden Abstands
 MELDE_CHECK_S = 10               # Takt der Regelprüfung (Flanken, Offline-Fristen)
+# Verweildauer, bevor ein Zustandswechsel gemeldet wird. Eine Wallbox, die
+# zwischen zwei Zuständen pendelt, darf keine Meldungskette auslösen — und ob
+# das Fahrzeug vor zwei Minuten oder gerade eben angesteckt wurde, ändert für
+# den Empfänger nichts.
+MELDE_FLANKE_S = 120
 MELDE_SPERRE_S = 3600            # Wiederholsperre für dieselbe Lage beim Empfänger
 
 
@@ -356,7 +361,11 @@ class State:
     record_keep_days = 14        # Ringbuffer: ältere Tage werden gelöscht (aus .env)
     last_box_seen: float | None = None     # Unix-Zeit: letzter OCPP-Heartbeat
     last_huawei_seen: float | None = None  # Unix-Zeit: letzter erfolgreicher Modbus-Poll
-    box_status = "unbekannt"               # letzter StatusNotification-Status der Box
+    box_status = "unbekannt"               # maßgeblicher Status der Ladedose
+    # Status je Anschluss. OCPP 1.6 kennt connectorId 0 für die Station als
+    # Ganzes und 1..n für die Dosen. Beides in ein Feld zu schreiben, lässt
+    # eine Station-Meldung den Dosenstatus überschreiben.
+    connector_status: dict[int, str] = {}
     # Herzschlag des Regeltakts, monotone Uhr. Nur diese eine Zahl entscheidet,
     # ob der Regler lebt — der Wächter-Thread liest sie, sonst niemand.
     last_tick: float = 0.0
@@ -375,6 +384,7 @@ class State:
     notify_url = ""              # Meldestelle, leer = aus (aus .env)
     notify_timeout_s = 5         # Zeitgrenze je Zustellversuch (aus .env)
     melde_offline_s = 300        # so lange darf ein Gerät weg sein, bevor Alarm (aus .env)
+    melde_flanke_s = MELDE_FLANKE_S  # so lange muss ein Wechsel halten (aus .env)
     notify_error: str | None = None        # letzter Zustellfehler, nur fürs UI
     notify_sent = 0                        # zugestellte Meldungen
     notify_dropped = 0                     # verworfene (zu alt oder Warteschlange voll)
@@ -823,6 +833,34 @@ def charge_power(now: float) -> float:
 
 
 state = State()
+
+
+def box_status_setzen(connector_id, status: str) -> str:
+    """Status eines Anschlusses merken und den maßgeblichen zurückgeben.
+
+    OCPP 1.6 kennt `connectorId = 0` für die Station als Ganzes und 1..n für
+    die einzelnen Ladedosen. Die Pulsar meldet beides: die Dose steht auf
+    `SuspendedEV`, während die Station in eigenem Takt `Available` schickt —
+    „die Station ist betriebsbereit", nicht „da steckt nichts".
+
+    Bis 2026-07-29 landete beides in derselben Variablen. Die Folge war nicht
+    nur eine Meldung „Fahrzeug abgesteckt / angesteckt" im Minutentakt: die
+    Station-Meldung setzte auch `state.charging = False` und warf den
+    Zählerstand weg, während das Auto lud.
+
+    Maßgeblich ist die niedrigste bekannte Dose. Nur wenn keine bekannt ist,
+    gilt die Station — es gibt Boxen, die ausschließlich für 0 melden.
+    """
+    try:
+        nummer = int(connector_id)
+    except (TypeError, ValueError):
+        nummer = 0
+    state.connector_status[nummer] = status
+
+    dosen = sorted(n for n in state.connector_status if n >= 1)
+    state.box_status = (state.connector_status[dosen[0]] if dosen
+                        else state.connector_status.get(0, state.box_status))
+    return state.box_status
 charge_point: "ChargePoint | None" = None
 modbus_client: AsyncModbusTcpClient | None = None
 modbus_lock = asyncio.Lock()  # serialisiert Polling und Schreibzugriffe (SDongle: 1 Verbindung)
@@ -870,8 +908,9 @@ class ChargePoint(OcppChargePoint):
 
     @on("StatusNotification")
     def on_status(self, connector_id, error_code, status, **kwargs):
-        log.info("Wallbox-Status: %s (%s)", status, error_code)
-        state.box_status = status
+        log.info("Wallbox-Status: Anschluss %s = %s (%s)",
+                 connector_id, status, error_code)
+        status = box_status_setzen(connector_id, status)
         if status in ("Charging",):
             state.charging = True
             reset_start_backoff()
@@ -2663,6 +2702,10 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
             ("PVUEB_MELDE_OFFLINE_S", state.melde_offline_s,
              "So lange dürfen Wechselrichter oder Wallbox weg sein, bevor ein "
              "Alarm rausgeht. Gilt auch als Schonzeit nach dem Start"),
+            ("PVUEB_MELDE_FLANKE_S", state.melde_flanke_s,
+             "So lange muss ein Zustandswechsel halten, bevor er gemeldet wird. "
+             "Eine pendelnde Wallbox erzeugt damit gar keine Meldung statt einer "
+             "Kette. 0 meldet sofort"),
         ]),
     ]
 
@@ -2858,33 +2901,62 @@ class Melder:
     Und sie stehen an einer Stelle, statt über zehn Handler verstreut.
     """
 
-    def __init__(self, grenze_s: float, start: float):
+    def __init__(self, grenze_s: float, start: float,
+                 flanke_s: float = MELDE_FLANKE_S):
         self.grenze_s = grenze_s
+        self.flanke_s = flanke_s
         self.start = start
         self.erste = True
         self.box_offline_seit: float | None = None
         self.box_gemeldet = False
         self.wr_offline_seit: float | None = None
         self.wr_gemeldet = False
-        self.angesteckt = False
-        self.laedt = False
+        # Gemeldeter Stand je Flanke und, solange ein Wechsel noch nicht lange
+        # genug hält, der Kandidat mit dem Zeitpunkt seines ersten Auftretens.
+        self.stand: dict[str, object] = {}
+        self.kandidat: dict[str, tuple[object, float]] = {}
         self.lud_nachts = False
-        self.akku_lud = False
 
-    def _uebernehmen(self, lage: dict):
-        self.angesteckt = lage["box_status"] in ANGESTECKT
-        self.laedt = lage["laedt"]
-        self.lud_nachts = lage["nacht"]
-        self.akku_lud = lage["akku_netzladung"]
+    def _lage_flanken(self, lage: dict) -> dict[str, object]:
+        return {
+            "angesteckt": lage["box_status"] in ANGESTECKT,
+            "laedt": lage["laedt"],
+            "akku": lage["akku_netzladung"],
+        }
+
+    def _flanke(self, name: str, wert, jetzt: float) -> bool:
+        """Hat sich dieser Wert dauerhaft geändert?
+
+        Erst wahr, wenn der neue Wert `flanke_s` lang gehalten hat. Ein Pendeln
+        zwischen zwei Zuständen erzeugt so gar keine Meldung statt einer Kette
+        — genau der Fall, den die Wallbox am 29.07.2026 geliefert hat.
+        """
+        if wert == self.stand.get(name):
+            self.kandidat.pop(name, None)
+            return False
+
+        seit = self.kandidat.get(name)
+        if seit is None or seit[0] != wert:
+            seit = (wert, jetzt)
+            self.kandidat[name] = seit
+        # Gleich mitprüfen, nicht erst im nächsten Durchgang: sonst verzögerte
+        # auch flanke_s = 0 jede Meldung um einen Takt.
+        if jetzt - seit[1] < self.flanke_s:
+            return False
+
+        self.kandidat.pop(name, None)
+        self.stand[name] = wert
+        return True
 
     def pruefen(self, lage: dict, jetzt: float) -> list[dict]:
         # Erster Durchgang: nur merken. Sonst meldete jeder Neustart „Auto
         # angesteckt" und „lädt" für einen Zustand, der schon vorher galt.
         if self.erste:
             self.erste = False
-            self._uebernehmen(lage)
+            self.stand = self._lage_flanken(lage)
+            self.lud_nachts = lage["nacht"]
             return []
-        return self._offline(lage, jetzt) + self._flanken(lage)
+        return self._offline(lage, jetzt) + self._flanken(lage, jetzt)
 
     # -- Alarme: etwas ist weg ------------------------------------------
 
@@ -2936,39 +3008,37 @@ class Melder:
 
     # -- Info: etwas hat sich geändert -----------------------------------
 
-    def _flanken(self, lage: dict) -> list[dict]:
+    def _flanken(self, lage: dict, jetzt: float) -> list[dict]:
         raus = []
+        neu = self._lage_flanken(lage)
 
-        angesteckt = lage["box_status"] in ANGESTECKT
-        if angesteckt != self.angesteckt:
-            self.angesteckt = angesteckt
+        if self._flanke("angesteckt", neu["angesteckt"], jetzt):
+            an = bool(self.stand["angesteckt"])
             raus.append({
                 "thema": "fahrzeug", "stufe": "info", "sperre_s": 0,
-                "schluessel": f"fahrzeug-{'an' if angesteckt else 'ab'}",
-                "text": ("Fahrzeug angesteckt." if angesteckt
-                         else "Fahrzeug abgesteckt.")})
+                "schluessel": f"fahrzeug-{'an' if an else 'ab'}",
+                "text": "Fahrzeug angesteckt." if an else "Fahrzeug abgesteckt."})
 
-        if lage["laedt"] != self.laedt:
-            if lage["laedt"]:
+        if self._flanke("laedt", neu["laedt"], jetzt):
+            laedt = bool(self.stand["laedt"])
+            if laedt:
                 # Die Art der Ladung merken: eine Nachtladung, die um 08:05
                 # endet, ist immer noch eine Nachtladung. Würde beim Stopp das
                 # aktuelle Fenster gelesen, hieße sie dort „PV-Laden beendet".
                 self.lud_nachts = lage["nacht"]
             art = "Nachtladen" if self.lud_nachts else "PV-Laden"
             thema = "nachtladung" if self.lud_nachts else "pvladung"
-            zustand = "gestartet" if lage["laedt"] else "beendet"
-            self.laedt = lage["laedt"]
+            zustand = "gestartet" if laedt else "beendet"
             raus.append({"thema": thema, "stufe": "info", "sperre_s": 0,
                          "schluessel": f"{thema}-{zustand}",
                          "text": f"{art} {zustand}."})
 
-        if lage["akku_netzladung"] != self.akku_lud:
-            self.akku_lud = lage["akku_netzladung"]
+        if self._flanke("akku", neu["akku"], jetzt):
+            an = bool(self.stand["akku"])
             raus.append({
                 "thema": "hausakku", "stufe": "info", "sperre_s": 0,
-                "schluessel": f"hausakku-{'an' if self.akku_lud else 'aus'}",
-                "text": ("Hausakku wird aus dem Netz geladen."
-                         if self.akku_lud
+                "schluessel": f"hausakku-{'an' if an else 'aus'}",
+                "text": ("Hausakku wird aus dem Netz geladen." if an
                          else "Netzladung des Hausakkus beendet.")})
 
         return raus
@@ -2976,7 +3046,8 @@ class Melder:
 
 async def melde_task():
     """Die Regeln im eigenen Takt prüfen, getrennt vom Regeltakt."""
-    melder = Melder(state.melde_offline_s, datetime.datetime.now().timestamp())
+    melder = Melder(state.melde_offline_s, datetime.datetime.now().timestamp(),
+                    state.melde_flanke_s)
     while True:
         jetzt = datetime.datetime.now().timestamp()
         for meldung in melder.pruefen(melde_lage(jetzt), jetzt):
@@ -3135,8 +3206,11 @@ async def main():
     state.notify_url = os.environ.get("PVUEB_NOTIFY_URL", "")
     state.notify_timeout_s = int(os.environ.get("PVUEB_NOTIFY_TIMEOUT_S", "5"))
     state.melde_offline_s = int(os.environ.get("PVUEB_MELDE_OFFLINE_S", "300"))
+    state.melde_flanke_s = int(os.environ.get("PVUEB_MELDE_FLANKE_S", MELDE_FLANKE_S))
     if state.notify_timeout_s < 1 or state.melde_offline_s < 60:
         sys.exit("PVUEB_NOTIFY_TIMEOUT_S muss >= 1 s, PVUEB_MELDE_OFFLINE_S >= 60 s sein")
+    if state.melde_flanke_s < 0:
+        sys.exit("PVUEB_MELDE_FLANKE_S muss >= 0 sein")
     state.watchdog_s = int(os.environ.get("PVUEB_WATCHDOG_S", WATCHDOG_TIMEOUT_S))
     # Untergrenze: der Wächter prüft alle WATCHDOG_CHECK_S, und ein Takt darf
     # auch mal auf einen zähen Modbus-Zugriff warten, ohne als tot zu gelten

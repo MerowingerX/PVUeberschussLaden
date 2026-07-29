@@ -35,9 +35,13 @@ def lage(**abweichungen) -> dict:
     return grund
 
 
-def melder(grenze_s=300, start=0.0) -> c.Melder:
-    """Ein eingelaufener Melder: erster Durchgang und Schonzeit vorbei."""
-    m = c.Melder(grenze_s, start)
+def melder(grenze_s=300, start=0.0, flanke_s=0) -> c.Melder:
+    """Ein eingelaufener Melder: erster Durchgang und Schonzeit vorbei.
+
+    flanke_s=0 heißt: Wechsel werden sofort gemeldet. Die Verweildauer hat
+    einen eigenen Test — sonst müsste jede andere Prüfung sie mitrechnen.
+    """
+    m = c.Melder(grenze_s, start, flanke_s)
     m.pruefen(lage(), start)          # erster Durchgang merkt nur
     return m
 
@@ -50,7 +54,7 @@ def texte(meldungen) -> str:
 
 def test_erster_durchgang():
     print("Erster Durchgang")
-    m = c.Melder(300, 0.0)
+    m = c.Melder(300, 0.0, 0)
     raus = m.pruefen(lage(box_status="Charging", laedt=True), 0.0)
     pruefe(raus == [],
            "der erste Durchgang meldet nichts — er lernt nur die Lage")
@@ -63,7 +67,7 @@ def test_erster_durchgang():
 
 def test_schonzeit():
     print("Schonzeit nach dem Start")
-    m = c.Melder(300, 1000.0)
+    m = c.Melder(300, 1000.0, 0)
     m.pruefen(lage(), 1000.0)
 
     tot = lage(box_verbunden=False, wr_alter_s=None)
@@ -236,6 +240,62 @@ def test_warteschlange():
     c.state.notify_dropped = 0
 
 
+def test_verweildauer():
+    print("Verweildauer vor der Meldung")
+    m = melder(flanke_s=120)
+
+    # Der Fall vom 29.07.2026: die Wallbox meldete abwechselnd den Status der
+    # Dose und den der Station, und daraus wurde "angesteckt / abgesteckt" im
+    # Minutentakt. Ein Pendeln darf gar keine Meldung erzeugen, nicht bloß
+    # weniger.
+    pruefe(m.pruefen(lage(box_status="Preparing"), 400.0) == [],
+           "ein frischer Wechsel meldet noch nicht")
+    pruefe(m.pruefen(lage(box_status="Available"), 460.0) == [],
+           "der Rücksprung ebenfalls nicht")
+    pruefe(m.pruefen(lage(box_status="Preparing"), 520.0) == [],
+           "und das Hin und Her erzeugt nichts")
+    pruefe(m.pruefen(lage(box_status="Available"), 580.0) == [],
+           "auch nach vier Wechseln nicht")
+
+    # Erst wenn ein Zustand steht, geht die Meldung raus.
+    pruefe(m.pruefen(lage(box_status="Preparing"), 640.0) == [],
+           "ein neuer Kandidat beginnt seine Frist von vorn")
+    raus = m.pruefen(lage(box_status="Preparing"), 800.0)
+    pruefe(len(raus) == 1 and "angesteckt" in raus[0]["text"],
+           "nach 120 s gehaltenem Zustand kommt genau eine Meldung")
+    pruefe(m.pruefen(lage(box_status="Preparing"), 900.0) == [],
+           "danach ist Ruhe")
+
+
+def test_station_und_dose():
+    print("Station und Dose (OCPP connectorId)")
+    c.state.connector_status.clear()
+    c.state.box_status = "unbekannt"
+
+    c.box_status_setzen(1, "SuspendedEV")
+    pruefe(c.state.box_status == "SuspendedEV", "die Dose bestimmt den Status")
+
+    # connectorId 0 ist die Station: "Available" heißt dort betriebsbereit,
+    # nicht "da steckt nichts".
+    c.box_status_setzen(0, "Available")
+    pruefe(c.state.box_status == "SuspendedEV",
+           "eine Station-Meldung überschreibt den Dosenstatus nicht")
+
+    c.box_status_setzen(1, "Charging")
+    pruefe(c.state.box_status == "Charging", "die Dose zählt weiter")
+
+    # Es gibt Boxen, die ausschließlich für 0 melden — die dürfen nicht blind
+    # bleiben.
+    c.state.connector_status.clear()
+    c.state.box_status = "unbekannt"
+    c.box_status_setzen(0, "Preparing")
+    pruefe(c.state.box_status == "Preparing",
+           "ohne bekannte Dose gilt die Station")
+
+    c.state.connector_status.clear()
+    c.state.box_status = "unbekannt"
+
+
 def main():
     test_erster_durchgang()
     test_schonzeit()
@@ -245,6 +305,8 @@ def main():
     test_fahrzeug()
     test_laden()
     test_hausakku()
+    test_verweildauer()
+    test_station_und_dose()
     test_warteschlange()
 
     print()
