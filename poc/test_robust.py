@@ -15,7 +15,10 @@ Baustein dieses Ausfalls gefangen.
 import asyncio
 import types
 
+import websockets
+
 import charge_loop as c
+import fake_box
 
 
 FEHLER: list[str] = []
@@ -336,12 +339,259 @@ def datetime_jetzt() -> float:
     return datetime.datetime.now().timestamp()
 
 
+# --- Protokollebene: echter WebSocket gegen unseren eigenen OCPP-Server ------
+#
+# Alles oberhalb hängt Attrappen direkt an c.charge_point. Damit ist die
+# Regellogik geprüft, die Naht zum Gerät aber nicht — und dort ist der Ausfall
+# entstanden. Ab hier läuft jede Nachricht durch Serialisierung, WebSocket und
+# die echte Zuordnung der ocpp-Bibliothek. Die Eigenheiten der Box stehen in
+# fake_box.py, jede mit ihrem Beweisstatus.
+
+OCPP_PORT = 9911
+
+
+async def mit_server(port: int):
+    """Unseren echten OCPP-Server starten, wie main() es tut."""
+    return await websockets.serve(c.on_connect, "127.0.0.1", port,
+                                  subprotocols=["ocpp1.6"])
+
+
+async def bis(bedingung, grenze=3.0, takt=0.02):
+    """Auf ein Ereignis warten, statt eine Wartezeit zu raten."""
+    ende = asyncio.get_event_loop().time() + grenze
+    while asyncio.get_event_loop().time() < ende:
+        if bedingung():
+            return True
+        await asyncio.sleep(takt)
+    return bedingung()
+
+
+async def test_protokoll_anmeldung():
+    """Die echte OCPP-Anmeldung, nicht ein nachgebautes Objekt.
+
+    Prüft die Kette, die bisher kein Test berührt hat: on_connect, die
+    Zuordnung eingehender Nachrichten und das, was die Box von uns
+    zurückbekommt.
+    """
+    grundzustand()
+    server = await mit_server(OCPP_PORT)
+    try:
+        box, ws, task = await fake_box.verbinde(OCPP_PORT)
+        await box.anmelden()
+        pruefe(c.charge_point is not None, "Server hat die Verbindung übernommen")
+        pruefe(c.state.box_status == "Available",
+               f"StatusNotification kam an: {c.state.box_status}")
+        pruefe(not c.state.limit_known,
+               "BootNotification hat den Limit-Merker entwertet (issue_limit_to_6A)")
+        await bis(lambda: "HeartbeatInterval" in box.konfiguration)
+        pruefe(box.konfiguration.get("HeartbeatInterval") == str(c.state.heartbeat_s),
+               f"Box wurde konfiguriert: {box.konfiguration}")
+        task.cancel()
+        await ws.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_protokoll_nachtladung():
+    """Nachtladen über die echte Leitung: Profil raus, Start, Ladung läuft."""
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "minpv", True
+    server = await mit_server(OCPP_PORT)
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        box, ws, task = await fake_box.verbinde(OCPP_PORT)
+        await box.anmelden()
+        takt = asyncio.create_task(c.control_task())
+        await bis(lambda: box.laeuft)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+        pruefe(box.laeuft, "Ladung läuft")
+        pruefe(box.echte_a() == c.MAX_AMPS,
+               f"und zwar mit {c.MAX_AMPS} A, nicht weniger — echte {box.echte_a()} A")
+        pruefe(c.state.charging, "der Regler weiß es auch (StatusNotification Charging)")
+        task.cancel()
+        await ws.close()
+    finally:
+        c.in_night_window = orig
+        server.close()
+        await server.wait_closed()
+
+
+async def test_protokoll_box_ignoriert_profil():
+    """Belegte Eigenheit: Accepted quittiert, trotzdem 6 A (issue_limit_to_6A).
+
+    Der Regler kann eine solche Box nicht zwingen — er soll es aber merken und
+    weiter nachsetzen, statt sich auf ein einmal gesendetes Profil zu verlassen.
+    """
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "minpv", True
+    c.state.limit_refresh_s = 0.1          # Auffrischung im Test beschleunigen
+    c.state.charge_w_max_age_s = 300
+    server = await mit_server(OCPP_PORT)
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        box, ws, task = await fake_box.verbinde(
+            OCPP_PORT, haelt_limit=False, eigen_a=6.0)
+        await box.anmelden()
+        takt = asyncio.create_task(c.control_task())
+        await bis(lambda: box.laeuft)
+        for _ in range(6):                  # ein paar Takte mit Messwerten
+            await box.messwerte()
+            await asyncio.sleep(0.05)
+        await bis(lambda: sum(1 for e, _ in box.ereignisse
+                              if e == "SetChargingProfile") >= 3)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+        gesetzt = [w for e, w in box.ereignisse if e == "SetChargingProfile"]
+        pruefe(all(a == c.MAX_AMPS for a, _ in gesetzt),
+               f"Regler setzt durchgehend {c.MAX_AMPS} A: {[a for a, _ in gesetzt][:4]}")
+        pruefe(len(gesetzt) >= 3,
+               f"und frischt auf, statt einmal zu senden ({len(gesetzt)}×)")
+        pruefe(box.echte_a() == 6.0, "die Box lädt trotzdem mit ihren 6 A")
+        pruefe(c.state.charge_w_src == "gemessen",
+               f"Ladeleistung kam echt über MeterValues: {c.state.charge_w_src}, "
+               f"{c.state.charge_w:.0f} W")
+        pruefe(c.state.limit_warned,
+               "und der Regler hat die Diskrepanz gemeldet statt ihr zu vertrauen")
+        task.cancel()
+        await ws.close()
+    finally:
+        c.in_night_window = orig
+        c.state.limit_refresh_s = 300
+        server.close()
+        await server.wait_closed()
+
+
+async def test_protokoll_reconnect_race():
+    """Der Reconnect-Race durch die echte Mechanik, nicht gegen ein Fake-Objekt.
+
+    Die Pulsar öffnet die neue Verbindung, bevor die alte zumacht — am
+    28.07.2026 fünfmal in zwei Minuten. Vorher löschte der Handler der alten
+    Verbindung beim Aufräumen die neue.
+    """
+    grundzustand()
+    server = await mit_server(OCPP_PORT)
+    try:
+        box_a, ws_a, task_a = await fake_box.verbinde(OCPP_PORT)
+        await box_a.anmelden()
+        cp_a = c.charge_point
+
+        box_b, ws_b, task_b = await fake_box.verbinde(OCPP_PORT)
+        await box_b.anmelden()
+        await bis(lambda: c.charge_point is not cp_a)
+        cp_b = c.charge_point
+        pruefe(cp_b is not cp_a, "zweite Verbindung hat übernommen")
+
+        task_a.cancel()
+        await ws_a.close()                  # die alte macht jetzt zu
+        await asyncio.sleep(0.2)
+        pruefe(c.charge_point is cp_b,
+               "die neue Verbindung steht noch, nachdem die alte weg ist")
+
+        # und sie ist auch wirklich benutzbar, nicht nur gesetzt
+        if c.charge_point is not None:
+            await c.charge_point.set_limit(c.MAX_AMPS)
+        pruefe(box_b.profil_a == c.MAX_AMPS,
+               f"über die überlebende Verbindung geht ein Limit raus: {box_b.profil_a}")
+        task_b.cancel()
+        await ws_b.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_protokoll_start_abgelehnt():
+    """Belegte Eigenheit: erster RemoteStart Accepted, der nächste Rejected.
+
+    Am 28.07. zwölfmal so im Log. Ohne Backoff liefe der Start alle 5 s weiter.
+    """
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "minpv", True
+    c.state.start_retry_s = 0.05
+    server = await mit_server(OCPP_PORT)
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        box, ws, task = await fake_box.verbinde(
+            OCPP_PORT, start_akzeptiert_dann_abgelehnt=True)
+        await box.anmelden()
+        # Box bleibt in Preparing: der Start wird angenommen, führt aber zu nichts
+        await box.melde_status("Preparing")
+        takt = asyncio.create_task(c.control_task())
+        await asyncio.sleep(1.0)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+        pruefe(box.starts < 15,
+               f"Startversuche gebremst statt Dauerfunk: {box.starts} in 1 s "
+               f"(ohne Bremse wären es ~100)")
+        pruefe(c.state.tick_error is None,
+               "und ein abgelehnter Start ist kein Reglerfehler")
+        task.cancel()
+        await ws.close()
+    finally:
+        c.in_night_window = orig
+        server.close()
+        await server.wait_closed()
+
+
+async def test_protokoll_hypothese_zeitfenster():
+    """HYPOTHESE, nicht belegt: Box befolgt ihren App-Zeitplan auch unter OCPP.
+
+    Trifft das zu, wäre ein Zeitplan als Rückfallebene für den toten Pi teuer
+    erkauft — er brächte tagsüber das PV-Überschussladen zum Erliegen. Dieser
+    Test behauptet nichts über die Box. Er hält fest, was PVueb täte, *wenn*
+    sie sich so verhielte, damit der Fall beim Messen wiedererkannt wird.
+    Messung: features/feature_WallboxRueckfallebene.md
+    """
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "fast", False
+    c.state.start_retry_s = 0.05
+    server = await mit_server(OCPP_PORT)
+    try:
+        # Zeitplan 00-08 Uhr, aber es ist Tag: die Box lehnt jeden Start ab
+        box, ws, task = await fake_box.verbinde(OCPP_PORT, zeitfenster=(0, 8))
+        box.zeitfenster = (0, 0)            # Fenster garantiert zu
+        await box.anmelden()
+        takt = asyncio.create_task(c.control_task())
+        await asyncio.sleep(0.6)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+        pruefe(not box.laeuft, "keine Ladung — die Box lässt uns nicht")
+        pruefe(box.starts >= 1, f"PVueb hat es versucht ({box.starts}×)")
+        pruefe(c.state.tick_error is None,
+               "und behandelt die Ablehnung als Betriebszustand, nicht als Fehler")
+        task.cancel()
+        await ws.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 TESTS = [test_takt_ueberlebt_wallbox_fehler, test_takt_erholt_sich,
          test_herzschlag_ohne_wallbox, test_watchdog_entscheidung,
          test_bewacht_startet_neu,
          test_reconnect_raeumt_nicht_die_neue_verbindung_weg,
          test_nachtladen_ohne_wechselrichter, test_pv_regelung_ohne_wechselrichter,
-         test_betriebsstufe, test_stumme_leitung_wird_gekappt]
+         test_betriebsstufe, test_stumme_leitung_wird_gekappt,
+         # Protokollebene: echter WebSocket, echte ocpp-Bibliothek
+         test_protokoll_anmeldung, test_protokoll_nachtladung,
+         test_protokoll_box_ignoriert_profil, test_protokoll_reconnect_race,
+         test_protokoll_start_abgelehnt, test_protokoll_hypothese_zeitfenster]
 
 
 async def main():

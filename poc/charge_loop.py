@@ -902,7 +902,14 @@ class ChargePoint(OcppChargePoint):
         now = asyncio.get_event_loop().time()
         power_wh = energy_wh = None
         for entry in meter_value:
-            for sample in entry.get("sampledValue", []):
+            # sampled_value, nicht sampledValue: die ocpp-Bibliothek wandelt die
+            # Nutzlast vor dem Handler rekursiv in snake_case um. Mit dem
+            # camelCase-Schlüssel traf die Schleife nie zu — jede gemeldete
+            # Ladeleistung wurde stillschweigend verworfen und der Regler
+            # schätzte sie stattdessen aus dem Limit (im Mitschnitt vom
+            # 25.07.2026: 1822 von 1823 Ladetakten mit charge_w_src
+            # "geschätzt", kein einziger "gemessen").
+            for sample in entry.get("sampled_value", []):
                 # Ohne measurand meint OCPP 1.6 den Energiezähler
                 measurand = sample.get("measurand", "Energy.Active.Import.Register")
                 unit = (sample.get("unit") or "").lower()

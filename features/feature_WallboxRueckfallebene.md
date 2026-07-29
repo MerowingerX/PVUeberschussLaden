@@ -33,9 +33,33 @@ Drei mögliche Verhalten, und nur zwei davon lassen eine Rückfallebene zu:
    eigenen Konfigurationswert.
 3. **Sie fährt ihren App-Zeitplan**, falls einer gesetzt ist.
 
+### Das Risiko am Zeitplan
+
+Ein Zeitplan ist **nicht kostenlos**, falls die Box ihn auch im OCPP-Betrieb
+befolgt. Dann verweigert sie außerhalb des Fensters jeden `RemoteStart` — und
+ein Eintrag „00:00–08:00" bedeutet: **tagsüber kein PV-Überschussladen mehr.**
+Die Rückfallebene würde die Hauptfunktion abschalten.
+
+| Verhalten der Box | Rückfallebene | Preis |
+|---|---|---|
+| Zeitplan wird im OCPP-Betrieb ignoriert | greift nur, falls die Box offline autostartet | keiner |
+| Zeitplan wird befolgt | greift | **PV-Überschussladen am Tag fällt aus** |
+
+Deshalb hat der Test zwei Teile, und der zweite ist der wichtigere: Es reicht
+nicht zu wissen, ob die Box nachts ohne uns lädt. Es muss auch feststehen, dass
+sie tagsüber weiter tut, was wir ihr sagen.
+
+Wie sich PVueb verhält, falls die Box so gebaut ist, hält
+`test_protokoll_hypothese_zeitfenster` in `poc/test_robust.py` fest — als
+Hypothese gekennzeichnet, ohne Behauptung über das Gerät. Ergebnis: Der Regler
+versucht es, wird abgewiesen, behandelt das als Betriebszustand und läuft
+weiter. Er merkt es also **nicht** von sich aus. Käme der Zeitplan, bräuchte es
+zusätzlich eine Meldung „Start wird dauerhaft abgelehnt".
+
 ### Testablauf
 
-Kostet eine Nacht und keinen Code.
+Kostet eine Nacht und keinen Code. **Zwei Teile** — der zweite entscheidet, ob
+der Zeitplan überhaupt in Frage kommt.
 
 1. Fahrzeug anstecken, Ladestand notieren.
 2. In der myWallbox-App: Stromstärke auf 16 A, Box entsperrt. Falls die App
@@ -46,9 +70,21 @@ Kostet eine Nacht und keinen Code.
    `charging_time` in der Wallbox-App, sowie die Netzleistung in FusionSolar.
 6. `docker compose start pvueb`.
 
-**Auswertung:** Hat sie geladen? Ab wann? Mit welcher Leistung? Wenn sie erst
-lud, nachdem die App-Sperre aufgehoben war, ist Verhalten 2 belegt. Lud sie
+**Auswertung Teil 1:** Hat sie geladen? Ab wann? Mit welcher Leistung? Wenn sie
+erst lud, nachdem die App-Sperre aufgehoben war, ist Verhalten 2 belegt. Lud sie
 punktgenau ab 00:00, ist es Verhalten 3.
+
+### Teil 2: Bleibt PV-Überschussladen am Tag möglich?
+
+Nur nötig, wenn in Teil 1 ein Zeitplan gesetzt war.
+
+7. Zeitplan „00:00–08:00" **stehen lassen**, PVueb wieder starten.
+8. Am nächsten sonnigen Tag PV-Überschussladen abwarten (Modus `minpv`).
+9. Im Log nachsehen: kommt `RemoteStart: Accepted` oder dauerhaft `Rejected`?
+
+**Kommt `Rejected`, ist der Zeitplan als Rückfallebene erledigt** — er kostet
+mehr, als er bringt. Dann bleibt nur `locked` + Stromstärke, und der Zeitplan
+muss wieder aus der App entfernt werden.
 
 Ich kann Schritt 5 aus dem Mitschnitt und der Cloud auswerten, sobald der Pi
 wieder läuft — der Cloud-Snapshot führt `added_energy`, `charging_time` und
