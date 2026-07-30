@@ -37,12 +37,15 @@ aber trotzdem zügig.
 ## Funktionen
 
 - **Freigabe per Knopfdruck** — ohne manuelle Freigabe lädt nichts, auch nachts nicht
-- **Lademodi:**
-  - *Reines PV-Überschussladen* — lädt nur, wenn der Überschuss für den Mindeststrom
-    reicht (6 A × 3 × 230 V ≈ 4,1 kW)
+- **Zwei Lademodi:**
   - *PV + Minimum* (`minpv`) — hält einen einstellbaren Mindeststrom (Slider 6–16 A),
-    Überschuss oben drauf
-  - *Sofort laden* — volle Leistung, PV egal
+    Überschuss oben drauf. Gestartet wird erst ab dem 1,10-fachen dieser Leistung
+  - *Sofort laden* (`fast`) — volle Leistung, PV egal
+
+  Einen dritten Modus „reines PV-Überschussladen" gab es bis zum 30.07.2026. Er
+  ist entfallen, weil er nichts anderes konnte: Wallbox und Fahrzeug brauchen
+  ohnehin den Mindeststrom von 6 A × 3 × 230 V ≈ 4,1 kW, unterhalb davon lädt
+  nichts. Eine Sicherung, die ihn noch nennt, startet in `minpv`.
 - **Wolkenloch-Überbrückung** (`minpv`): Fällt der Überschuss unter eine Pause-Schwelle,
   läuft ein Timeout statt eines sofortigen Stopps. Erholt er sich vorher, läuft die
   Ladung durch. So wird aus einer vorbeiziehenden Wolke kein Start-Stopp-Zyklus.
@@ -270,7 +273,7 @@ Bewusst fest im Code (`poc/charge_loop.py`, siehe Designprinzip):
 ## Simulation und Tests
 
 [poc/test_sim.py](poc/test_sim.py) fährt den echten Regelcode gegen ein Anlagenmodell —
-ohne Wechselrichter, ohne Wallbox, ohne Auto. 24 Szenarien: sonniger Tag, Wolkenfelder,
+ohne Wechselrichter, ohne Wallbox, ohne Auto. 22 Szenarien: sonniger Tag, Wolkenfelder,
 Dauerflackern, Nachtfenster, leere und volle Hausbatterie, Wallbox ohne Leistungsmeldung,
 Fahrzeug das nichts annimmt, Box die den Start ablehnt.
 
@@ -354,7 +357,7 @@ Häufige Befunde:
 | Datei | Zweck |
 |---|---|
 | [poc/charge_loop.py](poc/charge_loop.py) | ✅ Regel-Loop, OCPP-Server, Web-UI, Mitschnitt — der eigentliche Dienst |
-| [poc/test_sim.py](poc/test_sim.py) | ✅ 24 Simulationsszenarien gegen den echten Regelcode |
+| [poc/test_sim.py](poc/test_sim.py) | ✅ 22 Simulationsszenarien gegen den echten Regelcode |
 | [poc/test_robust.py](poc/test_robust.py) | ✅ 16 Regressionstests gegen den Ausfall vom 28.07.2026 |
 | [poc/test_melden.py](poc/test_melden.py) | ✅ 37 Prüfungen der Meldungen nach draußen |
 | [app/](app/) | ✅ Android-Hülle: Regler-UI und Meldungen als zwei Reiter |

@@ -8,7 +8,7 @@ Wechselrichter-IP kommt aus --inverter, der Umgebungsvariable PVUEB_INVERTER_IP
 oder einer .env-Datei im Projektverzeichnis (siehe .env.example).
 
 Stdin-Kommandos:
-    mode pv | minpv | fast   Lademodus wechseln (Start: pv)
+    mode minpv | fast        Lademodus wechseln (Start: minpv)
     frei / sperr             Laden freigeben / Freigabe zurücknehmen (Start: gesperrt)
     status                   aktuelle Werte anzeigen
     quit                     beenden
@@ -271,7 +271,7 @@ class State:
     # Softwareausfall von allein weiterarbeiten, nicht auf einen Knopfdruck
     # warten. Wer das nicht will, nimmt die Freigabe im Web-UI zurück; sie
     # überlebt dann über die Sicherung.
-    mode = "minpv"               # pv | minpv | fast
+    mode = "minpv"               # minpv | fast
     released = True              # Freigabe für den Regler (im Web-UI umschaltbar)
     min_amps = MIN_AMPS          # Untergrenze im Modus minpv (justierbar im UI)
     night_enabled = True         # Nachtladen-Automatik an/aus
@@ -656,6 +656,14 @@ def load_session():
                  daten["commit"], VERSION.get("commit"))
 
     state.mode = daten.get("mode", state.mode)
+    if state.mode == "pv":
+        # Der Modus "reines PV-Überschussladen" ist am 30.07.2026 entfallen:
+        # Wallbox und Fahrzeug brauchen ohnehin den Mindeststrom, unterhalb
+        # davon gibt es kein Laden. Eine ältere Sicherung darf deshalb keinen
+        # Modus wiederherstellen, den der Regler nicht mehr kennt.
+        log.info("Sicherung nennt Modus 'pv' — der ist entfallen, weiter mit 'minpv'")
+        state.mode = "minpv"
+
     state.released = bool(daten.get("released", state.released))
     state.min_amps = int(daten.get("min_amps", state.min_amps))
     state.night_enabled = bool(daten.get("night_enabled", state.night_enabled))
@@ -1716,10 +1724,7 @@ async def control_step(now: float):
     help_w = 0.0
     if (state.boost_start_w and allowance and state.soc is not None
             and state.soc >= state.boost_start_soc):
-        if state.mode == "minpv":
-            noetig = min_w if state.charging else state.minpv_start_factor * min_w
-        else:
-            noetig = MIN_AMPS * VOLTAGE * PHASES
+        noetig = min_w if state.charging else state.minpv_start_factor * min_w
         help_w = min(max(0.0, noetig - avail), state.boost_start_w)
         avail += help_w
     # Alle drei Beiträge kommen aus derselben Batterie, und die hat eine
@@ -1729,16 +1734,10 @@ async def control_step(now: float):
     # Wolkenloch-Boost die Grenze schon aus, „oben drauf" gibt es dann nichts.
     avail = min(avail, pv_surplus + state.batt_max_w)
     boost = max(bridge, help_w) + perma  # nur noch für Log und Anzeige
-    amps = target_amps(avail)
-    if state.mode == "minpv":
-        amps = max(state.min_amps, amps)
+    amps = max(state.min_amps, target_amps(avail))
 
     if not state.charging:
-        if state.mode == "minpv":
-            ready = avail >= state.minpv_start_factor * min_w
-        else:
-            ready = amps >= MIN_AMPS
-        if ready:
+        if avail >= state.minpv_start_factor * min_w:
             state.deficit_since = None
             state.surplus_since = state.surplus_since or now
             if now - state.surplus_since >= state.start_delay_s:
@@ -1759,28 +1758,27 @@ async def control_step(now: float):
             if limit_due(now, MAX_AMPS):
                 await apply_limit(now, MAX_AMPS)
     else:
-        if state.mode == "minpv":
-            # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
-            # Erholung über Resume-Schwelle verwirft ihn, Ablauf stoppt die Ladung
-            if avail > state.minpv_resume_factor * min_w:
-                if state.minpv_low_since is not None:
-                    log.info("minpv: Überschuss erholt (%.0f W, davon %.0f W Batterie-Boost) "
-                             "— Wolkenloch überbrückt", avail, boost)
-                state.minpv_low_since = None
-            elif avail < state.minpv_pause_factor * min_w:
-                if state.minpv_low_since is None:
-                    state.minpv_low_since = now
-                    log.info("minpv: Überschuss nur %.0f W (< %.0f W) — stoppe in %ds, "
-                             "falls keine Erholung", avail,
-                             state.minpv_pause_factor * min_w, state.minpv_timeout_s)
-            if (state.minpv_low_since is not None
-                    and now - state.minpv_low_since >= state.minpv_timeout_s):
-                log.info("minpv: PV-Überschuss seit %ds unter %.0f %% Min — stoppe Ladung",
-                         state.minpv_timeout_s, state.minpv_resume_factor * 100)
-                await charge_point.remote_stop()
-                state.minpv_low_since = None
-                state.surplus_since = state.deficit_since = None
-                return
+        # Wolkenloch-Überbrückung: unter Pause-Schwelle läuft ein Timeout,
+        # Erholung über Resume-Schwelle verwirft ihn, Ablauf stoppt die Ladung
+        if avail > state.minpv_resume_factor * min_w:
+            if state.minpv_low_since is not None:
+                log.info("minpv: Überschuss erholt (%.0f W, davon %.0f W Batterie-Boost) "
+                         "— Wolkenloch überbrückt", avail, boost)
+            state.minpv_low_since = None
+        elif avail < state.minpv_pause_factor * min_w:
+            if state.minpv_low_since is None:
+                state.minpv_low_since = now
+                log.info("minpv: Überschuss nur %.0f W (< %.0f W) — stoppe in %ds, "
+                         "falls keine Erholung", avail,
+                         state.minpv_pause_factor * min_w, state.minpv_timeout_s)
+        if (state.minpv_low_since is not None
+                and now - state.minpv_low_since >= state.minpv_timeout_s):
+            log.info("minpv: PV-Überschuss seit %ds unter %.0f %% Min — stoppe Ladung",
+                     state.minpv_timeout_s, state.minpv_resume_factor * 100)
+            await charge_point.remote_stop()
+            state.minpv_low_since = None
+            state.surplus_since = state.deficit_since = None
+            return
         if amps < MIN_AMPS:
             state.surplus_since = None
             state.deficit_since = state.deficit_since or now
@@ -1815,7 +1813,7 @@ async def command_loop():
         cmd = parts[0].lower()
         if cmd == "quit":
             os._exit(0)
-        elif cmd == "mode" and len(parts) == 2 and parts[1] in ("pv", "minpv", "fast"):
+        elif cmd == "mode" and len(parts) == 2 and parts[1] in ("minpv", "fast"):
             state.mode = parts[1]
             state.surplus_since = state.deficit_since = state.minpv_low_since = None
             log.info("Modus: %s", state.mode)
@@ -1892,7 +1890,6 @@ INDEX_HTML = """<!doctype html>
 <button id="frei" onclick="toggleRelease()">…</button>
 <h2>Lademodus – genau eine Option</h2>
 <div class="modes">
-<button id="m_pv" class="mode" onclick="setMode('pv')">Reines PV-Überschussladen</button>
 <button id="m_minpv" class="mode" onclick="setMode('minpv')">PV-Überschussladen, mindestens
   <span id="minlabel">6</span> A</button>
 <button id="m_fast" class="mode" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
@@ -2141,7 +2138,7 @@ async function refresh() {
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
   renderWallbox();
-  for (const m of ["pv","minpv","fast"])
+  for (const m of ["minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
   document.getElementById("minlabel").textContent = s.min_amps;
   const hb = document.getElementById("heartbeat");
@@ -2443,8 +2440,8 @@ async def record_task():
 
 async def http_mode(request):
     mode = request.match_info["mode"]
-    if mode not in ("pv", "minpv", "fast"):
-        raise web.HTTPBadRequest(text="mode muss pv|minpv|fast sein")
+    if mode not in ("minpv", "fast"):
+        raise web.HTTPBadRequest(text="mode muss minpv|fast sein")
     state.mode = mode
     state.surplus_since = state.deficit_since = state.minpv_low_since = None
     log.info("Modus (Web): %s", mode)

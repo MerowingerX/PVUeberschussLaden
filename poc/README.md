@@ -90,7 +90,9 @@ Verbindet alles: Modbus-Messung → Regel-Logik → OCPP-Steuerung. Dazu Web-Int
   `sudo ufw allow from <lan-subnetz> to any port 8080 proto tcp`)
   Zeigt Netz/Überschuss/SOC/Limit/Status, Freigabe-Button, Modus-Buttons.
 - **Freigabe:** Laden nur nach Knopfdruck (Web-UI oder stdin `frei`/`sperr`). Start: gesperrt.
-- **Modi:** `pv` (nur Überschuss), `minpv` (immer ≥ 6 A), `fast` (16 A).
+- **Modi:** `minpv` (immer ≥ 6 A, Überschuss oben drauf), `fast` (16 A).
+  Ein dritter Modus `pv` ist am 30.07.2026 entfallen — unterhalb des
+  Mindeststroms lädt ohnehin nichts.
 - **Nachttarif 00–08 Uhr** (`.env`): freigegebenes Fahrzeug lädt mit 16 A, unabhängig vom Modus.
 - **Batterie-Netzladung:** Web-Toggle oder Automatik (Nachtfenster + SOC <
   `PVUEB_BATT_LOW_SOC` + Prognose < `PVUEB_FORECAST_MIN_KWH`, max. 1 Start/Nacht)
@@ -105,7 +107,7 @@ Verbindet alles: Modbus-Messung → Regel-Logik → OCPP-Steuerung. Dazu Web-Int
 
 - [ ] Box verbindet sich mit charge_loop, Web-UI zeigt live Werte
 - [ ] Freigabe + Modus `fast`: Auto lädt; Freigabe weg: Ladung stoppt
-- [ ] Sonniger Tag, Modus `pv`: Ladung folgt dem Überschuss
+- [ ] Sonniger Tag, Modus `minpv`: Ladung folgt dem Überschuss
 - [x] Batterie-Netzladung (2026-07-16): Toggle startet Zwangsladung (Batterie
       +356 W, Netzbezug 672 W), Stopp per Toggle funktioniert; Grid-charge-Cutoff
       (47088) deckelt die Zwangsladung nicht. Noch offen: Selbst-Stopp am Ziel-SOC

@@ -306,134 +306,120 @@ async def t3():
 
 
 async def t4():
-    sim = Sim(fading, soc=50, mode="pv")
-    await sim.run(240)
-    report("TEST 4 — wie Test 3, aber Modus pv (kein Mindeststrom)", sim,
-           "Erwartet: Start, Limit fällt mit dem Mittel, Stopp über stop_delay statt Timeout.")
-
-
-async def t5():
     sim = Sim(flicker, soc=50, mode="minpv")
     await sim.run(120)
-    report("TEST 5 — nur kurze Spitzen (2 min über Schwelle, 8 min darunter)", sim,
+    report("TEST 4 — nur kurze Spitzen (2 min über Schwelle, 8 min darunter)", sim,
            "Erwartet: gar kein Start — start_delay 120 s wird nie durchgehalten.")
 
 
-async def t6():
+async def t5():
     sim = Sim(long_dip, soc=50, mode="minpv")
     await sim.run(300)
-    report("TEST 6 — Anlauf auf 8 A, dann 3 h bei 4 A, minpv 6 A", sim,
+    report("TEST 5 — Anlauf auf 8 A, dann 3 h bei 4 A, minpv 6 A", sim,
            "Erwartet: Boost federt den Einbruch ab, das 10-min-Mittel zieht das Ziel aber "
            "unter die Pause-Schwelle -> Timeout -> Stopp, lange bevor das Budget leer ist.")
 
 
-async def t7():
+async def t6():
     # Batterie nimmt nichts auf, damit der SOC unter der Boost-Grenze bleibt
     sim = Sim(fading, soc=25, mode="minpv", batt_charge_max=0)
     await sim.run(240)
-    report("TEST 7 — wie Test 3, aber SOC 25 % (unter boost_min_soc 30 %)", sim,
+    report("TEST 6 — wie Test 3, aber SOC 25 % (unter boost_min_soc 30 %)", sim,
            "Erwartet: kein Boost, Ladung stoppt früher, Batteriereserve bleibt unangetastet.")
 
 
-async def t8():
+async def t7():
     sim = Sim(wall, soc=50, mode="minpv")
     await sim.run(180)
-    report("TEST 8 — voller Anlauf, dann harter Abriss auf 0 A", sim,
+    report("TEST 7 — voller Anlauf, dann harter Abriss auf 0 A", sim,
            "Erwartet: Boost + Timeout federn ab, Stopp danach, Netzbezug begrenzt.")
 
 
-async def t9():
+async def t8():
     orig = c.in_night_window
     c.in_night_window = lambda *a: True
     try:
         sim = Sim(lambda m: 0.0, soc=50, mode="minpv", night=True)
         await sim.run(120)
-        report("TEST 9 — Nachtfenster ohne PV", sim,
+        report("TEST 8 — Nachtfenster ohne PV", sim,
                "Erwartet: sofort 16 A aus dem Netz, unabhängig vom Modus.")
     finally:
         c.in_night_window = orig
 
 
-async def t10():
+async def t9():
     # SOC unter boost_start_soc (50 %), Batterie nimmt nichts auf, damit er
     # dort bleibt — sonst schöbe die Starthilfe die 0,3 A Lücke zu (Test 21)
     sim = Sim(just_under, soc=45, mode="minpv", batt_charge_max=0)
     await sim.run(180)
-    report("TEST 10 — Dauerhaft 6,3 A bei minpv 6 A (Startschwelle 1,10 × 6 A = 6,6 A), SOC 45 %", sim,
+    report("TEST 9 — Dauerhaft 6,3 A bei minpv 6 A (Startschwelle 1,10 × 6 A = 6,6 A), SOC 45 %", sim,
            "Erwartet: kein Start — 6,3 A reichen für den minpv-Trigger nicht, und die "
            "Starthilfe der Batterie ist unter 50 % SOC gesperrt.")
 
 
-async def t11():
-    sim = Sim(just_under, soc=50, mode="pv")
-    await sim.run(180)
-    report("TEST 11 — wie Test 10, aber Modus pv", sim,
-           "Erwartet: Start bei 6 A — ohne minpv-Trigger genügt das Mittel über 6 A.")
-
-
-async def t12():
+async def t10():
     sim = Sim(dip_storm, soc=90, mode="minpv")
     await sim.run(480)
-    report("TEST 12 — Dauerfeuer kurzer Wolkenlöcher (6 min alle 20 min), 8 h", sim,
+    report("TEST 10 — Dauerfeuer kurzer Wolkenlöcher (6 min alle 20 min), 8 h", sim,
            "Erwartet: Boost überbrückt jedes Loch, bis das Tagesbudget (5 kWh) leer ist — "
            "danach greift der Timeout.")
 
 
-async def t13():
+async def t11():
     sim = Sim(sunny, soc=50, mode="minpv", meter="none")
     await sim.run(480)
-    report("TEST 13 — wie Test 1, aber Wallbox meldet keine Ladeleistung", sim,
+    report("TEST 11 — wie Test 1, aber Wallbox meldet keine Ladeleistung", sim,
            "Erwartet: identisch zu Test 1. Ohne Schätzung aus dem Limit hielte der Regler "
            "die eigene Ladung für einen PV-Einbruch und liefe in einen Stopp-Start-Kreisel.")
 
 
-async def t14():
+async def t12():
     sim = Sim(sunny, soc=50, mode="minpv", meter="stale")
     await sim.run(480)
-    report("TEST 14 — wie Test 1, aber Ladeleistung eingefroren (letzte Meldung 5 min alt)", sim,
+    report("TEST 12 — wie Test 1, aber Ladeleistung eingefroren (letzte Meldung 5 min alt)", sim,
            "Erwartet: identisch zu Test 1 — die tote Messung wird nach 30 s verworfen.")
 
 
-async def t15():
+async def t13():
     # Box meldet "Charging", das Auto nimmt nichts an (voll oder Ladeabbruch)
     sim = Sim(sunny, soc=50, mode="minpv", meter="none", car_amps=lambda m: 0.0)
     await sim.run(480)
-    report("TEST 15 — Wallbox meldet Ladung, Auto nimmt nichts an", sim,
+    report("TEST 13 — Wallbox meldet Ladung, Auto nimmt nichts an", sim,
            "Erwartet: Stopp über den minpv-Timeout. Ohne den Deckel aus der PV-Erzeugung "
            "bliebe die Ladung offen, weil die geschätzte Leistung einen Überschuss vortäuscht.")
 
 
-async def t16():
+async def t14():
     # Auto nimmt hartnäckig nur 6 A, das Limit darf ihm nicht davonlaufen
     sim = Sim(sunny, soc=50, mode="minpv", meter="none", car_amps=lambda m: 6.0)
     await sim.run(480)
-    report("TEST 16 — Auto nimmt nur 6 A, Wallbox meldet keine Ladeleistung", sim,
+    report("TEST 14 — Auto nimmt nur 6 A, Wallbox meldet keine Ladeleistung", sim,
            "Erwartet: Limit bleibt in der Nähe dessen, was das Auto zieht, statt bis 16 A "
            "hochzulaufen — der Deckel aus PV minus Netz minus Batterie hält es fest.")
 
 
-async def t17():
+async def t15():
     # Box hängt in "Finishing" und lehnt den Start ab, bis sie geweckt wird
     sim = Sim(sunny, soc=50, mode="minpv", accept_start=False)
     c.state.box_status = "Finishing"
     await sim.run(480)
-    report("TEST 17 — Box lehnt Start ab (hängt in Finishing)", sim,
+    report("TEST 15 — Box lehnt Start ab (hängt in Finishing)", sim,
            "Erwartet: ein abgelehnter Versuch, dann ChangeAvailability-Zyklus, danach Start. "
            "Ohne Backoff liefe der RemoteStart im 5-Sekunden-Takt weiter.")
 
 
-async def t18():
+async def t16():
     # Fahrzeug voll: Box meldet SuspendedEV und nimmt keinen Start an
     sim = Sim(sunny, soc=50, mode="minpv", accept_start=False)
     c.state.box_status = "SuspendedEV"
     await sim.run(480)
     versuche = sum(1 for _, e in sim.box.events if "abgelehnt" in e)
-    report("TEST 18 — Fahrzeug voll (SuspendedEV), Box nimmt keinen Start an", sim,
+    report("TEST 16 — Fahrzeug voll (SuspendedEV), Box nimmt keinen Start an", sim,
            f"Erwartet: wenige Startversuche über 8 h statt Dauerfunk — hier {versuche}. "
            "Ohne Bremse wären es rund 4000 (alle 5 s).")
 
 
-async def t19():
+async def t17():
     """Regression zu docs/issue_limit_to_6A.md.
 
     Der Regler hat im PV-Betrieb zuletzt 6 A gesetzt und glaubt weiter daran.
@@ -451,14 +437,14 @@ async def t19():
         c.state.current_limit, c.state.limit_known = 6.0, False
         await sim.run(120)
         gesetzt = [e for _, e in sim.box.events if e.startswith("Limit")]
-        report("TEST 19 — Nachtfenster nach Box-Boot, Merker steht auf 6 A", sim,
+        report("TEST 17 — Nachtfenster nach Box-Boot, Merker steht auf 6 A", sim,
                f"Erwartet: sofort {c.MAX_AMPS} A, obwohl der Merker 6 A sagte. "
                f"Gesetzte Limits: {gesetzt[:3]}")
     finally:
         c.in_night_window = orig
 
 
-async def t20():
+async def t18():
     """Box quittiert das Limit, hält sich aber nicht daran.
 
     Dagegen hilft kein Nachsetzen — der Regler soll es wenigstens bemerken und
@@ -472,7 +458,7 @@ async def t20():
                   obeys_limit=False, stuck_amps=6.0)
         await sim.run(60)
         wiederholt = sum(1 for _, e in sim.box.events if e.startswith("Limit"))
-        report("TEST 20 — Box ignoriert das Ladeprofil, 1 h Nachtfenster", sim,
+        report("TEST 18 — Box ignoriert das Ladeprofil, 1 h Nachtfenster", sim,
                f"Erwartet: Limit wird über die Stunde mehrfach nachgesetzt "
                f"(hier {wiederholt}×, Abstand {c.state.limit_refresh_s} s) und die "
                f"Diskrepanz einmal geloggt. Vor dem Fix blieb es bei einem Versuch.")
@@ -480,10 +466,10 @@ async def t20():
         c.in_night_window = orig
 
 
-async def t21():
+async def t19():
     """Starthilfe aus der Hausbatterie (PVUEB_BOOST_START_W).
 
-    Dieselbe Kurve wie Test 10, nur mit voller Batterie: 6,3 A PV fehlen 0,3 A
+    Dieselbe Kurve wie Test 9, nur mit voller Batterie: 6,3 A PV fehlen 0,3 A
     (207 W) zur minpv-Startschwelle. Die Batterie legt sie drauf. Danach liegt
     die PV über der Mindestleistung, die Starthilfe wird also nicht mehr
     gebraucht — die Ladung läuft aus PV weiter, ohne Budget zu verbrauchen.
@@ -496,25 +482,25 @@ async def t21():
         await sim.run(180)
     finally:
         c.state.perma_boost_w = orig
-    report("TEST 21 — wie Test 10, aber SOC 70 % (Starthilfe 500 W, Dauer-Boost aus)", sim,
+    report("TEST 19 — wie Test 9, aber SOC 70 % (Starthilfe 500 W, Dauer-Boost aus)", sim,
            "Erwartet: Start trotz 6,3 A, danach stabile Ladung ohne Stopp-Start-Kreisel "
            "und ohne nennenswerten Netzbezug.")
 
 
-async def t22():
+async def t20():
     """Starthilfe abgeschaltet — Verhalten wie vor dem Feature."""
     orig, orig_perma = c.state.boost_start_w, c.state.perma_boost_w
     c.state.boost_start_w = c.state.perma_boost_w = 0
     try:
         sim = Sim(just_under, soc=70, mode="minpv")
         await sim.run(180)
-        report("TEST 22 — wie Test 21, aber PVUEB_BOOST_START_W=0", sim,
+        report("TEST 20 — wie Test 19, aber PVUEB_BOOST_START_W=0", sim,
                "Erwartet: kein Start — ohne Starthilfe bleibt es beim alten Verhalten.")
     finally:
         c.state.boost_start_w, c.state.perma_boost_w = orig, orig_perma
 
 
-async def t23():
+async def t21():
     """Dauer-Boost bei voller Batterie (PVUEB_PERMA_BOOST_*).
 
     Sonniger Tag, Batterie steht schon auf 95 % und kann nichts mehr aufnehmen.
@@ -523,21 +509,21 @@ async def t23():
     """
     sim = Sim(sunny, soc=95, mode="minpv")
     await sim.run(480)
-    report("TEST 23 — sonniger Tag, Batterie voll (SOC 95 %), Dauer-Boost 1000 W", sim,
+    report("TEST 21 — sonniger Tag, Batterie voll (SOC 95 %), Dauer-Boost 1000 W", sim,
            "Erwartet: mehr im Auto als in Test 1, SOC fällt bis 50 % und bleibt dort — "
            "unter der Abschaltschwelle kein weiterer Dauer-Boost.")
 
 
-async def t24():
+async def t22():
     """Hysterese: knapp unter der oberen Schwelle springt nichts an."""
     sim = Sim(sunny, soc=85, mode="minpv", batt_charge_max=0)
     await sim.run(480)
-    report("TEST 24 — wie Test 23, aber SOC 85 % und Batterie nimmt nichts auf", sim,
+    report("TEST 22 — wie Test 21, aber SOC 85 % und Batterie nimmt nichts auf", sim,
            "Erwartet: kein Dauer-Boost — er startet erst ab 90 %, nicht schon knapp darunter.")
 
 
-TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18,
-         t19, t20, t21, t22, t23, t24]
+TESTS = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11,
+         t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22]
 
 
 JSON_OUT = ""
