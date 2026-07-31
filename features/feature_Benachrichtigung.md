@@ -87,15 +87,28 @@ kennen muss, und keine beschreibt einen Programmierfehler.
 | **Wechselrichter weg** | kein erfolgreicher Modbus-Poll seit `PVUEB_MELDE_OFFLINE_S` | alarm |
 | **Wallbox weg** | keine OCPP-Verbindung seit `PVUEB_MELDE_OFFLINE_S` | alarm |
 | **… wieder da** | jeweils die Rückkehr | info |
-| **Fahrzeug** | `box_status` wechselt zwischen „steckt" und `Available` | info |
+| **Fahrzeug** | `box_status` wechselt zwischen „steckt" (`Charging`, `SuspendedEV`, `SuspendedEVSE`, `Finishing`) und allem anderen | info |
 | **Nachtladen** | `charging` wechselt, während das Nachtfenster gilt | info |
 | **PV-Laden** | `charging` wechselt außerhalb des Nachtfensters | info |
 | **Hausakku** | `battery_grid_charge` wechselt | info |
 
-Drei Eigenheiten, die aus dem Betrieb folgen und in den Tests festgehalten sind:
+Vier Eigenheiten, die aus dem Betrieb folgen und in den Tests festgehalten sind:
 
 **Die Entwarnung ist eigenständig.** Ohne sie steht ein Alarm im Chat, und
 niemand weiß, ob er noch gilt.
+
+**`Preparing` zählt nicht als Fahrzeug.** In diesem Zustand steht die Box auch
+dann, wenn sie auf ein Kabel *wartet* — nach einem RemoteStart, einem RFID-Halt
+oder einem Start aus der Hersteller-App. In der Nacht zum 30.07.2026 kam so alle
+130 s ein Paar „angesteckt / abgesteckt", ohne dass ein Auto in der Einfahrt
+stand: der Regler startete in die leere Dose, die Box ging in `Preparing`, fiel
+nach ihrem `ConnectionTimeOut` (Werk: 120 s) auf `Available` zurück, der Regler
+startete erneut. Die Verweildauer von 120 s konnte das nicht abfangen — sie war
+zufällig genauso lang wie der Timeout der Box. Der Regler startet seitdem nicht
+mehr in eine leere Dose, und gemeldet wird erst, wenn Strom fließen könnte.
+Preis: ein Fahrzeug, das nie über `Preparing` hinauskommt (gesperrte Box,
+fehlende Autorisierung), erzeugt keine Meldung. Der bessere Fehler — die
+Gegenrichtung meldete ein Auto, das gar nicht da war.
 
 **Eine Nachtladung, die um 08:05 endet, meldet „Nachtladen beendet"** — nicht
 „PV-Laden beendet". Der Melder merkt sich die Art, mit der die Ladung begann,
@@ -169,10 +182,12 @@ zweiten Steuerweg neben der Web-UI.
 
 ## Tests
 
-`poc/test_melden.py`, 37 Prüfungen. Abgedeckt:
+`poc/test_melden.py`, 50 Prüfungen. Abgedeckt:
 
 - erster Durchgang meldet nichts, sondern lernt die Lage (sonst meldete jeder
   Neustart „Fahrzeug angesteckt" für etwas, das längst galt)
+- eine leere Dose, die zwischen `Preparing` und `Available` pendelt, erzeugt
+  keine einzige Meldung — auch ohne Verweildauer
 - Schonzeit nach dem Start, dann Frist, dann Alarm
 - ein Ausfall meldet genau einmal, die Rückkehr ebenfalls, ein zweiter Ausfall
   wieder

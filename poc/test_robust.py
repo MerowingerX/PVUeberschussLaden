@@ -64,6 +64,10 @@ def grundzustand():
     s.last_tick, s.tick_error = 0.0, None
     s.watchdog_s = c.WATCHDOG_TIMEOUT_S
     s.start_retry_s = 30
+    # Der Betriebsfall dieser Tests ist ein steckendes Fahrzeug. Ohne das
+    # startet der Regler seit dem 30.07.2026 gar nicht erst (try_start).
+    s.box_status = "Preparing"
+    s.leerstart_gemeldet = False
     c.reset_start_backoff()
 
 
@@ -403,6 +407,9 @@ async def test_protokoll_nachtladung():
     try:
         box, ws, task = await fake_box.verbinde(OCPP_PORT)
         await box.anmelden()
+        # Das Auto steckt: die Box steht in "Preparing", sonst startet
+        # der Regler nicht (leere Dose, siehe try_start).
+        await box.melde_status("Preparing")
         takt = asyncio.create_task(c.control_task())
         await bis(lambda: box.laeuft)
         takt.cancel()
@@ -439,6 +446,9 @@ async def test_protokoll_box_ignoriert_profil():
         box, ws, task = await fake_box.verbinde(
             OCPP_PORT, haelt_limit=False, eigen_a=6.0)
         await box.anmelden()
+        # Das Auto steckt: die Box steht in "Preparing", sonst startet
+        # der Regler nicht (leere Dose, siehe try_start).
+        await box.melde_status("Preparing")
         takt = asyncio.create_task(c.control_task())
         await bis(lambda: box.laeuft)
         for _ in range(6):                  # ein paar Takte mit Messwerten
@@ -546,6 +556,49 @@ async def test_protokoll_start_abgelehnt():
         await server.wait_closed()
 
 
+async def test_protokoll_leere_dose():
+    """Belegte Eigenheit: RemoteStart in eine leere Dose erzeugt Preparing.
+
+    Vorfall in der Nacht zum 30.07.2026: kein Auto in der Einfahrt, trotzdem
+    im Verlauf alle 130 s "Fahrzeug angesteckt" und "abgesteckt". Der Regler
+    schickte im Nachtfenster RemoteStart, die Box quittierte mit Accepted und
+    ging in Preparing — dort wartet sie ConnectionTimeOut lang (Werk: 120 s)
+    auf ein Kabel und fällt zurück auf Available. Damit erzeugte der Regler
+    genau den Wechsel, den er gleich darauf als Fahrzeug meldete.
+    """
+    grundzustand()
+    c.state.mode, c.state.night_enabled = "minpv", True
+    c.state.start_retry_s = 0.05
+    server = await mit_server(OCPP_PORT)
+    orig = c.in_night_window
+    c.in_night_window = lambda *a: True
+    try:
+        box, ws, task = await fake_box.verbinde(OCPP_PORT)
+        await box.anmelden()                 # meldet Available: die Dose ist frei
+        takt = asyncio.create_task(c.control_task())
+        await asyncio.sleep(0.5)
+        pruefe(box.starts == 0,
+               f"kein Startversuch in eine leere Dose ({box.starts}×)")
+        pruefe(not box.laeuft, "und folglich keine Ladung")
+
+        # Jetzt steckt jemand an — ab hier darf der Regler wieder.
+        await box.melde_status("Preparing")
+        await bis(lambda: box.laeuft)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+        pruefe(box.laeuft, "nach dem Anstecken läuft die Ladung")
+        pruefe(c.state.tick_error is None, "und der Regeltakt blieb heil")
+        task.cancel()
+        await ws.close()
+    finally:
+        c.in_night_window = orig
+        server.close()
+        await server.wait_closed()
+
+
 async def test_protokoll_hypothese_zeitfenster():
     """HYPOTHESE, nicht belegt: Box befolgt ihren App-Zeitplan auch unter OCPP.
 
@@ -564,6 +617,9 @@ async def test_protokoll_hypothese_zeitfenster():
         box, ws, task = await fake_box.verbinde(OCPP_PORT, zeitfenster=(0, 8))
         box.zeitfenster = (0, 0)            # Fenster garantiert zu
         await box.anmelden()
+        # Das Auto steckt: die Box steht in "Preparing", sonst startet
+        # der Regler nicht (leere Dose, siehe try_start).
+        await box.melde_status("Preparing")
         takt = asyncio.create_task(c.control_task())
         await asyncio.sleep(0.6)
         takt.cancel()
@@ -591,7 +647,8 @@ TESTS = [test_takt_ueberlebt_wallbox_fehler, test_takt_erholt_sich,
          # Protokollebene: echter WebSocket, echte ocpp-Bibliothek
          test_protokoll_anmeldung, test_protokoll_nachtladung,
          test_protokoll_box_ignoriert_profil, test_protokoll_reconnect_race,
-         test_protokoll_start_abgelehnt, test_protokoll_hypothese_zeitfenster]
+         test_protokoll_start_abgelehnt, test_protokoll_leere_dose,
+         test_protokoll_hypothese_zeitfenster]
 
 
 async def main():

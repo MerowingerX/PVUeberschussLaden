@@ -264,6 +264,13 @@ MELDE_CHECK_S = 10               # Takt der Regelprüfung (Flanken, Offline-Fris
 MELDE_FLANKE_S = 120
 MELDE_SPERRE_S = 3600            # Wiederholsperre für dieselbe Lage beim Empfänger
 
+# OCPP-Zustände, in denen ein Kabel an der Dose hängen kann. „Available" heißt
+# frei. „Preparing" ist zweideutig — dort steht die Box sowohl mit gestecktem
+# Kabel als auch, wenn sie nach einem RemoteStart auf eines wartet.
+ANGESTECKT = ("Preparing", "Charging", "SuspendedEV", "SuspendedEVSE", "Finishing")
+# Fürs Melden reicht diese Zweideutigkeit nicht, siehe _lage_flanken().
+ANGESTECKT_SICHER = ("Charging", "SuspendedEV", "SuspendedEVSE", "Finishing")
+
 
 class State:
     # Startverhalten ohne gültige Sicherung: freigegeben, PV-Minimum mit 6 A.
@@ -366,6 +373,7 @@ class State:
     # Ganzes und 1..n für die Dosen. Beides in ein Feld zu schreiben, lässt
     # eine Station-Meldung den Dosenstatus überschreiben.
     connector_status: dict[int, str] = {}
+    leerstart_gemeldet = False              # „kein Fahrzeug" steht schon im Log
     # Herzschlag des Regeltakts, monotone Uhr. Nur diese eine Zahl entscheidet,
     # ob der Regler lebt — der Wächter-Thread liest sie, sonst niemand.
     last_tick: float = 0.0
@@ -745,7 +753,21 @@ async def try_start(now: float, amps: float):
     Freigabe ignorieren (voll, Ladetimer, Ladeabbruch). Deshalb wird nach
     jedem Versuch gewartet, mit wachsendem Abstand — sonst liefe bei einem
     Auto, das nicht will, ein RemoteStart alle 5 Sekunden.
+
+    In eine leere Dose wird gar nicht erst gestartet. Sie quittiert den
+    RemoteStart mit „Accepted" und geht in „Preparing" — dort wartet sie
+    ConnectionTimeOut lang (Werk: 120 s) auf ein Kabel und fällt zurück auf
+    „Available". Der Regler erzeugte damit genau den Wechsel, den er gleich
+    darauf als „Fahrzeug angesteckt / abgesteckt" meldete, und das im Kreis:
+    in der Nacht zum 30.07.2026 alle 130 s, ohne Auto in der Einfahrt.
     """
+    if state.box_status not in ANGESTECKT:
+        # Einmal je Leerlaufphase ins Log, sonst füllt der Regeltakt es.
+        if not state.leerstart_gemeldet:
+            state.leerstart_gemeldet = True
+            log.info("Kein Fahrzeug an der Dose (Status %s) — kein Startversuch",
+                     state.box_status)
+        return
     if state.start_retry_at is not None and now < state.start_retry_at:
         return
     # SuspendedEV heißt: die Box gibt frei, das Fahrzeug nimmt nichts (voll,
@@ -868,6 +890,8 @@ def box_status_setzen(connector_id, status: str) -> str:
     dosen = sorted(n for n in state.connector_status if n >= 1)
     state.box_status = (state.connector_status[dosen[0]] if dosen
                         else state.connector_status.get(0, state.box_status))
+    if state.box_status in ANGESTECKT:
+        state.leerstart_gemeldet = False     # nächste Leerlaufphase darf melden
     return state.box_status
 charge_point: "ChargePoint | None" = None
 modbus_client: AsyncModbusTcpClient | None = None
@@ -2844,10 +2868,6 @@ def watchdog():
 # niemals eine Ladung beeinflussen, dieselbe Regel wie für die myWallbox-Cloud.
 meldungen: collections.deque = collections.deque(maxlen=NOTIFY_QUEUE_MAX)
 
-# OCPP-Zustände, in denen ein Fahrzeug steckt. „Available" heißt frei, alles
-# andere heißt: da hängt ein Kabel dran.
-ANGESTECKT = ("Preparing", "Charging", "SuspendedEV", "SuspendedEVSE", "Finishing")
-
 
 def melden(thema: str, text: str, stufe: str = "info",
            schluessel: str = "", sperre_s: float = MELDE_SPERRE_S):
@@ -2915,8 +2935,16 @@ class Melder:
         self.lud_nachts = False
 
     def _lage_flanken(self, lage: dict) -> dict[str, object]:
+        # „Preparing" zählt hier bewusst nicht als steckendes Fahrzeug: die Box
+        # steht dort auch, wenn sie auf ein Kabel wartet — nach einem Start aus
+        # der Hersteller-App, nach einem RFID-Halt oder nach einem RemoteStart
+        # von uns. Gemeldet wird erst, wenn Strom fließen könnte. Preis dieser
+        # Entscheidung: ein Fahrzeug, das nie über „Preparing" hinauskommt
+        # (gesperrte Box, fehlende Autorisierung), erzeugt keine Meldung. Das
+        # ist der bessere Fehler — die Gegenrichtung meldete ein Auto, das gar
+        # nicht da war.
         return {
-            "angesteckt": lage["box_status"] in ANGESTECKT,
+            "angesteckt": lage["box_status"] in ANGESTECKT_SICHER,
             "laedt": lage["laedt"],
             "akku": lage["akku_netzladung"],
         }

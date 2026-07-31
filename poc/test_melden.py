@@ -153,22 +153,40 @@ def test_fahrzeug():
     print("Fahrzeug")
     m = melder()
 
-    raus = m.pruefen(lage(box_status="Preparing"), 400.0)
-    pruefe(len(raus) == 1 and raus[0]["stufe"] == "info"
+    # "Preparing" ist kein Fahrzeug: dort steht die Box auch, wenn sie nach
+    # einem RemoteStart auf ein Kabel wartet. Genau das meldete sie in der
+    # Nacht zum 30.07.2026 alle 130 s als angesteckt/abgesteckt.
+    pruefe(m.pruefen(lage(box_status="Preparing"), 400.0) == [],
+           "Preparing allein ist noch kein angestecktes Fahrzeug")
+
+    raus = m.pruefen(lage(box_status="Charging"), 410.0)
+    pruefe(len(raus) >= 1 and raus[0]["stufe"] == "info"
            and "angesteckt" in raus[0]["text"], "Anstecken wird gemeldet")
     # Ohne den OCPP-Status im Text ist von aussen nicht zu sehen, warum eine
     # Box pendelt.
-    pruefe("Preparing" in raus[0]["text"],
+    pruefe("Charging" in raus[0]["text"],
            "und der Text nennt den OCPP-Status")
 
-    pruefe(m.pruefen(lage(box_status="Charging"), 410.0) == [],
-           "Preparing -> Charging ist kein zweites Anstecken")
     pruefe(m.pruefen(lage(box_status="SuspendedEV"), 420.0) == [],
            "SuspendedEV auch nicht — das Kabel steckt weiter")
 
     raus = m.pruefen(lage(box_status="Available"), 430.0)
     pruefe(len(raus) == 1 and "abgesteckt" in raus[0]["text"]
            and "Available" in raus[0]["text"], "Abstecken wird gemeldet")
+
+
+def test_leere_dose_pendelt():
+    print("Leere Dose pendelt (Preparing <-> Available)")
+    m = melder()
+
+    # Der Vorfall vom 30.07.2026 in Reinform: die Box wechselt im
+    # ConnectionTimeOut-Takt zwischen Preparing und Available, weil ein
+    # RemoteStart in eine leere Dose ging. Auch ohne Verweildauer (flanke_s=0)
+    # darf daraus keine einzige Meldung entstehen.
+    raus = []
+    for i, status in enumerate(["Preparing", "Available"] * 5):
+        raus += m.pruefen(lage(box_status=status), 400.0 + i * 130.0)
+    pruefe(raus == [], f"zehn Wechsel ergeben keine Meldung: {texte(raus)}")
 
 
 def test_laden():
@@ -252,22 +270,22 @@ def test_verweildauer():
     # Dose und den der Station, und daraus wurde "angesteckt / abgesteckt" im
     # Minutentakt. Ein Pendeln darf gar keine Meldung erzeugen, nicht bloß
     # weniger.
-    pruefe(m.pruefen(lage(box_status="Preparing"), 400.0) == [],
+    pruefe(m.pruefen(lage(box_status="Charging"), 400.0) == [],
            "ein frischer Wechsel meldet noch nicht")
     pruefe(m.pruefen(lage(box_status="Available"), 460.0) == [],
            "der Rücksprung ebenfalls nicht")
-    pruefe(m.pruefen(lage(box_status="Preparing"), 520.0) == [],
+    pruefe(m.pruefen(lage(box_status="Charging"), 520.0) == [],
            "und das Hin und Her erzeugt nichts")
     pruefe(m.pruefen(lage(box_status="Available"), 580.0) == [],
            "auch nach vier Wechseln nicht")
 
     # Erst wenn ein Zustand steht, geht die Meldung raus.
-    pruefe(m.pruefen(lage(box_status="Preparing"), 640.0) == [],
+    pruefe(m.pruefen(lage(box_status="Charging"), 640.0) == [],
            "ein neuer Kandidat beginnt seine Frist von vorn")
-    raus = m.pruefen(lage(box_status="Preparing"), 800.0)
+    raus = m.pruefen(lage(box_status="Charging"), 800.0)
     pruefe(len(raus) == 1 and "angesteckt" in raus[0]["text"],
            "nach 120 s gehaltenem Zustand kommt genau eine Meldung")
-    pruefe(m.pruefen(lage(box_status="Preparing"), 900.0) == [],
+    pruefe(m.pruefen(lage(box_status="Charging"), 900.0) == [],
            "danach ist Ruhe")
 
 
@@ -307,6 +325,7 @@ def main():
     test_wechselrichter_weg()
     test_beide_weg()
     test_fahrzeug()
+    test_leere_dose_pendelt()
     test_laden()
     test_hausakku()
     test_verweildauer()

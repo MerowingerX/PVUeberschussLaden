@@ -11,6 +11,14 @@ c) bei reinem PVUeb stoppt die Ladung nach `PVUEB_STOP_DELAY_S`, wenn der Übers
 
 ## Umgesetzter Algorithmus (minpv)
 
+Vorbedingung für jeden Start, auch im Nachtfenster und im Modus `fast`: an der
+Dose muss ein Kabel hängen (`box_status` in `Preparing`, `Charging`,
+`SuspendedEV`, `SuspendedEVSE`, `Finishing`). In eine freie Dose (`Available`)
+geht kein `RemoteStart` — sie quittiert ihn mit „Accepted", wartet dann ihren
+`ConnectionTimeOut` lang in `Preparing` auf ein Kabel und fällt zurück. Der
+Regler erzeugte damit einen Wechsel, den der Melder als angestecktes Fahrzeug
+las (Nacht zum 30.07.2026, alle 130 s ein Meldungspaar ohne Auto).
+
 Bezugsgröße: Min-Leistung = `min_amps × 3 Phasen × 230 V` (bei 6 A: 4140 W).
 Echter PV-Überschuss = `Netz + Ladeleistung + Batterieleistung` — Hausbatterie-Ladung
 zählt als verfügbar, Batterie-Entladung täuscht am Netzpunkt nur Überschuss vor
