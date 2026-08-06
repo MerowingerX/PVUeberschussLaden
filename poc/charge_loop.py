@@ -1904,10 +1904,140 @@ INDEX_HTML = """<!doctype html>
   .bar.stale > i { background:#555; }
   .note { color:#aaa; font-size:.85rem; padding:.4rem 0; }
   .note.err { color:#ef9a9a; }
+  /* --- Übersichtsseite: Anlagenbild mit Energieflüssen ------------------- */
+  .tick { text-align:center; color:#aaa; font-size:.85rem; padding:.2rem 0 .4rem;
+          cursor:pointer; }
+  .fluss { display:block; width:100%; height:auto; touch-action:manipulation; }
+  /* Ein Herz im SVG braucht einen eigenen Bezugsrahmen, sonst skaliert die
+     Animation um den Ursprung der Zeichenfläche statt um sich selbst. */
+  .fluss .heart { transform-box:fill-box; transform-origin:center; }
+  .node { cursor:pointer; }
+  /* Die Fläche bleibt unsichtbar, fängt aber den Finger — sonst müsste man
+     das Symbol selbst treffen. pointer-events:all, weil eine ungefüllte
+     Fläche sonst nicht angetippt werden kann. */
+  .n-plate { fill:none; pointer-events:all; }
+  .node:active .n-plate { fill:#ffffff1a; }
+  .n-ic { fill:none; stroke:#eee; stroke-width:2.2; stroke-linecap:round;
+          stroke-linejoin:round; }
+  .n-fill { fill:#42a5f5; opacity:.85; }
+  .n-lbl { fill:#aaa; font-size:11px; }
+  .n-val { fill:#eee; font-size:14px; font-variant-numeric:tabular-nums; }
+  .n-sub { fill:#888; font-size:10px; }
+  .n-heart { font-size:13px; }
+  .node.weg .n-ic { stroke:#4a4a4a; }
+  /* Flüsse: eine matte Grundlinie, darüber laufende Punkte. Die Punkte sind
+     ein gestrichelter Strich mit runden Enden. Das kostet eine CSS-Animation
+     und kein einziges Neuzeichnen pro Bild in JavaScript — auf einem Telefon,
+     das die Seite zwei Sekunden lang offen hält, ist das der Unterschied
+     zwischen einem ruhigen Bild und einem warmen Akku. */
+  .fl-b { fill:none; stroke:#2f2f2f; stroke-width:3; stroke-linecap:round; }
+  .fl-d { fill:none; stroke-width:3.4; stroke-linecap:round;
+          stroke-dasharray:0.1 13; animation:fluss 1.4s linear infinite; }
+  @keyframes fluss { to { stroke-dashoffset:-13; } }
+  .fl.aus .fl-d { display:none; }
+  .fl.aus .fl-b { stroke:#242424; }
+  .fl.rueck .fl-d { animation-direction:reverse; }
+  .fl.weg { display:none; }
+  .fl.pv .fl-d { stroke:#f9a825; }
+  .fl.netz .fl-d { stroke:#66bb6a; }
+  .fl.netz.bezug .fl-d { stroke:#ef5350; }
+  .fl.akku .fl-d { stroke:#42a5f5; }
+  .fl.box .fl-d, .fl.kabel .fl-d { stroke:#66bb6a; }
+  /* Preparing heißt: die Box wartet auf ein Kabel und weiß selbst nicht, ob
+     eines steckt. Das gestrichelte Kabel sagt genau das. */
+  .fl.kabel.unsicher .fl-b { stroke:#f9a825; stroke-dasharray:5 5; }
+  @media (prefers-reduced-motion: reduce) {
+    .fl-d { animation:none; stroke-dasharray:none; opacity:.55; }
+    .heart { animation:none; }
+  }
 </style></head><body>
 <h1>PVueb – Überschussladen</h1>
-<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+<div class="dots"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
 <div class="pages" id="pages">
+<section class="page">
+<div class="tick" id="tick" onclick="go(4)">…</div>
+<svg class="fluss" viewBox="0 0 320 444" role="img"
+     aria-label="Anlagenbild mit Energieflüssen">
+  <!-- Erst die Flüsse, dann die Knoten: so laufen die Linien sichtbar hinter
+       den Symbolen zusammen statt über sie hinweg. -->
+  <g id="f_pv" class="fl pv">
+    <path class="fl-b" d="M52 64C52 120 92 170 118 195"/>
+    <path class="fl-d" d="M52 64C52 120 92 170 118 195"/>
+  </g>
+  <g id="f_netz" class="fl netz">
+    <path class="fl-b" d="M268 70C268 120 228 170 202 195"/>
+    <path class="fl-d" d="M268 70C268 120 228 170 202 195"/>
+  </g>
+  <g id="f_akku" class="fl akku">
+    <path class="fl-b" d="M52 298C52 262 90 234 118 219"/>
+    <path class="fl-d" d="M52 298C52 262 90 234 118 219"/>
+  </g>
+  <g id="f_box" class="fl box">
+    <path class="fl-b" d="M202 219C228 236 268 258 268 274"/>
+    <path class="fl-d" d="M202 219C228 236 268 258 268 274"/>
+  </g>
+  <g id="f_kabel" class="fl kabel">
+    <path class="fl-b" d="M268 324L268 384"/>
+    <path class="fl-d" d="M268 324L268 384"/>
+  </g>
+
+  <g class="node" onclick="go(3)">
+    <rect class="n-plate" x="14" y="14" width="120" height="74" rx="12"/>
+    <circle class="n-ic" cx="52" cy="46" r="13"/>
+    <path class="n-ic" d="M68 46h5M63.3 57.3l3.5 3.5M52 62v5M40.7 57.3l-3.5 3.5M36 46h-5M40.7 34.7l-3.5-3.5M52 30v-5M63.3 34.7l3.5-3.5"/>
+    <text class="n-lbl" x="76" y="40">PV</text>
+    <text class="n-val" x="76" y="58" id="g_pv">–</text>
+    <text class="n-sub" x="76" y="72" id="g_pvdach"></text>
+  </g>
+
+  <g class="node" onclick="go(3)">
+    <rect class="n-plate" x="186" y="14" width="120" height="74" rx="12"/>
+    <path class="n-ic" d="M254 70L263 26M282 70l-9-44M263 26h10M259 30h18M256 44h24M253 58h30"/>
+    <text class="n-lbl" x="244" y="40" text-anchor="end">Netz</text>
+    <text class="n-val" x="244" y="58" text-anchor="end" id="g_netz">–</text>
+    <text class="n-sub" x="244" y="72" text-anchor="end" id="g_netzart"></text>
+  </g>
+
+  <g class="node" onclick="go(3)">
+    <rect class="n-plate" x="106" y="150" width="108" height="116" rx="12"/>
+    <path class="n-ic" d="M118 222v-32l42-30 42 30v32z"/>
+    <rect class="n-ic" x="152" y="196" width="16" height="14" rx="2"/>
+    <text class="n-lbl" x="158" y="242" text-anchor="middle">Haus</text>
+    <text class="heart n-heart" x="182" y="242" id="h_haus">❤</text>
+    <text class="n-val" x="160" y="258" text-anchor="middle" id="g_haus">–</text>
+  </g>
+
+  <g class="node" onclick="go(2)">
+    <rect class="n-plate" x="8" y="292" width="96" height="112" rx="12"/>
+    <rect class="n-ic" x="46" y="302" width="12" height="6" rx="2"/>
+    <rect id="akku_fuell" class="n-fill" x="38" y="312" width="28" height="36"/>
+    <rect class="n-ic" x="34" y="308" width="36" height="44" rx="4"/>
+    <text class="n-lbl" x="52" y="366" text-anchor="middle">Akku</text>
+    <text class="n-val" x="52" y="382" text-anchor="middle" id="g_akku">–</text>
+    <text class="n-sub" x="52" y="396" text-anchor="middle" id="g_akkuw"></text>
+  </g>
+
+  <g class="node" onclick="go(5)">
+    <rect class="n-plate" x="180" y="268" width="128" height="68" rx="12"/>
+    <rect class="n-ic" x="252" y="276" width="32" height="48" rx="6"/>
+    <rect class="n-ic" x="257" y="282" width="22" height="14" rx="2"/>
+    <circle class="n-ic" cx="268" cy="310" r="7"/>
+    <text class="heart n-heart" x="290" y="288" id="h_box">❤</text>
+    <text class="n-lbl" x="246" y="292" text-anchor="end">Wallbox</text>
+    <text class="n-val" x="246" y="310" text-anchor="end" id="g_box">–</text>
+    <text class="n-sub" x="246" y="324" text-anchor="end" id="g_boxsub"></text>
+  </g>
+
+  <g class="node" id="n_auto" onclick="go(1)">
+    <rect class="n-plate" x="212" y="370" width="104" height="66" rx="12"/>
+    <path class="n-ic" d="M240 404l4-12q2-6 9-6h30q7 0 9 6l4 12z"/>
+    <circle class="n-ic" cx="250" cy="405" r="5"/>
+    <circle class="n-ic" cx="286" cy="405" r="5"/>
+    <text class="n-sub" x="268" y="428" text-anchor="middle" id="g_auto">–</text>
+  </g>
+</svg>
+<div class="note">Ein Element antippen öffnet seine Detailseite, wischen blättert.</div>
+</section>
 <section class="page">
 <div id="stat"></div>
 <h2>Freigabe</h2>
@@ -2092,6 +2222,100 @@ function tickInfo() {
   const txt = heart(s.tick_age_s, s.tick_timeout_s) + " vor " + s.tick_age_s + " s";
   return s.tick_error ? txt + ' <span class="err">⚠ ' + s.tick_error + "</span>" : txt;
 }
+// --- Übersichtsseite -------------------------------------------------------
+// Zu einer der Detailseiten springen. Die Reihenfolge steht oben im HTML:
+// 0 Übersicht, 1 Freigabe, 2 Akku, 3 Steuerung, 4 Diagnose, 5 Wallbox-Cloud.
+// Erst weich versuchen, dann hart nachsetzen. Es gibt WebViews, die weiches
+// Scrollen annehmen und nichts tun — ein Tipp, der gar nichts bewirkt, wäre
+// der schlimmere Fehler als ein Sprung ohne Animation.
+function go(i) {
+  const pg = document.getElementById("pages");
+  const ziel = i * pg.clientWidth;
+  pg.scrollTo({left: ziel, behavior: "smooth"});
+  setTimeout(() => { if (Math.abs(pg.scrollLeft - ziel) > 4) pg.scrollLeft = ziel; }, 400);
+  // Gleich mitsetzen: die Punktleiste hängt sonst am scroll-Ereignis und
+  // zeigt nach einem Sprung noch die Seite davor.
+  punkte(i);
+}
+function punkte(i) {
+  document.querySelectorAll(".dot").forEach((d, n) => d.classList.toggle("on", n === i));
+}
+// Einen Fluss ein- oder ausschalten. Die Geschwindigkeit der Punkte trägt die
+// Leistung: viel Leistung, schnelle Punkte. Unter 20 W wird gar nichts
+// animiert — ein Rauschen von wenigen Watt ist kein Fluss.
+function fluss(id, watt, umgekehrt) {
+  const g = document.getElementById(id);
+  const an = Math.abs(watt || 0) >= 20;
+  g.classList.toggle("aus", !an);
+  g.classList.toggle("rueck", !!umgekehrt);
+  if (!an) return;
+  const dauer = Math.max(0.45, Math.min(2.6, 1400 / Math.abs(watt)));
+  g.querySelector(".fl-d").style.animationDuration = dauer.toFixed(2) + "s";
+}
+function svgHeart(id, seen_s, limit) {
+  const el = document.getElementById(id);
+  const ok = seen_s !== null && seen_s !== undefined && seen_s < limit;
+  el.textContent = ok ? "❤" : "💔";
+  el.classList.toggle("dead", !ok);
+}
+// Dieselben Mengen wie im Regler (ANGESTECKT / ANGESTECKT_SICHER). "Preparing"
+// steht bewusst nicht bei den sicheren: dort wartet die Box auch auf ein Kabel.
+const STECKT_SICHER = ["Charging", "SuspendedEV", "SuspendedEVSE", "Finishing"];
+function renderFluss() {
+  const t = (id, txt) => { document.getElementById(id).textContent = txt; };
+  const w = v => (v === null || v === undefined) ? "–" : Math.round(v) + " W";
+
+  document.getElementById("tick").innerHTML = tickInfo() + " · "
+    + ({"voll":"✅","eingeschränkt":"⚠","kein Laden":"⛔"}[s.betrieb] || "")
+    + " " + s.betrieb_text;
+
+  // PV: was der Wechselrichter abgibt, ist der Fluss. Die Gleichstromseite
+  // steht klein darunter, sonst wundert sich, wer beide Zahlen kennt.
+  t("g_pv", w(s.pv_w));
+  t("g_pvdach", (s.pv_dc_w && Math.abs(s.pv_dc_w - (s.pv_w || 0)) > 50)
+    ? "Dach " + Math.round(s.pv_dc_w) + " W" : "");
+  fluss("f_pv", s.pv_w, false);
+
+  // Netz: der Pfad ist von der Leitung zum Haus gezeichnet. Einspeisung läuft
+  // also rückwärts. grid_w >= 0 heißt Einspeisung, so liest es der Regler auch.
+  const bezug = s.grid_w !== null && s.grid_w < 0;
+  t("g_netz", s.grid_w === null ? "–" : Math.round(Math.abs(s.grid_w)) + " W");
+  t("g_netzart", s.grid_w === null ? "" : (bezug ? "Bezug" : "Einspeisung"));
+  document.getElementById("f_netz").classList.toggle("bezug", bezug);
+  fluss("f_netz", s.grid_w, !bezug);
+
+  t("g_haus", w(s.house_w));
+  svgHeart("h_haus", s.huawei_seen_s, 90);
+
+  // Akku: Pfad vom Akku zum Haus, Laden läuft rückwärts. Der Füllstand ist
+  // ein Rechteck, das von unten wächst.
+  t("g_akku", s.soc === null ? "–" : s.soc.toFixed(0) + " %");
+  t("g_akkuw", s.battery_w === null ? ""
+    : (s.battery_w >= 0 ? "lädt " : "entlädt ") + Math.abs(Math.round(s.battery_w)) + " W");
+  fluss("f_akku", s.battery_w, s.battery_w >= 0);
+  const hoehe = 36 * Math.max(0, Math.min(100, s.soc === null ? 0 : s.soc)) / 100;
+  const fuell = document.getElementById("akku_fuell");
+  fuell.setAttribute("y", (348 - hoehe).toFixed(1));
+  fuell.setAttribute("height", hoehe.toFixed(1));
+
+  // Wallbox und Auto
+  const boxLimit = Math.max(90, 3 * s.heartbeat_s);
+  svgHeart("h_box", s.box_connected ? s.box_seen_s : null, boxLimit);
+  t("g_box", w(s.charge_w));
+  t("g_boxsub", s.box_connected ? s.box_status : "getrennt");
+  fluss("f_box", s.charge_w, false);
+
+  const sicher = STECKT_SICHER.includes(s.box_status);
+  const wartet = s.box_status === "Preparing";
+  const kabel = document.getElementById("f_kabel");
+  kabel.classList.toggle("weg", !sicher && !wartet);
+  kabel.classList.toggle("unsicher", wartet);
+  fluss("f_kabel", sicher ? s.charge_w : 0, false);
+  document.getElementById("n_auto").classList.toggle("weg", !sicher && !wartet);
+  t("g_auto", s.charging ? "lädt" : sicher ? "steckt"
+    : wartet ? "wartet (Preparing)" : "kein Fahrzeug");
+}
+
 async function refresh() {
   s = await (await fetch("/api/status")).json();
   const f = document.getElementById("frei");
@@ -2162,6 +2386,7 @@ async function refresh() {
   ];
   document.getElementById("batstat").innerHTML = brows.map(row).join("");
   renderWallbox();
+  renderFluss();
   for (const m of ["minpv","fast"])
     document.getElementById("m_"+m).classList.toggle("on", s.mode === m);
   document.getElementById("minlabel").textContent = s.min_amps;
@@ -2196,10 +2421,7 @@ async function setConfig(cfg) {
   refresh();
 }
 const pg = document.getElementById("pages");
-pg.addEventListener("scroll", () => {
-  const i = Math.round(pg.scrollLeft / pg.clientWidth);
-  document.querySelectorAll(".dot").forEach((d, n) => d.classList.toggle("on", n === i));
-});
+pg.addEventListener("scroll", () => punkte(Math.round(pg.scrollLeft / pg.clientWidth)));
 refresh(); setInterval(refresh, 2000);
 </script></body></html>"""
 

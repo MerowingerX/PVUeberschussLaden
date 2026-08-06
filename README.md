@@ -94,8 +94,14 @@ aber trotzdem zügig.
   [features/feature_NeustartOhneUnterbrechung.md](features/feature_NeustartOhneUnterbrechung.md)
 - **Startverhalten ohne Sicherung**: freigegeben, Modus `minpv` mit 6 A. Die Anlage
   arbeitet nach einem Strom- oder Softwareausfall von allein weiter.
-- **Web-UI** fürs Handy, fünf Seiten zum Wischen — nach Frage sortiert, nicht nach
-  Datenquelle: *Status & Lademodus* (Netz, Überschuss, Ladeleistung, Freigabe, Modus,
+- **Web-UI** fürs Handy, sechs Seiten zum Wischen — nach Frage sortiert, nicht nach
+  Datenquelle. Vorneweg die *Übersicht*: ein Bild der Anlage mit Sonne, Netz, Haus,
+  Akku, Wallbox und Auto, dazwischen die Energieflüsse als laufende Punkte —
+  Richtung, Farbe und Tempo sagen, wohin wie viel geht. Das Kabel zum Auto ist nur
+  da, wenn eines steckt, und gestrichelt, solange die Box in `Preparing` auf eines
+  wartet. Jedes Element ist ein Sprung auf seine Detailseite; die Herzen zeigen, ob
+  Regeltakt, Modbus und OCPP noch schlagen. Dahinter unverändert:
+  *Status & Lademodus* (Netz, Überschuss, Ladeleistung, Freigabe, Modus,
   Nachtautomatik, Betriebsstufe in einer Zeile) · *Huawei-Batterie* (SOC, Leistung,
   Netzladung, Prognose) · *Steuerung* — warum lädt es gerade so (PV-Erzeugung,
   Hausverbrauch, was fürs Auto frei ist, PV-Mittel, minpv-Schwellen, Boosts,
