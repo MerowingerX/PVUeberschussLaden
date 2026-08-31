@@ -257,3 +257,70 @@ Solange das so bleibt, gilt bei einer einphasigen Ladung weiterhin:
 Das zu beheben heißt, die Phasenzahl in die Regelung zu ziehen — eigener
 Vorgang, eigene Testfälle. Erst braucht es einen Mitschnitt einer einphasigen
 Ladung, um die Erkennung gegen echte Daten zu prüfen.
+
+---
+
+## Nachtrag 31.08.2026: „Grenze in der App" war falsch beschriftet
+
+Im Web-UI stand auf der Wallbox-Seite dauerhaft:
+
+```
+Grenze in der App    6 A von 16 A ⚠ deckelt die Ladung
+```
+
+Die Warnung feuerte, sobald `app_max_a < hw_max_a` — also praktisch immer.
+Über den Mitschnitt 25.–31.08. (n = 57149) steht der Wert in **72,4 %** aller
+Abtastungen auf 6, während laufender Ladung dagegen nur in **20,7 %**. Die
+Warnung stand also vor allem dann, wenn es gar nichts zu deckeln gab.
+
+### Was das Feld wirklich ist
+
+`config.max_charging_current` aus der myWallbox-Cloud ist **kein
+Schieberegler in der App**, sondern der Strom, den die Box gerade anwendet —
+ein Rücklesen unseres eigenen Ladeprofils über den Umweg der Cloud.
+
+Drei Belege:
+
+1. Am 27.08. um 16:16 stand unser PV-Limit auf **7,9 A**, die Cloud meldete
+   **7**. Um 16:29 Limit 7,3 A → wieder 7. Ein App-Regler steht nicht auf
+   krummen Zwischenwerten, ein angewandter Sollwert schon.
+2. Über alle laufenden Ladungen (n = 5657) stimmt der Wert in **84,4 %** mit
+   dem abgerundeten `current_limit` überein.
+3. Von sieben Abweichungsfenstern während laufender Ladung begannen **sechs
+   exakt mit einem Ladestart** und endeten nach `limit_refresh_s` = 300 s:
+
+   | von | bis | Dauer |
+   |---|---|---|
+   | 27.08. 00:00:12 | 00:05:42 | 5 min |
+   | 27.08. 01:51:33 | 02:06:23 | 15 min |
+   | 28.08. 00:00:05 | 00:05:25 | 5 min |
+   | 28.08. 13:23:33 | 13:28:43 | 5 min |
+   | 30.08. 17:07:02 | 17:07:52 | 50 s |
+   | 31.08. 00:00:05 | 00:05:35 | 5 min |
+   | 31.08. 02:36:37 | 04:21:48 | 1 h 45 — **ungeklärt** |
+
+   Die ersten sechs sind exakt der TxDefaultProfile-Fehler. Das Feld hat ihn
+   jedes Mal gemeldet — es hat nur niemand als Meldung gelesen.
+
+Die 6 A, die man fast immer sieht, sind der **Ruhewert der Box**: fällt kein
+Ladeprofil in Kraft, geht sie auf ihr Minimum zurück.
+
+### Geändert
+
+Die Zeile heißt jetzt „Strom laut Box" und unterscheidet drei Lagen:
+
+* es lädt nichts → `6 A – Ruhewert, es lädt nichts`
+* es lädt, Wert passt → `16 A – deckt sich mit unserem Limit`
+* es lädt, Wert liegt darunter → `6 A ⚠ folgt unserem Limit von 16 A nicht`
+
+Nur der dritte Fall ist eine Meldung. Der Feldname `app_max_a` bleibt, damit
+ältere Mitschnitte vergleichbar bleiben.
+
+### Offen
+
+Das Fenster 31.08. 02:36–04:21 passt in keine der beiden Erklärungen: die
+Cloud meldete 1 h 45 lang 6 A, während die Ladeleistung unbewegt bei 3620 W
+stand (einphasig 15,75 A). Wäre der Wert dort wirksam gewesen, hätte das Auto
+auf 1,4 kW fallen müssen. Das Sync-Alter lag in dem Fenster bei 110–113 s
+statt der sonstigen 40–70 s. Mehr als der Verdacht auf eine hängende
+Cloud-Meldung lässt sich daraus vorerst nicht machen.

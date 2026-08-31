@@ -1631,9 +1631,25 @@ def wallbox_snapshot(daten: dict) -> dict:
         "charging_time_s": daten.get("charging_time"),
         "status_id": daten.get("status_id"),
         "status": WALLBOX_STATUS.get(daten.get("status_id"), "unbekannt"),
-        # Grenze aus der Wallbox-App. Im OCPP-Betrieb gilt unser Limit, aber
-        # fällt die Box je aus dem OCPP-Modus, deckelt dieser Wert die Ladung
+        # Der Name täuscht: `max_charging_current` ist kein Schieberegler in der
+        # App, sondern der Strom, den die Box gerade anwendet — also ein
+        # Rücklesen unseres eigenen Ladeprofils über den Umweg der Cloud.
+        #
+        # Belegt am 2026-08-31 aus dem Mitschnitt 25.–31.08.:
+        #   * am 27.08. um 16:16 stand unser PV-Limit auf 7,9 A, die Cloud
+        #     meldete 7 — ein App-Regler steht nicht auf krummen Werten
+        #   * über alle laufenden Ladungen (n = 5657) stimmte der Wert in
+        #     84,4 % mit dem abgerundeten `current_limit` überein
+        #   * von sieben Abweichungsfenstern begannen sechs exakt mit einem
+        #     Ladestart und endeten nach `limit_refresh_s` — das sind genau
+        #     die Fälle, in denen das TxDefaultProfile verfiel
+        #
+        # Der Feldname bleibt trotzdem `app_max_a`: ältere Mitschnitte tragen
+        # ihn, und ein Umbenennen zerschnitte die Zeitreihe.
+        # Im Leerlauf fällt die Box auf 6 A zurück — dort sagt der Wert nichts
+        # über eine Deckelung aus (docs/issue_load_immediatly.md).
         "app_max_a": config.get("max_charging_current"),
+        # Grenze der Installation, vom Errichter gesetzt. Ändert sich nie.
         "hw_max_a": config.get("max_available_current"),
         "firmware": (config.get("software") or {}).get("currentVersion"),
         "locked": config.get("locked"),
@@ -2287,6 +2303,32 @@ function agoRuhig(sec) {
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
 }
+function boxStrom() {
+  // max_charging_current aus der Hersteller-Cloud ist KEIN App-Schieberegler,
+  // sondern der Strom, den die Box gerade anwendet. Beleg: am 27.08.2026 stand
+  // unser PV-Limit auf 7,9 A und die Cloud meldete 7; über alle Ladungen
+  // 25.-31.08. stimmte sie in 84 % der Abtastungen mit unserem abgerundeten
+  // Limit überein.
+  //
+  // Bis zum 31.08.2026 stand hier "6 A von 16 A ⚠ deckelt die Ladung",
+  // sobald der Wert unter der Installationsgrenze lag -- also fast immer,
+  // weil die Box im Leerlauf auf 6 A zurückfällt und 90 % der Zeit nichts
+  // lädt. Die Warnung stand dauerhaft und behauptete eine Ursache, die es
+  // nicht gab (docs/issue_load_immediatly.md).
+  //
+  // Interessant ist nur der eine Fall: es lädt, und die Box wendet weniger
+  // an, als wir gesetzt haben. Genau der hat alle sechs Ladestarts markiert,
+  // bei denen das TxDefaultProfile verfiel.
+  const w = s.wallbox_cloud || {};
+  const a = w.app_max_a;
+  if (a === undefined || a === null) return "–";
+  const grenze = w.hw_max_a ? " (Grenze der Installation " + w.hw_max_a + " A)" : "";
+  if (!s.charging) return a + " A – Ruhewert, es lädt nichts" + grenze;
+  const soll = Math.floor(s.current_limit);
+  if (a < soll)
+    return a + " A ⚠ folgt unserem Limit von " + soll + " A nicht" + grenze;
+  return a + " A – deckt sich mit unserem Limit" + grenze;
+}
 function phasenZeile() {
   // Zeigt die drei Phasenleistungen und markiert eine Schieflage. Genau die
   // unterscheidet einphasiges Laden mit 16 A (3,7 kW auf einem Leiter) von
@@ -2323,9 +2365,7 @@ function renderWallbox() {
     ["Sitzung geladen", w.added_kwh === undefined || w.added_kwh === null ? "–"
       : w.added_kwh + " kWh" + (w.added_km ? " ≈ " + w.added_km + " km" : "")],
     ["Ladezeit gesamt", w.charging_time_s ? (w.charging_time_s / 3600).toFixed(1) + " h" : "–"],
-    ["Grenze in der App", w.app_max_a === undefined || w.app_max_a === null ? "–"
-      : w.app_max_a + " A von " + (w.hw_max_a ?? "?") + " A"
-        + (w.hw_max_a && w.app_max_a < w.hw_max_a ? " ⚠ deckelt die Ladung" : "")],
+    ["Strom laut Box", boxStrom()],
     ["Firmware", w.firmware || "–"],
     // Zwei verschiedene Wege, die gern verwechselt werden: die Box meldet an
     // ihren Hersteller, wir fragen dort ab. Nur das zweite liegt bei uns.
