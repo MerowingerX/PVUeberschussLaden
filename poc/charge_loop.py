@@ -183,6 +183,29 @@ REG_PV_DC_POWER = 32064      # int32, W, DC-Eingangsleistung
 # stammen sie aus verschiedenen Momenten und die Summe zappelt
 REG_BLOCK_START, REG_BLOCK_COUNT = REG_BATTERY_POWER, 114
 
+# Phasenwerte des Smart Meters. Empirisch bestimmt am 2026-08-31 gegen die
+# laufende Anlage: der Block 37100–37147 wurde roh gelesen und die Deutung
+# an drei unabhängigen Proben festgemacht.
+#
+#   37101/03/05 = 240,0 / 242,1 / 241,6 V   (Phasenspannung, 0,1 V)
+#   37107/09/11 =   8,86 /  7,77 /  9,04 A  (Phasenstrom,   0,01 A)
+#   37132/34/36 =   2128 /  1850 /  2187 W  (Wirkleistung je Phase)
+#
+#   Summe der Phasenleistungen  6165 W  gegen 37113 (gesamt) 6173 W
+#   U × I je Phase              2126 W  gegen 37132          2128 W
+#   Außenleiter 37126 = 417,5 V, geteilt durch 240,0 V = 1,74 ≈ √3
+#
+# Wozu: der Regler rechnet mit PHASES = 3. Ein einphasig ladendes Fahrzeug
+# zieht 16 A auf einer Phase (3,7 kW) statt 6 A auf dreien (4,1 kW) — dieselbe
+# Größenordnung, aber eine ganz andere Ursache. Ohne Phasenwerte ist beides im
+# Summenzähler nicht zu unterscheiden (docs/issue_load_immediatly.md).
+# Spannungen und Ströme liegen im ohnehin gelesenen Block; nur die
+# Phasenleistungen brauchen eine eigene Anfrage, weil 37132+6 über die
+# Modbus-Grenze von 125 Registern je Lesevorgang hinausreichen würde.
+REG_PHASE_VOLTAGE = 37101        # int32 ×3, ×0,1 V, Abstand 2
+REG_PHASE_CURRENT = 37107        # int32 ×3, ×0,01 A, Abstand 2
+REG_PHASE_POWER, REG_PHASE_POWER_COUNT = 37132, 6   # int32 ×3, W
+
 # LUNA2000-Zwangsladung (verifiziert 2026-07-16 gegen huawei_solar 3.0.6)
 REG_FORCIBLE_CMD = 47100         # uint16: 0 = Stop, 1 = Laden, 2 = Entladen
 REG_FORCIBLE_TARGET_SOC = 47101  # uint16, ×0,1 %
@@ -364,6 +387,13 @@ class State:
     deficit_since: float | None = None   # Zeitstempel: Überschuss fehlt seit ...
     minpv_low_since: float | None = None # Zeitstempel: PV-Überschuss unter Pause-Schwelle seit ...
     last_adjust = 0.0
+    # Phasenwerte des Smart Meters, je Liste [L1, L2, L3] oder None.
+    # Nur Diagnose und Mitschnitt — die Regelung rechnet unverändert mit
+    # PHASES. Sie beantworten die Frage, die der Summenzähler offenlässt:
+    # laedt das Fahrzeug einphasig mit 16 A oder dreiphasig mit 6 A?
+    phase_v: list[float] | None = None    # Phasenspannung je Leiter, V
+    phase_a: list[float] | None = None    # Phasenstrom je Leiter, A
+    phase_w: list[int] | None = None      # Wirkleistung je Leiter, W (Vorzeichen wie 37113)
     battery_grid_charge = False  # von uns gestartete Zwangsladung aktiv
     forcible_cmd: int | None = None      # gelesenes Register 47100 (0/1/2)
     battery_charge_auto = False  # aktive Zwangsladung kam von der Nachtautomatik
@@ -1268,6 +1298,23 @@ def decode_i32(words: list[int]) -> float:
     return float(raw)
 
 
+def phasen_werte(registers: list[int], erstes_register: int,
+                 skalierung: float) -> list[float] | None:
+    """Drei aufeinanderfolgende int32 aus dem Blockread holen, je Phase eines.
+
+    `registers` beginnt bei REG_BLOCK_START. Liegt einer der drei Werte
+    außerhalb des gelesenen Blocks, kommt None zurück statt einer halben
+    Liste — ein Mitschnitt mit zwei von drei Phasen wäre irreführend.
+    """
+    werte = []
+    for phase in range(3):
+        offset = erstes_register - REG_BLOCK_START + 2 * phase
+        if offset < 0 or offset + 2 > len(registers):
+            return None
+        werte.append(round(decode_i32(registers[offset:offset + 2]) * skalierung, 2))
+    return werte
+
+
 async def modbus_task(host: str):
     global modbus_client
     while True:
@@ -1296,8 +1343,19 @@ async def modbus_task(host: str):
                                 state.battery_w = decode_i32(registers[0:2])
                                 state.grid_w = decode_i32(registers[offset:offset + 2])
                                 state.last_huawei_seen = datetime.datetime.now().timestamp()
+                                # Spannungen und Ströme je Phase liegen im selben
+                                # Block (37101/07 gegen Start 37001) — sie kosten
+                                # hier keine zusätzliche Anfrage.
+                                state.phase_v = phasen_werte(
+                                    registers, REG_PHASE_VOLTAGE, 0.1)
+                                state.phase_a = phasen_werte(
+                                    registers, REG_PHASE_CURRENT, 0.01)
                             await asyncio.sleep(0.3)  # SDongle nicht hetzen
                         if not state.modbus_block:
+                            # Ohne Blockread gibt es keine Phasenwerte. Lieber
+                            # nichts als der Stand von vor Minuten, der im
+                            # Mitschnitt wie eine frische Messung aussähe.
+                            state.phase_v = state.phase_a = None
                             result = await client.read_holding_registers(
                                 REG_GRID_POWER, count=2, device_id=1
                             )
@@ -1328,6 +1386,13 @@ async def modbus_task(host: str):
                         )
                         if not soc_result.isError():
                             state.soc = soc_result.registers[0] * 0.1
+                        await asyncio.sleep(0.3)
+                        phase_result = await client.read_holding_registers(
+                            REG_PHASE_POWER, count=REG_PHASE_POWER_COUNT, device_id=1
+                        )
+                        if not phase_result.isError():
+                            state.phase_w = [decode_i32(phase_result.registers[i:i + 2])
+                                             for i in (0, 2, 4)]
                         await asyncio.sleep(0.3)
                         cmd_result = await client.read_holding_registers(
                             REG_FORCIBLE_CMD, count=1, device_id=1
@@ -2222,6 +2287,18 @@ function agoRuhig(sec) {
 function hhmm(minutes) {
   return String(Math.floor(minutes/60)).padStart(2,"0") + ":" + String(minutes%60).padStart(2,"0");
 }
+function phasenZeile() {
+  // Zeigt die drei Phasenleistungen und markiert eine Schieflage. Genau die
+  // unterscheidet einphasiges Laden mit 16 A (3,7 kW auf einem Leiter) von
+  // dreiphasigem mit 6 A (4,1 kW auf dreien) — im Summenzähler sehen beide
+  // gleich aus.
+  const w = s.phase_w, a = s.phase_a;
+  if (!w || w.length !== 3) return "–";
+  const txt = w.map(x => Math.round(x)).join(" / ") + " W"
+    + (a && a.length === 3 ? " · " + a.map(x => x.toFixed(1)).join(" / ") + " A" : "");
+  const spanne = Math.max(...w) - Math.min(...w);
+  return txt + (spanne >= 1500 ? " ⚠ einphasige Last" : "");
+}
 function renderWallbox() {
   // Seite 4: was die Box selbst über sich sagt (Hersteller-Cloud)
   const out = document.getElementById("wbstat");
@@ -2470,6 +2547,7 @@ async function refresh() {
       : Math.round(s.pv_dc_w) + " W"],
     ["Wechselrichter raus (AC)", s.pv_w === null ? "–" : Math.round(s.pv_w) + " W"],
     ["Hausverbrauch", s.house_w === null ? "–" : Math.round(s.house_w) + " W"],
+    ["Netz je Phase", phasenZeile()],
     ["Fürs Auto frei", s.pv_surplus_w === null ? "–"
       : Math.round(s.pv_surplus_w) + " W ≈ " + (s.pv_surplus_w / WPA).toFixed(1) + " A"],
     ["PV-Mittel " + (s.avg_active_s ? Math.round(s.avg_active_s/60) + " min" : "aus")
@@ -2599,6 +2677,9 @@ def status_dict() -> dict:
         # bleibt der AC-Ausgang als Näherung — der enthält die Batterie bereits,
         # deshalb dort ohne battery_w.
         "house_w": house_power(),
+        "phase_v": state.phase_v,
+        "phase_a": state.phase_a,
+        "phase_w": state.phase_w,
         "modbus_block": state.modbus_block,
         "batt_target_soc": state.batt_target_soc,
         "batt_charge_w": state.batt_charge_w,
@@ -2741,6 +2822,10 @@ async def http_info(_request):
 # und würden den Mitschnitt sonst um ein Vielfaches aufblähen.
 RECORD_FIELDS = (
     "grid_w", "battery_w", "pv_w", "pv_dc_w", "house_w", "soc",
+    # Phasenwerte des Smart Meters. Ohne sie ist im Summenzähler nicht zu
+    # sehen, ob ein Fahrzeug einphasig mit 16 A oder dreiphasig mit 6 A lädt
+    # — beides landet bei rund 4 kW (docs/issue_load_immediatly.md).
+    "phase_v", "phase_a", "phase_w",
     "charge_w", "charge_w_src", "current_limit", "limit_effective",
     "charging", "box_status",
     "surplus_w", "pv_surplus_w", "pv_avg_w", "avg_active_s", "minpv_low_s",

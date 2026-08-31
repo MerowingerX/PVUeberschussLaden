@@ -200,3 +200,60 @@ Regressionstests in `poc/test_robust.py`, gegen die Attrappe mit
   aus dem Issue behandelt das Symptom; mit dem TxProfile beim Transaktionsstart
   ist die Auffrischung wieder das, was sie sein soll — ein Netz gegen stille
   Divergenz, nicht der Weg zum richtigen Ladestrom.
+
+---
+
+## Nachtrag 31.08.2026: einphasig ist nicht dasselbe wie 6 A
+
+Die Nachtladung 31.08. (00:00–06:55) lief mit konstant **3623 W** bei Limit
+16 A, ab der ersten Sekunde, ohne Anlaufphase. Das ist *nicht* der Fehler
+oben. Zwei harte Grenzen trennen die Fälle:
+
+* einphasig höchstens 16 A × 230 V = **3680 W**
+* dreiphasig mindestens 6 A × 3 × 230 V = **4140 W**
+
+| Vorgang | gemessen | dreiphasig | einphasig | Deutung |
+|---|---|---|---|---|
+| 28.08. 13:24–13:28 | 4182 W | 6,06 A | *über 3680 W, unmöglich* | **6 A, dreiphasig** |
+| 30.08. 17:07 | 4284 W | 6,21 A | *unmöglich* | **6 A, dreiphasig** |
+| 31.08. Nacht | 3623 W | *5,25 A, unter dem Minimum* | 15,75 A | **16 A, einphasig** |
+
+Die Box hat in der Nacht also befolgt, was ihr gesagt wurde. Falsch war die
+Diagnose: `limit_effective` stand sieben Stunden auf `false`, weil der Regler
+3623 W gegen 16 A × 3 × 230 V = 11040 W hält. `wallbox_cloud.app_max_a` kippte
+dabei um 02:39 auf 6 und um 04:29 zurück auf 16, ohne dass sich die Leistung
+um 60 W bewegte — der Wert ist als Rücklesen unbrauchbar.
+
+### Phasenwerte werden jetzt mitgeschrieben
+
+Der Smart Meter liefert sie über Modbus. Der Registerblock 37100–37147 wurde
+am 31.08.2026 gegen die laufende Anlage roh gelesen und die Deutung an drei
+unabhängigen Proben festgemacht (siehe Kommentar bei `REG_PHASE_VOLTAGE` in
+`poc/charge_loop.py`):
+
+```
+37101/03/05  240,0 / 242,1 / 241,6 V    Phasenspannung   (0,1 V)
+37107/09/11    8,86 /  7,77 /  9,04 A   Phasenstrom      (0,01 A)
+37132/34/36    2128 /  1850 /  2187 W   Wirkleistung je Phase
+             Summe 6165 W gegen 37113 (gesamt) 6173 W
+```
+
+Spannungen und Ströme liegen im ohnehin gelesenen Block ab 37001 und kosten
+keine zusätzliche Anfrage; nur die Phasenleistungen brauchen eine eigene,
+weil 37132+6 über die Modbus-Grenze von 125 Registern hinausreichen würde.
+
+`phase_v`, `phase_a` und `phase_w` stehen in `/api/status`, im Mitschnitt und
+auf der Steuerungsseite („Netz je Phase", mit Hinweis ab 1500 W Spreizung).
+
+### Was das **nicht** ist
+
+Reines Mitschreiben. Die Regelung rechnet unverändert mit `PHASES = 3`.
+Solange das so bleibt, gilt bei einer einphasigen Ladung weiterhin:
+
+* `limit_effective` meldet Dauerfehlalarm
+* `charge_power()` schätzt bei toter Messung 11 kW statt 3,7 kW
+* `target_amps()` unterstellt 690 W je Ampere statt 230 W
+
+Das zu beheben heißt, die Phasenzahl in die Regelung zu ziehen — eigener
+Vorgang, eigene Testfälle. Erst braucht es einen Mitschnitt einer einphasigen
+Ladung, um die Erkennung gegen echte Daten zu prüfen.
