@@ -18,7 +18,7 @@ Verhalten, das nie jemand gesehen hat.
 | Schalter | Verhalten | Quelle |
 |---|---|---|
 | `haelt_limit=False` | quittiert SetChargingProfile mit Accepted, lädt trotzdem mit `eigen_a` | docs/issue_limit_to_6A.md |
-| `profil_vor_transaktion_verfaellt` | ein vor der Transaktion gesetztes TxDefaultProfile wird beim Sessionstart verworfen | Logauszug 23.07.2026 |
+| `profil_vor_transaktion_verfaellt` | ein vor der Transaktion gesetztes TxDefaultProfile wird beim Sessionstart verworfen | Logauszug 23.07.2026, Mitschnitt 28./30.08.2026 |
 | `start_akzeptiert_dann_abgelehnt` | erster RemoteStart Accepted, der nächste Rejected | Log 28.07.2026, 06:03:57/06:04:28 |
 | `meldet_leistung=False` | keine Power.Active.Import in MeterValues | Grundlage der Schätzung aus dem Limit |
 | `gesperrt` | App-/RFID-Sperre steht, blockiert RemoteStart aber nicht | Nacht 23.07.2026 (einmalige Beobachtung) |

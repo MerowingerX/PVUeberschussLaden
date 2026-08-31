@@ -279,6 +279,13 @@ class State:
     # warten. Wer das nicht will, nimmt die Freigabe im Web-UI zurück; sie
     # überlebt dann über die Sicherung.
     mode = "minpv"               # minpv | fast
+    # „Sofort laden" ist ein Kommando, kein Dauerzustand: nach dem Ladeende
+    # fällt der Modus auf minpv zurück. Ohne das stand er am 28.08.2026 zwei
+    # Tage lang auf "fast" und startete das nächste angesteckte Fahrzeug
+    # ungefragt (docs/issue_load_immediatly.md).
+    fast_end_s = 60              # so lange nach Ladeende zurück auf minpv, 0 = nie (aus .env)
+    fast_idle_since: float | None = None  # Loop-Zeit: Ladung liegt seit ...
+    fast_geladen = False         # in diesem "fast" ist schon Strom geflossen
     released = True              # Freigabe für den Regler (im Web-UI umschaltbar)
     min_amps = MIN_AMPS          # Untergrenze im Modus minpv (justierbar im UI)
     night_enabled = True         # Nachtladen-Automatik an/aus
@@ -346,7 +353,9 @@ class State:
     limit_deadband_a = 0.3       # so viel Abweichung, bevor neu gesetzt wird (aus .env)
     limit_refresh_s = 300        # Limit spätestens so oft wiederholen (aus .env)
     limit_warn_factor = 0.6      # darunter gilt das Limit als wirkungslos (aus .env)
+    limit_warn_grace_s = 60      # Anlaufzeit, bevor die Warnung greift (aus .env)
     limit_warned = False         # Warnung für diesen Ladevorgang schon raus
+    charging_since: float | None = None  # Loop-Zeit: Box meldet "Charging" seit ...
     start_retry_at: float | None = None  # frühester nächster Startversuch (Loop-Zeit)
     start_attempts = 0           # abgelehnte Startversuche in Folge
     start_retry_s = 30           # Basis für den Backoff zwischen Versuchen (aus .env)
@@ -556,6 +565,10 @@ def save_session():
         "clock_synced": uhr_synchron(),
         "commit": VERSION.get("commit"),
         "mode": state.mode,
+        # Ohne diesen Merker stünde „Sofort laden" nach einem Neustart mitten
+        # in der Ladung für immer — fast_beenden hielte den Auftrag für noch
+        # nicht ausgeführt und gäbe ihn nie wieder ab.
+        "fast_geladen": state.fast_geladen,
         "released": state.released,
         "min_amps": state.min_amps,
         "night_enabled": state.night_enabled,
@@ -672,6 +685,7 @@ def load_session():
         log.info("Sicherung nennt Modus 'pv' — der ist entfallen, weiter mit 'minpv'")
         state.mode = "minpv"
 
+    state.fast_geladen = bool(daten.get("fast_geladen", False))
     state.released = bool(daten.get("released", state.released))
     state.min_amps = int(daten.get("min_amps", state.min_amps))
     state.night_enabled = bool(daten.get("night_enabled", state.night_enabled))
@@ -724,10 +738,88 @@ def in_night_window(now: datetime.datetime | None = None) -> bool:
 MAX_START_RETRY_S = 300      # Obergrenze für den Backoff zwischen Startversuchen
 
 
+def fast_beenden(now: float):
+    """„Sofort laden" nach getaner Arbeit wieder abgeben.
+
+    Der Knopf ist ein Kommando für *diese* Ladung, kein Betriebsmodus. Bis zum
+    31.08.2026 war er einer: am Freitag, 28.08. um 13:23 gedrückt, stand er am
+    Sonntagabend noch, und das gerade angesteckte Fahrzeug lud sofort los, ohne
+    dass jemand das wollte (docs/issue_load_immediatly.md).
+
+    Abgegeben wird erst, wenn der Auftrag auch ausgeführt wurde — `fast_geladen`
+    steht, sobald einmal Strom geflossen ist. Ohne diese Bedingung verfiele der
+    Modus schon, während man noch mit dem Kabel zum Auto geht: wer den Knopf vor
+    dem Anstecken drückt, sieht die Box in „Available", und das ist kein
+    Ladeende, sondern der Zustand davor.
+
+    Danach zwei Auslöser, mit unterschiedlicher Eile:
+
+    * Kabel gezogen (`Available`) — sofort. Da ist nichts mehr zu laden.
+    * Ladung liegt (`SuspendedEV`, `SuspendedEVSE`, `Finishing`) — erst nach
+      `fast_end_s`. Die Entprellung ist nicht Vorsicht, sondern nötig: die Box
+      durchläuft `SuspendedEV` auch beim *Start*, drei Sekunden vor `Charging`
+      (28.08. 13:23:29, 30.08. 17:06:59, 31.08. 00:00:04). Und ein Fahrzeug darf
+      mitten in der Ladung kurz aussetzen, ohne dass ihm die volle Leistung
+      genommen wird.
+
+    `Preparing` zählt als „arbeitet noch": dort steht die Box zwischen Stecken
+    und Ladebeginn, und dort wartet auch der Backoff aus try_start.
+    """
+    if state.mode != "fast" or not state.fast_end_s:
+        state.fast_idle_since = None
+        return
+    if state.charging:
+        state.fast_geladen = True
+        state.fast_idle_since = None
+        return
+    if not state.fast_geladen:
+        return                                  # Auftrag noch nicht ausgeführt
+
+    def zurueck(grund: str):
+        state.mode = "minpv"
+        state.fast_idle_since = None
+        state.fast_geladen = False
+        state.surplus_since = state.deficit_since = state.minpv_low_since = None
+        log.info("Sofort-Laden beendet (%s) — zurück auf PV-Überschussladen", grund)
+        save_session()
+
+    if state.box_status == "Available":
+        zurueck("Fahrzeug abgesteckt")
+    elif state.box_status not in ANGESTECKT_SICHER:
+        state.fast_idle_since = None            # Preparing, Faulted, keine Box
+    else:
+        state.fast_idle_since = state.fast_idle_since or now
+        if now - state.fast_idle_since >= state.fast_end_s:
+            zurueck(f"Ladung liegt seit {state.fast_end_s}s ({state.box_status})")
+
+
 async def apply_limit(now: float, amps: float):
     """Limit an die Box schicken und den Zeitpunkt merken."""
     await charge_point.set_limit(amps)
     state.limit_set_t = now
+
+
+def limit_neu_senden(grund: str):
+    """Das Limit im nächsten Regeltakt erneut schicken, egal was der Merker sagt.
+
+    Aufzurufen, sobald eine Transaktion steht. Der Grund ist die Profilart:
+    `set_limit()` wählt sie am `transaction_id`, und `try_start()` sendet das
+    Limit zwangsläufig *vor* dem RemoteStart — also immer als
+    `TxDefaultProfile`. Diese Pulsar quittiert das mit „Accepted", eröffnet die
+    Session danach aber mit ihrem eigenen Wert (6 A). Der Merker steht
+    trotzdem auf 16 A, und `limit_due()` schweigt bis zur Auffrischung nach
+    `limit_refresh_s` — 300 s, in denen das Auto mit 6 A lädt. Genau so am
+    28.08.2026 (fünf Minuten) und am 30.08.2026 (bis der Nutzer eingriff),
+    und schon in der Nacht zum 23.07.2026 über volle drei Stunden
+    (docs/issue_limit_to_6A.md, docs/issue_load_immediatly.md).
+
+    Der Merker wird also für ungültig erklärt und das Totband der PV-Regelung
+    freigegeben. Der nächste Takt sendet dasselbe Limit erneut — diesmal mit
+    laufender Transaktion, also als `TxProfile`, das die Box befolgt.
+    """
+    state.limit_known = False
+    state.last_adjust = 0.0
+    log.info("%s — Limit geht als TxProfile erneut raus", grund)
 
 
 def limit_due(now: float, amps: float) -> bool:
@@ -804,6 +896,14 @@ def warn_limit_ineffective(now: float):
         return
     if state.charge_w_seen is None or now - state.charge_w_seen > state.charge_w_max_age_s:
         return
+    # Anlaufzeit abwarten. Die Box meldet in den ersten Sekunden nach dem
+    # Ladestart 0 W, während das Fahrzeug noch aushandelt. Ohne diese Sperre
+    # feuert die Warnung genau dort — und ist danach für diesen Ladevorgang
+    # verbraucht. Am 28.08. und 30.08.2026 hat sie so den echten Fall
+    # verdeckt: 4,2 kW bei erlaubten 11 kW (docs/issue_load_immediatly.md).
+    if (state.charging_since is None
+            or now - state.charging_since < state.limit_warn_grace_s):
+        return
     erlaubt_w = state.current_limit * VOLTAGE * PHASES
     if state.charge_w >= state.limit_warn_factor * erlaubt_w:
         return
@@ -823,6 +923,7 @@ def reset_start_backoff():
 def reset_charge_meter():
     """Zählerstände der Wallbox verwerfen — nach Ladeende sind sie wertlos."""
     state.limit_warned = False
+    state.charging_since = None
     state.charge_w = 0.0
     state.charge_w_seen = None
     state.charge_w_src = "keine"
@@ -944,6 +1045,8 @@ class ChargePoint(OcppChargePoint):
                  connector_id, status, error_code)
         status = box_status_setzen(connector_id, status)
         if status in ("Charging",):
+            if not state.charging:
+                state.charging_since = asyncio.get_event_loop().time()
             state.charging = True
             reset_start_backoff()
         elif status in ("Available", "Finishing", "SuspendedEVSE", "SuspendedEV", "Faulted"):
@@ -962,8 +1065,11 @@ class ChargePoint(OcppChargePoint):
     @on("StartTransaction")
     def on_start_transaction(self, connector_id, id_tag, meter_start, **kwargs):
         state.transaction_id = 1
+        if not state.charging:
+            state.charging_since = asyncio.get_event_loop().time()
         state.charging = True
         log.info("Transaktion gestartet (meter %s Wh)", meter_start)
+        limit_neu_senden("Transaktion gestartet")
         save_session()
         return call_result.StartTransaction(
             transaction_id=state.transaction_id,
@@ -990,7 +1096,10 @@ class ChargePoint(OcppChargePoint):
         if laufend is not None and state.transaction_id != laufend:
             log.info("Laufende Transaktion %s aus MeterValues übernommen", laufend)
             state.transaction_id = laufend
+            if not state.charging:
+                state.charging_since = asyncio.get_event_loop().time()
             state.charging = True
+            limit_neu_senden("Transaktion übernommen")
             save_session()
         now = asyncio.get_event_loop().time()
         power_wh = energy_wh = None
@@ -1697,6 +1806,10 @@ async def control_task():
 async def control_step(now: float):
     """Ein Regeltakt. Getrennt von control_task, damit test_sim.py ihn mit
     simulierter Zeit und simulierter Wallbox durchspielen kann."""
+    # Vor allem anderen: steht „Sofort laden" noch zu Recht? Die Prüfung gehört
+    # vor die Freigabe-Abfrage — sonst bliebe der Modus stehen, solange jemand
+    # den Regler gesperrt hat, und griffe beim Entsperren wieder.
+    fast_beenden(now)
     if not state.released:
         if state.charging:
             log.info("Freigabe fehlt — stoppe Ladung")
@@ -1849,6 +1962,7 @@ async def command_loop():
         elif cmd == "mode" and len(parts) == 2 and parts[1] in ("minpv", "fast"):
             state.mode = parts[1]
             state.surplus_since = state.deficit_since = state.minpv_low_since = None
+            state.fast_idle_since, state.fast_geladen = None, False
             log.info("Modus: %s", state.mode)
         elif cmd in ("frei", "release"):
             state.released = True
@@ -1902,6 +2016,8 @@ INDEX_HTML = """<!doctype html>
   @keyframes pulse { 0%,100% { transform:scale(1); } 50% { transform:scale(1.3); } }
   .heart.dead { animation:none; filter:grayscale(1) brightness(.6); }
   .modes { border:1px solid #444; border-radius:.6rem; padding:.2rem .5rem .5rem; }
+  .hint { display:block; font-size:.8rem; color:#aaa; margin-top:.15rem; }
+  button.on .hint { color:#cfe8d0; }
   button.mode { padding-left:2.4rem; position:relative; }
   button.mode::before { content:"○"; position:absolute; left:.9rem; }
   button.mode.on::before { content:"●"; }
@@ -2055,7 +2171,8 @@ INDEX_HTML = """<!doctype html>
 <div class="modes">
 <button id="m_minpv" class="mode" onclick="setMode('minpv')">PV-Überschussladen, mindestens
   <span id="minlabel">6</span> A</button>
-<button id="m_fast" class="mode" onclick="setMode('fast')">Sofort laden, mit voller Leistung</button>
+<button id="m_fast" class="mode" onclick="setMode('fast')">Sofort laden, mit voller Leistung
+  <span class="hint">gilt nur für diese Ladung</span></button>
 </div>
 <h2>Automatik</h2>
 <button id="night" onclick="toggleNight()">…</button>
@@ -2699,6 +2816,9 @@ async def http_mode(request):
         raise web.HTTPBadRequest(text="mode muss minpv|fast sein")
     state.mode = mode
     state.surplus_since = state.deficit_since = state.minpv_low_since = None
+    # Frischer Knopfdruck, frischer Auftrag: sonst verfiele ein „fast", das auf
+    # ein noch stehendes Fahrzeug trifft, sofort wieder (fast_beenden).
+    state.fast_idle_since, state.fast_geladen = None, False
     log.info("Modus (Web): %s", mode)
     save_session()
     return web.json_response({"ok": True})
@@ -2862,6 +2982,8 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
              "So lange muss er fehlen, bevor gestoppt wird"),
             ("PVUEB_HEARTBEAT_S", state.heartbeat_s,
              "OCPP-Heartbeat der Wallbox, auch im Web-UI einstellbar"),
+            ("PVUEB_FAST_END_S", state.fast_end_s,
+             "So lange nach Ladeende fällt „Sofort laden“ auf PV zurück, 0 = nie"),
         ]),
         ("minpv: Startschwelle und Wolkenloch-Überbrückung", [
             ("PVUEB_MINPV_START_FACTOR", state.minpv_start_factor,
@@ -2885,6 +3007,8 @@ def env_spec() -> list[tuple[str, list[tuple[str, object, str]]]]:
              "Limit spätestens so oft wiederholen, auch unverändert"),
             ("PVUEB_LIMIT_WARN_FACTOR", state.limit_warn_factor,
              "Unter diesem Anteil des erlaubten Stroms gilt das Limit als wirkungslos"),
+            ("PVUEB_LIMIT_WARN_GRACE_S", state.limit_warn_grace_s,
+             "Anlaufzeit nach Ladebeginn, bevor diese Warnung greift"),
         ]),
         ("Messwerte der Wallbox", [
             ("PVUEB_CHARGE_W_MAX_AGE_S", state.charge_w_max_age_s,
@@ -3380,6 +3504,9 @@ async def main():
     state.limit_warn_factor = float(os.environ.get("PVUEB_LIMIT_WARN_FACTOR", "0.6"))
     if not 0 <= state.limit_warn_factor < 1:
         sys.exit("PVUEB_LIMIT_WARN_FACTOR muss in [0, 1) liegen")
+    state.limit_warn_grace_s = int(os.environ.get("PVUEB_LIMIT_WARN_GRACE_S", "60"))
+    if state.limit_warn_grace_s < 0:
+        sys.exit("PVUEB_LIMIT_WARN_GRACE_S muss >= 0 sein")
     state.avg_window_s = int(float(os.environ.get("PVUEB_AVG_WINDOW_MIN", "10")) * 60)
     state.start_avg_window_s = int(float(os.environ.get("PVUEB_START_AVG_MIN", "2")) * 60)
     if state.avg_window_s < 0 or state.start_avg_window_s < 0:
@@ -3426,6 +3553,9 @@ async def main():
     state.start_retry_s = int(os.environ.get("PVUEB_START_RETRY_S", "30"))
     if state.start_retry_s < 1:
         sys.exit("PVUEB_START_RETRY_S muss >= 1 Sekunde sein")
+    state.fast_end_s = int(os.environ.get("PVUEB_FAST_END_S", "60"))
+    if state.fast_end_s < 0:
+        sys.exit("PVUEB_FAST_END_S muss >= 0 sein (0 = Sofort-Laden bleibt stehen)")
     state.web_user = os.environ.get("PVUEB_WEB_USER", "")
     state.web_password = os.environ.get("PVUEB_WEB_PASSWORD", "")
     state.ocpp_user = os.environ.get("PVUEB_OCPP_USER", "")

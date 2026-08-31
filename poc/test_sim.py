@@ -69,6 +69,7 @@ class FakeBox:
             self.events.append((Sim.t, "START abgelehnt"))
             return "Rejected"
         c.state.charging = True
+        c.state.charging_since = Sim.t   # wie on_status: Beginn des Ladens merken
         c.reset_start_backoff()          # entspricht StatusNotification "Charging"
         self.events.append((Sim.t, "START"))
         return "Accepted"
@@ -111,6 +112,12 @@ class Sim:
         s.charging, s.charge_w, s.current_limit = False, 0.0, 0
         s.limit_known, s.limit_set_t, s.limit_warned = False, 0.0, False
         s.limit_refresh_s, s.limit_warn_factor = 300, 0.6
+        # Die Anlaufzeit der Warnung deckt die Sekunden ab, in denen die Box
+        # nach dem Start noch 0 W meldet (docs/issue_load_immediatly.md).
+        s.limit_warn_grace_s, s.charging_since = 60, None
+        # "Sofort laden" bleibt hier stehen: die Sim schaltet den Modus je
+        # Testfall bewusst und soll ihn nicht unterwegs verlieren.
+        s.fast_end_s, s.fast_idle_since, s.fast_geladen = 0, None, False
         s.charge_w_seen, s.charge_w_src = None, "keine"
         s.charge_energy_wh = s.charge_energy_t = None
         s.charge_w_max_age_s = 30

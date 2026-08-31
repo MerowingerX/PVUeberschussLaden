@@ -40,7 +40,11 @@ aber trotzdem zügig.
 - **Zwei Lademodi:**
   - *PV + Minimum* (`minpv`) — hält einen einstellbaren Mindeststrom (Slider 6–16 A),
     Überschuss oben drauf. Gestartet wird erst ab dem 1,10-fachen dieser Leistung
-  - *Sofort laden* (`fast`) — volle Leistung, PV egal
+  - *Sofort laden* (`fast`) — volle Leistung, PV egal. Gilt für **eine** Ladung:
+    ist sie beendet (`SuspendedEV`/`Finishing`, entprellt über
+    `PVUEB_FAST_END_S`) oder das Fahrzeug abgesteckt, fällt der Regler auf
+    `minpv` zurück. Sonst startete das nächste angesteckte Fahrzeug ungefragt
+    mit voller Leistung (docs/issue_load_immediatly.md)
 
   Einen dritten Modus „reines PV-Überschussladen" gab es bis zum 30.07.2026. Er
   ist entfallen, weil er nichts anderes konnte: Wallbox und Fahrzeug brauchen

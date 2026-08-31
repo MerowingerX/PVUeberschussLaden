@@ -60,6 +60,9 @@ def grundzustand():
     s.released, s.mode, s.min_amps = True, "fast", 6
     s.night_enabled = False
     s.charging, s.current_limit, s.limit_known = False, 0.0, False
+    # Ohne das schleppt der nächste Test die Transaktion des vorigen mit —
+    # und set_limit wählt die Profilart genau daran.
+    s.transaction_id = None
     s.grid_w, s.battery_w, s.soc, s.pv_w = 0.0, 0.0, 50.0, 0.0
     s.last_tick, s.tick_error = 0.0, None
     s.watchdog_s = c.WATCHDOG_TIMEOUT_S
@@ -68,6 +71,12 @@ def grundzustand():
     # startet der Regler seit dem 30.07.2026 gar nicht erst (try_start).
     s.box_status = "Preparing"
     s.leerstart_gemeldet = False
+    # "Sofort laden" ist einmalig (docs/issue_load_immediatly.md). Für die
+    # Tests hier steht der Auftrag frisch an, sonst gäbe fast_beenden ihn
+    # mitten im Testlauf ab.
+    s.fast_end_s, s.fast_idle_since, s.fast_geladen = 60, None, False
+    s.charging_since, s.limit_warned = None, False
+    s.limit_warn_grace_s = 60
     c.reset_start_backoff()
 
 
@@ -439,6 +448,10 @@ async def test_protokoll_box_ignoriert_profil():
     c.state.mode, c.state.night_enabled = "minpv", True
     c.state.limit_refresh_s = 0.1          # Auffrischung im Test beschleunigen
     c.state.charge_w_max_age_s = 300
+    # Hier geht es um die Diskrepanz selbst, nicht um die Anlaufflanke:
+    # ohne diese Zeile käme die Warnung erst nach limit_warn_grace_s.
+    c.state.limit_warn_grace_s = 0
+    c.state.charging_since = 0.0
     server = await mit_server(OCPP_PORT)
     orig = c.in_night_window
     c.in_night_window = lambda *a: True
@@ -638,17 +651,119 @@ async def test_protokoll_hypothese_zeitfenster():
         await server.wait_closed()
 
 
+async def test_sofort_laden_ist_einmalig():
+    """Der Knopf gilt für eine Ladung, nicht bis zum nächsten Klick.
+
+    Am 28.08.2026 um 13:23 gedrückt, stand er am Sonntagabend noch — und das
+    frisch angesteckte Fahrzeug lud ungefragt los
+    (docs/issue_load_immediatly.md).
+    """
+    grundzustand()
+    c.state.fast_end_s = 60
+    jetzt = 10_000.0
+
+    # Vor dem Anstecken: der Auftrag steht noch aus, "Available" ist kein
+    # Ladeende. Sonst verfiele der Modus, während man zum Auto geht.
+    c.state.box_status = "Available"
+    c.fast_beenden(jetzt)
+    pruefe(c.state.mode == "fast", "vor dem Anstecken bleibt 'fast' stehen")
+
+    # Startflanke: Preparing -> SuspendedEV -> Charging in drei Sekunden.
+    # Das SuspendedEV dazwischen darf den Modus nicht abräumen.
+    for status in ("Preparing", "SuspendedEV"):
+        c.state.box_status, c.state.charging = status, False
+        c.fast_beenden(jetzt)
+        jetzt += 3
+    pruefe(c.state.mode == "fast", "das SuspendedEV der Startflanke räumt nichts ab")
+
+    c.state.box_status, c.state.charging = "Charging", True
+    c.fast_beenden(jetzt)
+    pruefe(c.state.fast_geladen, "Ladung läuft — der Auftrag gilt als ausgeführt")
+
+    # Fahrzeug voll: SuspendedEV, aber erst nach der Nachlaufzeit zurück
+    c.state.box_status, c.state.charging = "SuspendedEV", False
+    c.fast_beenden(jetzt)
+    pruefe(c.state.mode == "fast", "kurzes Aussetzen beendet 'fast' noch nicht")
+    c.fast_beenden(jetzt + c.state.fast_end_s + 1)
+    pruefe(c.state.mode == "minpv",
+           f"nach {c.state.fast_end_s}s Stillstand zurück auf minpv: {c.state.mode}")
+
+    # Abstecken beendet sofort, ohne Nachlauf
+    grundzustand()
+    c.state.fast_end_s, c.state.charging = 60, True
+    c.state.box_status = "Charging"
+    c.fast_beenden(jetzt)
+    c.state.box_status, c.state.charging = "Available", False
+    c.fast_beenden(jetzt + 1)
+    pruefe(c.state.mode == "minpv", f"Abstecken beendet sofort: {c.state.mode}")
+
+    # Abgeschaltet (0) heißt: bleibt stehen wie bisher
+    grundzustand()
+    c.state.fast_end_s = 0
+    c.state.box_status, c.state.charging = "Charging", True
+    c.fast_beenden(jetzt)
+    c.state.box_status, c.state.charging = "Available", False
+    c.fast_beenden(jetzt + 10_000)
+    pruefe(c.state.mode == "fast", "PVUEB_FAST_END_S=0 lässt den Modus stehen")
+
+
+async def test_protokoll_limit_gilt_ab_transaktionsbeginn():
+    """Belegte Eigenheit: das Profil vor der Transaktion verfällt beim Start.
+
+    `try_start` sendet das Limit zwangsläufig vor dem RemoteStart, also als
+    TxDefaultProfile. Diese Pulsar quittiert es und eröffnet die Session
+    trotzdem mit ihren 6 A. Bis zum 31.08.2026 fiel das erst der Auffrischung
+    nach `limit_refresh_s` auf — 300 s Laden mit 6 A (28.08. und 30.08.2026,
+    davor schon die Nacht zum 23.07.2026). Die Auffrischung bleibt hier
+    absichtlich auf 300 s: was der Test sieht, kann nur vom Transaktionsbeginn
+    kommen.
+    """
+    grundzustand()
+    c.state.limit_refresh_s = 300
+    server = await mit_server(OCPP_PORT)
+    try:
+        box, ws, task = await fake_box.verbinde(
+            OCPP_PORT, profil_vor_transaktion_verfaellt=True, eigen_a=6.0)
+        await box.anmelden()
+        await box.melde_status("Preparing")
+        takt = asyncio.create_task(c.control_task())
+        await bis(lambda: box.laeuft)
+        erreicht = await bis(lambda: box.echte_a() == c.MAX_AMPS)
+        takt.cancel()
+        try:
+            await takt
+        except asyncio.CancelledError:
+            pass
+
+        profile = [w[1] for e, w in box.ereignisse if e == "SetChargingProfile"]
+        pruefe(erreicht,
+               f"die Box lädt mit {c.MAX_AMPS} A statt mit ihren {box.eigen_a} A "
+               f"— echte {box.echte_a()} A")
+        pruefe("TxProfile" in profile,
+               f"weil ein TxProfile nachgereicht wurde: {profile}")
+        pruefe(profile[0] == "TxDefaultProfile",
+               f"der erste Schuss war wie bisher ein TxDefaultProfile: {profile}")
+        task.cancel()
+        await ws.close()
+    finally:
+        c.state.limit_refresh_s = 300
+        server.close()
+        await server.wait_closed()
+
+
 TESTS = [test_takt_ueberlebt_wallbox_fehler, test_takt_erholt_sich,
          test_herzschlag_ohne_wallbox, test_watchdog_entscheidung,
          test_bewacht_startet_neu,
          test_reconnect_raeumt_nicht_die_neue_verbindung_weg,
          test_nachtladen_ohne_wechselrichter, test_pv_regelung_ohne_wechselrichter,
          test_betriebsstufe, test_stumme_leitung_wird_gekappt,
+         test_sofort_laden_ist_einmalig,
          # Protokollebene: echter WebSocket, echte ocpp-Bibliothek
          test_protokoll_anmeldung, test_protokoll_nachtladung,
          test_protokoll_box_ignoriert_profil, test_protokoll_reconnect_race,
          test_protokoll_start_abgelehnt, test_protokoll_leere_dose,
-         test_protokoll_hypothese_zeitfenster]
+         test_protokoll_hypothese_zeitfenster,
+         test_protokoll_limit_gilt_ab_transaktionsbeginn]
 
 
 async def main():
