@@ -57,6 +57,18 @@ gesamten Log nicht vor. Die 6 A sind der Eigenwert der Box.
 auf dem Pi steht leer. Damit gäbe es eine Zeitreihe von `charge_w` gegen
 `current_limit` statt nur der Ereignisse aus dem Log.
 
+**Erledigt (17.08.2026)**: In der Nacht 14.08. drosselte die Box sich für
+~40 Minuten (01:41–02:21) eigenmächtig auf 6 A, während unser Limit
+durchgehend unverändert bei 16 A stand — bestätigt per Mitschnitt und Log,
+aber die Ursache blieb offen, weil die Cloud-Antwort viel mehr Felder liefert
+als `wallbox_snapshot()` bis dahin auswertete. `power_sharing_status`,
+`grid.status`, `pru.status`, `current_mode`, `preventive_discharge` und
+`ecosmart.enabled` landen jetzt mit im Mitschnitt (`wallbox_cloud` in
+`recordings/status-*.jsonl`) — bei einer Wiederholung sollte sich daraus
+ablesen lassen, ob z. B. Power Sharing/Fuse Protection dahintersteckt (der
+Tarif hat `DYNAMIC_POWER_SHARING` im Plan, `ecosmart.enabled` stand zum
+Zeitpunkt der Prüfung auf `false`, scheidet also als Ursache aus).
+
 ## Behoben
 
 - `on_boot` erklärt den Merker für ungültig (`limit_known = False`)

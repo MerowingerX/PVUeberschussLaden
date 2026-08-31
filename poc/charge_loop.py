@@ -1465,6 +1465,15 @@ def wallbox_snapshot(daten: dict) -> dict:
         "locked": config.get("locked"),
         "last_sync": daten.get("last_sync"),
         "last_sync_s": sync_alter(daten.get("last_sync")),
+        # Undokumentierte Statusfelder der Cloud — greifen nicht in die Regelung
+        # ein, sollen aber im Mitschnitt landen: erklären womöglich, warum die
+        # Box eigenmächtig unter unser Limit geht (docs/issue_limit_to_6A.md).
+        "power_sharing_status": daten.get("power_sharing_status"),
+        "grid_status": (daten.get("grid") or {}).get("status"),
+        "pru_status": (daten.get("pru") or {}).get("status"),
+        "current_mode": daten.get("current_mode"),
+        "preventive_discharge": daten.get("preventive_discharge"),
+        "ecosmart_enabled": (config.get("ecosmart") or {}).get("enabled"),
     }
 
 

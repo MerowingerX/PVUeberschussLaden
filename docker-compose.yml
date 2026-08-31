@@ -2,6 +2,7 @@ services:
   pvueb:
     build:
       context: .
+      network: host
       # Werte kommen aus der Umgebung — `make up` füllt sie aus Git. Ein
       # blankes `docker compose up --build` läuft weiter, dann steht auf der
       # Info-Seite eben „unbekannt".
