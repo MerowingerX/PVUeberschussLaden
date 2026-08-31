@@ -18,7 +18,9 @@ import os
 import time
 import urllib.request
 
-DEFAULT_URL = "http://192.168.100.2:8080/api/status"
+# Neptun, der laufende Dienst. Bis 2026-08-31 stand hier 192.168.100.2 — der
+# alte Raspberry Pi, der das Ziel einmal war und inzwischen ausgemustert ist.
+DEFAULT_URL = "http://192.168.100.4:8080/api/status"
 # Der Regler tastet alle 5 s; 10 s reichen, um Wolkenlöcher sauber abzubilden
 DEFAULT_INTERVAL = 10
 
